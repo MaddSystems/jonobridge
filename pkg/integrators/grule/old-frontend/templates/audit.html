@@ -1,0 +1,364 @@
+{% extends "base.html" %}
+
+{% block title %}Auditoría - Grule Engine{% endblock %}
+
+{% block content %}
+<div class="audit-container">
+    <!-- Header -->
+    <div class="header-section">
+        <h1><i class="fas fa-history"></i> Audit Trail Dashboard</h1>
+        <p>Visualizar ejecuciones de reglas en tiempo real</p>
+    </div>
+
+    <!-- Grid Section -->
+    <div class="grid-section">
+        <div class="grid-toolbar">
+            <input type="text" id="searchImei" class="form-control form-control-sm" placeholder="Buscar por IMEI..." value="" style="max-width: 300px;">
+            <select id="sortBy" class="form-select form-select-sm" style="max-width: 200px;">
+                <option value="execution_date">Ordenar por: Fecha</option>
+                <option value="imei">Ordenar por: IMEI</option>
+                <option value="alert_fired">Ordenar por: Alertas</option>
+            </select>
+            <button class="btn btn-primary btn-sm" onclick="loadGrid()"><i class="fas fa-search"></i> Buscar</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearSearch()">Limpiar</button>
+        </div>
+
+        <table id="auditGrid" style="width: 100%;"></table>
+        <div id="auditGridPager"></div>
+    </div>
+</div>
+
+<!-- Modal para detalles de ejecución -->
+<div class="modal fade" id="executionModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">
+                    <i class="fas fa-cog"></i> Detalles de Ejecución
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" style="max-height: 70vh; overflow-y: auto;">
+                <div id="timeline-app">
+                    <!-- Será rellenado por Vue -->
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .audit-container {
+        padding-top: 20px;
+    }
+
+    .header-section {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 25px;
+        border-radius: 10px;
+        margin-bottom: 30px;
+    }
+
+    .header-section h1 {
+        margin: 0;
+        font-weight: 600;
+        font-size: 2em;
+    }
+
+    .header-section p {
+        margin: 5px 0 0 0;
+        opacity: 0.9;
+    }
+
+    .grid-section {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        margin-bottom: 30px;
+    }
+
+    .grid-toolbar {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 15px;
+        flex-wrap: wrap;
+    }
+
+    /* jqGrid customizations */
+    .ui-jqgrid {
+        border-radius: 8px;
+        overflow: hidden;
+    }
+
+    .ui-jqgrid .ui-jqgrid-htable {
+        background: #f8f9fa;
+    }
+
+    .ui-jqgrid .ui-jqgrid-htable th {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        font-weight: 600;
+    }
+
+    .ui-jqgrid .ui-jqgrid-btable tr:hover {
+        background: #e7f3ff;
+        cursor: pointer;
+    }
+
+    .badge-imei {
+        background: #e7e7ff;
+        color: #667eea;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 0.9em;
+        font-weight: 600;
+        font-family: 'Courier New', monospace;
+    }
+
+    .accordion-button:not(.collapsed) {
+        background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+        color: #667eea;
+    }
+
+    .accordion-button:focus {
+        border-color: #667eea;
+        box-shadow: 0 0 0 0.25rem rgba(102, 126, 234, 0.25);
+    }
+
+    @media (max-width: 768px) {
+        .grid-toolbar {
+            flex-direction: column;
+        }
+
+        .grid-toolbar > * {
+            width: 100%;
+        }
+
+        .header-section h1 {
+            font-size: 1.5em;
+        }
+
+        .modal-xl {
+            max-width: 95vw;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<!-- jqGrid CSS and JS -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jqueryui/1.12.1/jquery-ui.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/css/ui.jqgrid.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/jquery.jqgrid.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/js/i18n/grid.locale-es.min.js"></script>
+
+<!-- Vue 3 -->
+<script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.js"></script>
+
+{% raw %}
+<script>
+    // jqGrid initialization
+    $(document).ready(function() {
+        $('#auditGrid').jqGrid({
+            url: '/api/audit/grid',
+            datatype: 'json',
+            mtype: 'GET',
+            colNames: ['ID', 'IMEI', 'Fecha Ejecución', 'Pasos', 'Alerta'],
+            colModel: [
+                { name: 'id', index: 'id', width: 80, hidden: true },
+                { name: 'imei', index: 'imei', width: 150, formatter: imeiFormatter },
+                { name: 'execution_date', index: 'execution_date', width: 180 },
+                { name: 'total_steps', index: 'total_steps', width: 80, align: 'center' },
+                { name: 'alert_fired', index: 'alert_fired', width: 100, formatter: alertFormatter }
+            ],
+            pager: '#auditGridPager',
+            rowNum: 25,
+            rowList: [10, 25, 50, 100],
+            sortname: 'execution_date',
+            sortorder: 'desc',
+            viewrecords: true,
+            jsonReader: {
+                page: 'page',
+                total: 'total',
+                records: 'records',
+                root: 'rows',
+                id: 'id'
+            },
+            onSelectRow: function(id) {
+                timelineApp.selectExecution(id);
+            }
+        });
+
+        $('#auditGrid').jqGrid('navGrid', '#auditGridPager', {
+            edit: false,
+            add: false,
+            del: false,
+            search: false,
+            refresh: true
+        });
+    });
+
+    // Formatters for jqGrid
+    function imeiFormatter(cellvalue, options, rowObject) {
+        return '<span class="badge-imei">' + cellvalue + '</span>';
+    }
+
+    function alertFormatter(cellvalue, options, rowObject) {
+        if (cellvalue === true || cellvalue === 1 || cellvalue === 'true') {
+            return '<span class="badge bg-danger">✅ SÍ</span>';
+        }
+        return '<span class="badge bg-secondary">❌ NO</span>';
+    }
+
+    // Search functions
+    function loadGrid() {
+        const searchText = document.getElementById('searchImei').value;
+        const sortBy = document.getElementById('sortBy').value;
+        
+        $('#auditGrid').jqGrid('setGridParam', {
+            url: '/api/audit/grid?searchText=' + encodeURIComponent(searchText) + '&sidx=' + sortBy,
+            page: 1
+        }).trigger('reloadGrid');
+    }
+
+    function clearSearch() {
+        document.getElementById('searchImei').value = '';
+        document.getElementById('sortBy').value = 'execution_date';
+        loadGrid();
+    }
+
+    // Vue 3 Timeline App
+    const { createApp } = Vue;
+
+    const timelineApp = createApp({
+        template: `
+            <div v-if="selectedExecution">
+                <div class="alert alert-info mb-4">
+                    <div class="row">
+                        <div class="col-md-3">
+                            <strong>IMEI:</strong><br>
+                            <code>{{ selectedExecution.IMEI }}</code>
+                        </div>
+                        <div class="col-md-3">
+                            <strong>Fecha:</strong><br>
+                            {{ formatDate(selectedExecution.ExecutionDate) }}
+                        </div>
+                        <div class="col-md-3">
+                            <strong>Total Steps:</strong><br>
+                            {{ executionDetail.trace?.Steps?.length || 0 }}
+                        </div>
+                        <div class="col-md-3">
+                            <strong>Estado:</strong><br>
+                            <span v-if="selectedExecution.AlertFired" class="badge bg-danger">✅ SÍ</span>
+                            <span v-else class="badge bg-secondary">❌ NO</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="accordion accordion-flush" id="stepsAccordion" v-if="executionDetail && executionDetail.trace">
+                    <div v-for="(step, idx) in executionDetail.trace.Steps" :key="idx" class="accordion-item">
+                        <h2 class="accordion-header">
+                            <button class="accordion-button collapsed" type="button" :data-bs-target="'#step' + idx" data-bs-toggle="collapse">
+                                <span class="badge" :class="'bg-' + getStatusColor(step.status)">
+                                    {{ step.status || 'PASSED' }}
+                                </span>
+                                <strong style="margin-left: 10px;">{{ step.rule_name }}</strong>
+                                <small style="margin-left: 10px; color: #666;">{{ step.description }}</small>
+                            </button>
+                        </h2>
+                        <div :id="'step' + idx" class="accordion-collapse collapse" data-bs-parent="#stepsAccordion">
+                            <div class="accordion-body">
+                                <table class="table table-sm">
+                                    <tbody>
+                                        <tr>
+                                            <td><strong>Duración:</strong></td>
+                                            <td>{{ (step.duration_ms || 0).toFixed(2) }} ms</td>
+                                        </tr>
+                                        <tr>
+                                            <td><strong>Salience:</strong></td>
+                                            <td>{{ step.salience || 'N/A' }}</td>
+                                        </tr>
+                                        <tr>
+                                            <td><strong>Step Order:</strong></td>
+                                            <td>{{ step.step_order || idx + 1 }}</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+
+                                <div v-if="step.conditions && Object.keys(step.conditions).length > 0">
+                                    <h6 style="color: #667eea; margin-top: 15px;">📋 Condiciones Evaluadas:</h6>
+                                    <div class="bg-light p-2 rounded" style="max-height: 200px; overflow-y: auto;">
+                                        <pre style="margin: 0; white-space: pre-wrap; word-wrap: break-word;">{{ JSON.stringify(step.conditions, null, 2) }}</pre>
+                                    </div>
+                                </div>
+
+                                <div v-if="step.actions && Object.keys(step.actions).length > 0">
+                                    <h6 style="color: #198754; margin-top: 15px;">✅ Acciones Ejecutadas:</h6>
+                                    <div class="bg-light p-2 rounded" style="max-height: 200px; overflow-y: auto;">
+                                        <pre style="margin: 0; white-space: pre-wrap; word-wrap: break-word;">{{ JSON.stringify(step.actions, null, 2) }}</pre>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div v-else class="text-center py-5">
+                    <div class="spinner-border" role="status">
+                        <span class="visually-hidden">Cargando...</span>
+                    </div>
+                    <p>Cargando detalles...</p>
+                </div>
+            </div>
+            <div v-else class="text-center py-5">
+                <p>Seleccione una ejecución para ver detalles</p>
+            </div>
+        `,
+        data() {
+            return {
+                selectedExecution: null,
+                executionDetail: null,
+                loading: false
+            };
+        },
+        methods: {
+            selectExecution(executionId) {
+                this.loading = true;
+                fetch('/api/audit/executions/' + executionId)
+                    .then(r => r.json())
+                    .then(data => {
+                        console.log('Execution Detail:', data);
+                        this.executionDetail = data;
+                        this.selectedExecution = data.trace;
+                        this.loading = false;
+
+                        // Mostrar modal
+                        const modal = new bootstrap.Modal(document.getElementById('executionModal'));
+                        modal.show();
+                    })
+                    .catch(err => {
+                        console.error('Error loading execution detail:', err);
+                        this.loading = false;
+                        alert('Error cargando detalles: ' + err);
+                    });
+            },
+            formatDate(dateStr) {
+                if (!dateStr) return 'N/A';
+                const date = new Date(dateStr);
+                return date.toLocaleString('es-ES');
+            },
+            getStatusColor(status) {
+                if (!status) return 'success';
+                const lower = status.toLowerCase();
+                if (lower === 'passed') return 'success';
+                if (lower === 'failed') return 'danger';
+                if (lower === 'skipped') return 'warning';
+                return 'info';
+            }
+        }
+    }).mount('#timeline-app');
+</script>
+{% endraw %}
+{% endblock %}

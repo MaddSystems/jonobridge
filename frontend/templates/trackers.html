@@ -1,0 +1,433 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="card">
+        <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+            <h2 class="mb-0">Trackers</h2>
+            <button class="btn btn-light btn-sm" onclick="refreshTable()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="alertArea"></div>
+            <div class="table-responsive">
+                <table id="trackersTable" class="table table-bordered table-hover">
+                    <thead>
+                        <tr>
+                            <th>Client</th>
+                            <th>IMEI</th>
+                            <th>Protocol</th>
+                            <th>Port</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Command Modal -->
+<div class="modal fade" id="commandModal" tabindex="-1" aria-labelledby="commandModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="commandModalLabel">Send Command</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <form id="commandForm">
+                    <input type="hidden" id="imeiNumber">
+                    <input type="hidden" id="hexPacket">
+                    <input type="hidden" id="asciiPacket">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="form-group mb-3">
+                                <label for="trackerTypeSelect">Tracker Type</label>
+                                <select class="form-select" id="trackerTypeSelect" onchange="switchTrackerType()">
+                                    <option value="gt06" selected>GT06</option>
+                                    <option value="bsj">BSJ-EG01</option>
+                                </select>
+                            </div>
+                            
+                            <!-- GT06 Command Section -->
+                            <div id="gt06Section">
+                                <div class="mb-3">
+                                    <label for="commandInput" class="form-label">Command</label>
+                                    <input type="text" class="form-control" id="commandInput" 
+                                           placeholder="Enter command (e.g., WHERE#)">
+                                </div>
+                                <div class="mb-3">
+                                    <button type="button" class="btn btn-primary" onclick="generateOutputPacket()">Generate Packet</button>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="outputPacket" class="form-label">Generated Packet (HEX)</label>
+                                    <input type="text" class="form-control" id="outputPacket" readonly>
+                                    <small class="text-muted">For debugging purposes</small>
+                                </div>
+                            </div>
+                            
+                            <!-- BSJ-EG01 Command Section -->
+                            <div id="bsjSection" style="display: none;">
+                                <div class="mb-3">
+                                    <label for="bsjCommandInput" class="form-label">Command</label>
+                                    <input type="text" class="form-control" id="bsjCommandInput" 
+                                           placeholder="Enter command (e.g., <SPBSJ*P:BSJGPS*C:30>)">
+                                </div>
+                                <div class="mb-3">
+                                    <button type="button" class="btn btn-primary" onclick="generateBSJPacket()">Generate Packet</button>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="bsjOutputPacket" class="form-label">Generated Packet (HEX)</label>
+                                    <input type="text" class="form-control" id="bsjOutputPacket" readonly>
+                                    <small class="text-muted">For debugging purposes</small>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <!-- Command References - Will switch based on selected tracker type -->
+                            <div id="gt06Commands" class="card">
+                                <div class="card-header">
+                                    <h6 class="mb-0">Common GT06 Commands</h6>
+                                </div>
+                                <div class="card-body" style="max-height: 250px; overflow-y: auto;">
+                                    <p><strong>Device Control:</strong></p>
+                                    <ul>
+                                        <li><code>RESET#</code> - Restart device</li>
+                                        <li><code>POWEROFF#</code> - Turn off device</li>
+                                        <li><code>BEGIN#</code> - Initialize device</li>
+                                        <li><code>FACTORY#</code> - Reset to factory settings</li>
+                                    </ul>
+                                    <p><strong>Tracking Commands:</strong></p>
+                                    <ul>
+                                        <li><code>WHERE#</code> - Get current location</li>
+                                        <li><code>TIMER#30#</code> - Set position reporting interval (30 sec)</li>
+                                        <li><code>SPEED#100#</code> - Set speed alarm (100 km/h)</li>
+                                    </ul>
+                                    <p><strong>Setup:</strong></p>
+                                    <ul>
+                                        <li><code>APN#apn_name#username#password#</code> - Configure APN</li>
+                                        <li><code>SERVER#3.14.189.127#8002#</code> - Set server IP and port</li>
+                                        <li><code>CENTER#number#</code> - Set center phone number</li>
+                                    </ul>
+                                    <p><strong>Vehicle Control:</strong></p>
+                                    <ul>
+                                        <li><code>RELAY#</code> - Control relay for oil/electricity</li>
+                                        <li><code>RESTORE#</code> - Restore oil and electricity</li>
+                                    </ul>
+                                </div>
+                            </div>
+                            
+                            <div id="bsjCommands" class="card" style="display: none;">
+                                <div class="card-header">
+                                    <h6 class="mb-0">Common BSJ-EG01 Commands</h6>
+                                </div>
+                                <div class="card-body" style="max-height: 250px; overflow-y: auto;">
+                                    <p><strong>Tracking Commands:</strong></p>
+                                    <ul>
+                                        <li><code>&lt;SPBSJ*P:BSJGPS*C:30&gt;</code> - Set tracking mode (30 sec interval)</li>
+                                        <li><code>&lt;SPBSJ*P:BSJGPS*C:0&gt;</code> - Set standby mode</li>
+                                    </ul>
+                                    <p><strong>Server Configuration:</strong></p>
+                                    <ul>
+                                        <li><code>&lt;SPBSJ*P:BSJGPS*T:047.107.222.141,7788*N:17811114444&gt;</code> - Set IP and port</li>
+                                        <li><code>&lt;SPBSJ*P:BSJGPS*Q:data.car900.com:7788&gt;</code> - Set domain name</li>
+                                    </ul>
+                                    <p><strong>Contact Setup:</strong></p>
+                                    <ul>
+                                        <li><code>&lt;SPBSJ*P:BSJGPS*QQHM:17875175231,12342746346&gt;</code> - Set family numbers</li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="submitCommand()">Send Command</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block styles %}
+<!-- DataTables CSS -->
+<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.11.5/css/dataTables.bootstrap5.min.css"/>
+<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/buttons/2.2.2/css/buttons.bootstrap5.min.css"/>
+<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/responsive/2.2.9/css/responsive.bootstrap5.min.css"/>
+<!-- Font Awesome -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css"/>
+{% endblock %}
+
+{% block scripts %}
+<!-- DataTables JS -->
+<script type="text/javascript" src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/1.11.5/js/jquery.dataTables.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/1.11.5/js/dataTables.bootstrap5.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.2.2/js/dataTables.buttons.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.2.2/js/buttons.bootstrap5.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.2.2/js/buttons.html5.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/responsive/2.2.9/js/dataTables.responsive.min.js"></script>
+<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.1.3/jszip.min.js"></script>
+
+<script>
+    let commandModal;
+    let currentClient;
+    let currentImei;
+    let trackersTable;
+
+    document.addEventListener('DOMContentLoaded', function() {
+        commandModal = new bootstrap.Modal(document.getElementById('commandModal'));
+        
+        // Initialize DataTable
+        trackersTable = $('#trackersTable').DataTable({
+            processing: true,
+            serverSide: true,
+            responsive: true,
+            ajax: {
+                url: '/api/trackers/data',
+                type: 'POST',
+                data: function(d) {
+                    console.log('Sending request:', d);
+                    return JSON.stringify(d);
+                },
+                contentType: 'application/json',
+                error: function(xhr, error, thrown) {
+                    console.error('DataTables error:', error, thrown);
+                    showAlert('Error loading tracker data: ' + error, 'danger');
+                }
+            },
+            columns: [
+                { data: 'client' },
+                { data: 'imei' },
+                { data: 'protocol' },
+                { data: 'port' },
+                {
+                    data: null,
+                    orderable: false,
+                    render: function(data, type, row) {
+                        return `<button class="btn btn-primary btn-sm" onclick="openCommandModal('${row.client}', '${row.imei}')">Send</button>`;
+                    }
+                }
+            ],
+            dom: 'Bfrtip',
+            buttons: [
+                'copy', 'csv', 'excel'
+            ],
+            pageLength: 10,
+            order: [[0, 'asc']],
+            language: {
+                search: "Search all columns:",
+                processing: "Loading trackers...",
+                zeroRecords: "No matching trackers found",
+                info: "Showing _START_ to _END_ of _TOTAL_ trackers",
+                infoEmpty: "No trackers available",
+                infoFiltered: "(filtered from _MAX_ total trackers)"
+            }
+        });
+
+        // Refresh data every 30 seconds
+        setInterval(function() {
+            trackersTable.ajax.reload(null, false);
+        }, 30000);
+    });
+
+    function refreshTable() {
+        trackersTable.ajax.reload(null, false);
+    }
+
+    function switchTrackerType() {
+        const trackerType = document.getElementById('trackerTypeSelect').value;
+        
+        // Toggle form sections
+        document.getElementById('gt06Section').style.display = trackerType === 'gt06' ? 'block' : 'none';
+        document.getElementById('bsjSection').style.display = trackerType === 'bsj' ? 'block' : 'none';
+        
+        // Toggle command references
+        document.getElementById('gt06Commands').style.display = trackerType === 'gt06' ? 'block' : 'none';
+        document.getElementById('bsjCommands').style.display = trackerType === 'bsj' ? 'block' : 'none';
+        
+        // Update modal title to reflect the selected tracker type
+        document.getElementById('commandModalLabel').innerText = 
+            trackerType === 'gt06' ? 'Send GT06 Command' : 'Send BSJ-EG01 Command';
+    }
+
+    function openCommandModal(client, imei) {
+        currentClient = client;
+        currentImei = imei;
+        
+        document.getElementById('imeiNumber').value = imei;
+        document.getElementById('commandInput').value = '';
+        document.getElementById('outputPacket').value = '';
+        document.getElementById('bsjCommandInput').value = '';
+        document.getElementById('bsjOutputPacket').value = '';
+        
+        // Reset to GT06 by default
+        document.getElementById('trackerTypeSelect').value = 'gt06';
+        switchTrackerType();
+        
+        commandModal.show();
+    }
+
+    function showAlert(message, type = 'success') {
+        const alertArea = document.getElementById('alertArea');
+        const alertDiv = document.createElement('div');
+        alertDiv.className = `alert alert-${type} alert-dismissible fade show`;
+        alertDiv.innerHTML = `
+            ${message}
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        `;
+        alertArea.appendChild(alertDiv);
+        
+        // Auto-dismiss after 5 seconds
+        setTimeout(() => {
+            alertDiv.remove();
+        }, 5000);
+    }
+
+    async function generateOutputPacket() {
+        const commandInput = document.getElementById('commandInput').value.trim();
+        const imei = document.getElementById('imeiNumber').value.trim();
+        
+        if (!commandInput) {
+            showAlert('Please enter a command to generate the packet', 'warning');
+            return;
+        }
+
+        try {
+            const response = await fetch('/api/generate_gt06_packet', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    imei: imei,
+                    command: commandInput
+                })
+            });
+
+            const data = await response.json();
+            
+            if (response.ok) {
+                // Display the hex representation in the output field for debugging
+                document.getElementById('outputPacket').value = data.hex;
+                
+                // Store both hex and ASCII formats in hidden fields for later use
+                document.getElementById('hexPacket').value = data.hex;
+                document.getElementById('asciiPacket').value = data.packet;
+            } else {
+                showAlert(data.error || 'Error generating packet', 'danger');
+            }
+        } catch (error) {
+            console.error('Error:', error);
+            showAlert('Error generating packet: ' + error.message, 'danger');
+        }
+    }
+
+    async function generateBSJPacket() {
+        const commandInput = document.getElementById('bsjCommandInput').value.trim();
+        const imei = document.getElementById('imeiNumber').value.trim();
+        
+        if (!commandInput) {
+            showAlert('Please enter a BSJ command', 'warning');
+            return;
+        }
+        
+        try {
+            // Call our server-side API to generate the BSJ packet
+            const response = await fetch('/api/generate_bsj_packet', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    command: commandInput,
+                    imei: imei
+                })
+            });
+            
+            const data = await response.json();
+            
+            if (response.ok) {
+                // Display the hex representation in the output field
+                document.getElementById('bsjOutputPacket').value = data.hex;
+                
+                // Store hex packet for later use
+                document.getElementById('hexPacket').value = data.hex;
+            } else {
+                showAlert(data.error || 'Error generating BSJ packet', 'danger');
+            }
+        } catch (error) {
+            console.error('Error:', error);
+            showAlert('Error generating BSJ packet: ' + error.message, 'danger');
+        }
+    }
+
+    async function submitCommand() {
+        const trackerType = document.getElementById('trackerTypeSelect').value;
+        let command, hexPacket;
+        
+        if (trackerType === 'gt06') {
+            // GT06 command logic
+            command = document.getElementById('commandInput').value.trim();
+            hexPacket = document.getElementById('hexPacket').value.trim();
+            
+            if (!command) {
+                showAlert('Please enter a command', 'warning');
+                return;
+            }
+            
+            if (!hexPacket) {
+                showAlert('Please generate a packet first', 'warning');
+                return;
+            }
+        } else {
+            // BSJ-EG01 command logic
+            command = document.getElementById('bsjCommandInput').value.trim();
+            hexPacket = document.getElementById('bsjOutputPacket').value.trim();
+            
+            if (!command) {
+                showAlert('Please enter a BSJ command', 'warning');
+                return;
+            }
+            
+            if (!hexPacket) {
+                showAlert('Please generate a BSJ packet first', 'warning');
+                return;
+            }
+        }
+        
+        try {
+            const response = await fetch('/api/sendcommand', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    client: currentClient,
+                    imei: currentImei,
+                    command: command,
+                    payload: hexPacket,
+                    tracker_type: trackerType
+                })
+            });
+
+            const data = await response.json();
+            
+            if (response.ok) {
+                showAlert(data.message || 'Command sent successfully');
+                commandModal.hide();
+            } else {
+                showAlert(data.error || 'Error sending command', 'danger');
+            }
+        } catch (error) {
+            console.error('Error:', error);
+            showAlert('Error sending command: ' + error.message, 'danger');
+        }
+    }
+</script>
+{% endblock %}

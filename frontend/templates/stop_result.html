@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <div class="card">
+        <div class="card-header bg-warning text-dark">
+            <h2 class="mb-0">Service Status for Client: {{ client.name }}</h2>
+        </div>
+        <div class="card-body">
+            {% for result in results %}
+                <div class="card mb-3">
+                    <div class="card-header">
+                        <h3 class="h5 mb-0">{{ result.type }}</h3>
+                    </div>
+                    <div class="card-body">
+                        <h4 class="h6">Command:</h4>
+                        <pre class="bg-light p-2 rounded"><code>{{ result.command }}</code></pre>
+                        
+                        <h4 class="h6 mt-3">Output:</h4>
+                        {% if result.success %}
+                            <pre class="bg-light p-2 rounded"><code>{{ result.output }}</code></pre>
+                        {% else %}
+                            <div class="alert alert-danger">
+                                <i class="fas fa-exclamation-circle"></i> Error: {{ result.output }}
+                            </div>
+                        {% endif %}
+                    </div>
+                </div>
+            {% endfor %}
+
+            <div class="mt-4">
+                <a href="{{ url_for('index') }}" class="btn btn-secondary">
+                    <i class="fas fa-arrow-left"></i> Back to Home
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+pre {
+    margin-bottom: 0;
+    white-space: pre-wrap;
+}
+code {
+    color: #333;
+}
+</style>
+{% endblock %} 

@@ -1,0 +1,185 @@
+package audit
+
+import (
+	"log"
+	"os"
+	"sync"
+	"time"
+)
+
+// AuditEntry is the data structure passed from listener to Capture()
+type AuditEntry struct {
+	IMEI         string                 // From IncomingPacket
+	RuleID       int64                  // From manifest or 0
+	RuleName     string                 // From rule execution
+	Salience     int                    // From rule execution
+	Description  string                 // From manifest
+	Level        string                 // From manifest (debug/info/warning/critical)
+	IsAlert      bool                   // From manifest
+	StepNumber   int                    // From manifest order field
+	StageReached string                 // Same as Description for now
+	Snapshot     map[string]interface{} // Rich snapshot from extractSnapshot()
+}
+
+// Capture saves audit entry to database in frontend-compatible format
+// This function MUST populate rule_execution_state in the exact format
+// expected by the frontend at /progress-audit-movie
+func Capture(entry *AuditEntry) {
+	if entry == nil || !IsProgressAuditEnabled() {
+		return
+	}
+
+	log.Printf("[Capture] Capturing audit for IMEI %s, Rule %s, IsAlert=%v", entry.IMEI, entry.RuleName, entry.IsAlert)
+
+	// Build ProgressAudit compatible with existing SaveProgressAudit
+	progress := ProgressAudit{
+		IMEI:               entry.IMEI,
+		RuleID:             entry.RuleID,
+		RuleName:           entry.RuleName,
+		StepNumber:         entry.StepNumber,
+		StageReached:       entry.StageReached,
+		Level:              entry.Level,
+		StopReason:         "", // Set if rule didn't fire
+		BufferSize:         extractBufferSize(entry.Snapshot),
+		MetricsReady:       extractMetricsReady(entry.Snapshot),
+		GeofenceEval:       extractGeofenceEval(entry.Snapshot),
+		ContextSnapshot:    JSONMap(entry.Snapshot),
+		ExecutionTime:      time.Now(),
+		ComponentsExecuted: []string{entry.RuleName},
+		ComponentDetails:   JSONMap{"salience": entry.Salience, "level": entry.Level, "is_alert": entry.IsAlert},
+	}
+
+	if err := SaveProgressAudit(progress); err != nil {
+		log.Printf("[Capture] Error saving audit: %v", err)
+	}
+
+	// NEW: If this is an alert rule, also save to alert tables
+	if entry.IsAlert {
+		if err := SaveAlertAudit(entry); err != nil {
+			log.Printf("[Capture] Error saving alert audit: %v", err)
+		}
+	}
+}
+
+// extractBufferSize gets buffer size from snapshot for frontend display
+func extractBufferSize(snapshot map[string]interface{}) int {
+	if buffer, ok := snapshot["buffer_circular"].([]map[string]interface{}); ok {
+		return len(buffer)
+	}
+	// Fallback check for different types or nested maps
+	if buffer, ok := snapshot["buffer_circular"].([]interface{}); ok {
+		return len(buffer)
+	}
+	return 0
+}
+
+// extractMetricsReady checks if metrics are available in snapshot
+func extractMetricsReady(snapshot map[string]interface{}) bool {
+	// Look in packet_current since wrapper_flags is deprecated
+	if packet, ok := snapshot["packet_current"].(map[string]interface{}); ok {
+		if ready, ok := packet["MetricsReady"].(bool); ok {
+			return ready
+		}
+	}
+	return false
+}
+
+// extractGeofenceEval summarizes geofence checks for frontend display
+func extractGeofenceEval(snapshot map[string]interface{}) string {
+	if checks, ok := snapshot["geofence_checks"].(map[string]bool); ok {
+		for name, inside := range checks {
+			if inside {
+				return "inside:" + name
+			}
+		}
+		return "outside_all"
+	}
+	return "not_evaluated"
+}
+
+type ExecutionCapture struct {
+	mu         sync.RWMutex
+	imei       string
+	executions []RuleExecution
+	alertFired bool
+	startTime  time.Time
+}
+
+var (
+	globalCaptures = make(map[string]*ExecutionCapture)
+	capturesMutex  sync.RWMutex
+)
+
+func StartCapture(imei string) *ExecutionCapture {
+	capturesMutex.Lock()
+	defer capturesMutex.Unlock()
+
+	capture := &ExecutionCapture{
+		imei:       imei,
+		executions: []RuleExecution{},
+		alertFired: false,
+		startTime:  time.Now(),
+	}
+
+	globalCaptures[imei] = capture
+	return capture
+}
+
+func (ec *ExecutionCapture) RecordExecution(exec RuleExecution) {
+	ec.mu.Lock()
+	defer ec.mu.Unlock()
+
+	exec.Timestamp = time.Now()
+	ec.executions = append(ec.executions, exec)
+
+	if exec.AlertFired {
+		ec.alertFired = true
+	}
+
+	log.Printf("📝 [AUDIT] Capturado: %s - %s (Alert: %v)", ec.imei, exec.RuleName, exec.AlertFired)
+}
+
+func FinishCapture(imei string) error {
+	capturesMutex.Lock()
+	capture, exists := globalCaptures[imei]
+	delete(globalCaptures, imei)
+	capturesMutex.Unlock()
+
+	if !exists || capture == nil {
+		return nil
+	}
+
+	if os.Getenv("GRULE_AUDIT_ENABLED") != "Y" {
+		return nil
+	}
+
+	level := os.Getenv("GRULE_AUDIT_LEVEL")
+	if level == "NONE" {
+		return nil
+	}
+	if level == "ERROR" && !capture.alertFired {
+		return nil
+	}
+
+	if len(capture.executions) > 0 {
+		return SaveExecutions(imei, capture.executions)
+	}
+
+	return nil
+}
+
+func GetCapture(imei string) *ExecutionCapture {
+	capturesMutex.RLock()
+	defer capturesMutex.RUnlock()
+	return globalCaptures[imei]
+}
+
+func RecordProgress(progress ProgressAudit) {
+	if !IsProgressAuditEnabled() {
+		return
+	}
+
+	if err := SaveProgressAudit(progress); err != nil {
+		log.Printf("❌ Error guardando progress audit: %v", err)
+	}
+}

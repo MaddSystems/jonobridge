@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <div class="card">
+        <div class="card-header bg-warning text-dark">
+            <h2 class="mb-0">Stop Services for Client: {{ client.name }}</h2>
+        </div>
+        <div class="card-body">
+            <div class="alert alert-warning">
+                <i class="fas fa-exclamation-triangle"></i> 
+                Warning: This action will stop all running services for this client.
+            </div>
+
+            <form action="{{ url_for('stop_services', client_id=client.id) }}" method="POST">
+                <button type="submit" class="btn btn-warning">
+                    <i class="fas fa-stop-circle"></i> Stop All Services
+                </button>
+                <a href="{{ url_for('index') }}" class="btn btn-secondary">
+                    <i class="fas fa-arrow-left"></i> Back
+                </a>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

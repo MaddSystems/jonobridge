@@ -1,0 +1,217 @@
+{% extends "base.html" %}
+
+{% block title %}Tramas Inválidas - Grule Engine{% endblock %}
+
+{% block content %}
+<div class="invalid-packets-container">
+    <!-- Header -->
+    <div class="header-section">
+        <h1><i class="fas fa-exclamation-triangle"></i> Tramas Inválidas</h1>
+        <p>IMEIs que han enviado tramas corruptas o vacías (problema del tracker)</p>
+    </div>
+
+    <!-- Grid Section -->
+    <div class="grid-section">
+        <div class="grid-toolbar">
+            <input type="text" id="searchImei" class="form-control form-control-sm" placeholder="Buscar por IMEI..." value="" style="max-width: 300px;">
+            <select id="sortBy" class="form-select form-select-sm" style="max-width: 200px;">
+                <option value="last_seen">Ordenar por: Última Vez</option>
+                <option value="imei">Ordenar por: IMEI</option>
+                <option value="count">Ordenar por: Ocurrencias</option>
+            </select>
+            <button class="btn btn-primary btn-sm" onclick="loadGrid()"><i class="fas fa-search"></i> Buscar</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearSearch()">Limpiar</button>
+            <button class="btn btn-success btn-sm" onclick="downloadCSV()"><i class="fas fa-download"></i> Descargar CSV</button>
+        </div>
+
+        <table id="invalidPacketsGrid" style="width: 100%;"></table>
+        <div id="invalidPacketsGridPager"></div>
+    </div>
+</div>
+
+<style>
+    .invalid-packets-container {
+        padding-top: 20px;
+    }
+
+    .header-section {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 25px;
+        border-radius: 10px;
+        margin-bottom: 30px;
+    }
+
+    .header-section h1 {
+        margin: 0;
+        font-weight: 600;
+        font-size: 2em;
+    }
+
+    .header-section p {
+        margin: 5px 0 0 0;
+        opacity: 0.9;
+    }
+
+    .grid-section {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        margin-bottom: 30px;
+    }
+
+    .grid-toolbar {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 15px;
+        flex-wrap: wrap;
+    }
+
+    /* jqGrid customizations */
+    .ui-jqgrid {
+        border-radius: 8px;
+        overflow: hidden;
+    }
+
+    .ui-jqgrid .ui-jqgrid-htable {
+        background: #f8f9fa;
+    }
+
+    .ui-jqgrid .ui-jqgrid-htable th {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        font-weight: 600;
+    }
+
+    .ui-jqgrid .ui-jqgrid-btable tr:hover {
+        background: #e7f3ff;
+        cursor: pointer;
+    }
+
+    .badge-imei {
+        background: #e7e7ff;
+        color: #667eea;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 0.9em;
+        font-weight: 600;
+        font-family: 'Courier New', monospace;
+    }
+
+    @media (max-width: 768px) {
+        .grid-toolbar {
+            flex-direction: column;
+        }
+
+        .grid-toolbar > * {
+            width: 100%;
+        }
+
+        .header-section h1 {
+            font-size: 1.5em;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<!-- jqGrid CSS and JS -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jqueryui/1.12.1/jquery-ui.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/css/ui.jqgrid.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/jquery.jqgrid.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/js/i18n/grid.locale-es.min.js"></script>
+
+<script>
+    // jqGrid initialization
+    $(document).ready(function() {
+        $('#invalidPacketsGrid').jqGrid({
+            url: '/api/invalid-packets',
+            datatype: 'json',
+            mtype: 'GET',
+            colNames: ['IMEI', 'Ocurrencias', 'Última Vez'],
+            colModel: [
+                { name: 'imei', index: 'imei', width: 150, formatter: imeiFormatter },
+                { name: 'count', index: 'count', width: 100, align: 'center' },
+                { name: 'last_seen', index: 'last_seen', width: 180 }
+            ],
+            pager: '#invalidPacketsGridPager',
+            rowNum: 25,
+            rowList: [10, 25, 50, 100],
+            sortname: 'last_seen',
+            sortorder: 'desc',
+            viewrecords: true,
+            jsonReader: {
+                page: 'page',
+                total: 'total',
+                records: 'total',
+                root: 'data',
+                id: 'imei'
+            },
+            onSortCol: function(index, iCol, sortorder) {
+                // Obtener el nombre de la columna
+                var colModel = $(this).jqGrid('getGridParam', 'colModel');
+                var sortBy = colModel[iCol].index;
+                
+                // Actualizar la URL con el nuevo ordenamiento
+                $(this).jqGrid('setGridParam', {
+                    url: '/api/invalid-packets?sidx=' + sortBy,
+                    page: 1
+                }).trigger('reloadGrid');
+                
+                return 'stop';
+            }
+        });
+
+        $('#invalidPacketsGrid').jqGrid('navGrid', '#invalidPacketsGridPager', {
+            edit: false,
+            add: false,
+            del: false,
+            search: false,
+            refresh: true
+        });
+    });
+
+    // Formatters for jqGrid
+    function imeiFormatter(cellvalue, options, rowObject) {
+        return '<span class="badge-imei">' + cellvalue + '</span>';
+    }
+
+    // Search functions
+    function loadGrid() {
+        const searchText = document.getElementById('searchImei').value;
+        const sortBy = document.getElementById('sortBy').value;
+        
+        $('#invalidPacketsGrid').jqGrid('setGridParam', {
+            url: '/api/invalid-packets?searchText=' + encodeURIComponent(searchText) + '&sidx=' + sortBy,
+            page: 1
+        }).trigger('reloadGrid');
+    }
+
+    function clearSearch() {
+        document.getElementById('searchImei').value = '';
+        document.getElementById('sortBy').value = 'last_seen';
+        loadGrid();
+    }
+
+    function downloadCSV() {
+        const searchText = document.getElementById('searchImei').value;
+        const sortBy = document.getElementById('sortBy').value;
+        
+        // Construir URL de descarga
+        let downloadUrl = '/api/invalid-packets-csv?';
+        if (searchText) {
+            downloadUrl += 'searchText=' + encodeURIComponent(searchText) + '&';
+        }
+        downloadUrl += 'sidx=' + sortBy;
+        
+        // Crear enlace temporal y hacer clic
+        const link = document.createElement('a');
+        link.href = downloadUrl;
+        link.download = 'invalid_packets_' + new Date().toISOString().slice(0,10) + '.csv';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+</script>
+{% endblock %}

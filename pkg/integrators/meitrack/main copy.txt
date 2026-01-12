@@ -1,0 +1,284 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"meitrack/features/meitrack_integrator"
+	"net"
+	"os"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/MaddSystems/jonobridge/common/utils"
+	"golang.org/x/sync/semaphore"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+)
+
+// TrackerData represents the JSON structure to send via HTTP
+type TrackerData struct {
+	TrackerData string `json:"trackerdata"`
+}
+
+var elasticDocName string
+var send_to_elastic string
+var meitrack_mock_imei string
+var meitrack_mock_value string
+var verbose_logging string
+
+// Connection rate limiting semaphore
+var connectionSemaphore = semaphore.NewWeighted(10) // Max 10 concurrent connections
+
+// Message processing counter
+var messageCounter int64
+
+// Function to post data to the HTTP server and publish to MQTT
+func postDataToServer(message_send string, serverAddress string) {
+	// Acquire semaphore before establishing connection (rate limiting)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := connectionSemaphore.Acquire(ctx, 1); err != nil {
+		utils.VPrint("Failed to acquire connection semaphore: %v", err)
+		return
+	}
+	defer connectionSemaphore.Release(1)
+
+	// Attempt to establish a TCP connection to the server with reduced timeout
+	conn, err := net.DialTimeout("tcp", serverAddress, 3*time.Second)
+	if err != nil {
+		utils.VPrint("Failed to connect to %s: %v", serverAddress, err)
+		return // Exit the function if connection fails
+	}
+	defer func() {
+		err := conn.Close()
+		if err != nil && strings.ToUpper(verbose_logging) == "Y" {
+			utils.VPrint("Error closing connection: %v", err)
+		}
+	}()
+
+	if strings.ToUpper(verbose_logging) == "Y" {
+		utils.VPrint("Successfully connected to %s", serverAddress)
+	}
+
+	// Set separate deadlines for read and write operations
+	conn.SetDeadline(time.Now().Add(5 * time.Second))        // Overall deadline
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))    // Read timeout
+	conn.SetWriteDeadline(time.Now().Add(3 * time.Second))   // Write timeout
+
+	// Send the message
+	bytesWritten, err := fmt.Fprintf(conn, "%s\n", message_send)
+	if err != nil {
+		utils.VPrint("Failed to send message: %v", err)
+		return
+	}
+	if strings.ToUpper(verbose_logging) == "Y" {
+		utils.VPrint("Sent %d bytes to %s", bytesWritten, serverAddress)
+	}
+}
+
+// New function to post data to multiple servers
+func postDataToMultipleServers(message_send string, serverAddresses []string) {
+	for _, serverAddress := range serverAddresses {
+		serverAddress = strings.TrimSpace(serverAddress) // Remove any whitespace
+		if serverAddress == "" {
+			continue // Skip empty addresses
+		}
+
+		if strings.ToUpper(verbose_logging) == "Y" {
+			utils.VPrint("Posting to server: %s", serverAddress)
+		}
+		postDataToServer(message_send, serverAddress)
+	}
+}
+
+func main() {
+	// Parse command-line flags
+	flag.Parse()
+
+	// Get server addresses from environment variable
+	serverAddressesEnv := os.Getenv("MEITRACK_HOST")
+	var serverAddresses []string
+
+	if serverAddressesEnv == "" {
+		// Default server if not set
+		serverAddresses = []string{"server1.gpscontrol.com.mx:8500"}
+		utils.VPrint("MEITRACK_HOST not set. Using default server address: %s", serverAddresses[0])
+	} else {
+		// Parse comma-separated list of servers
+		serverAddresses = strings.Split(serverAddressesEnv, ",")
+		utils.VPrint("Using multiple MEITRACK_HOST servers: %s", serverAddressesEnv)
+	}
+
+	// Get the MEITRACK_FWD_ONLY_ADAS environment variable
+	fwdOnlyADAS := os.Getenv("MEITRACK_FWD_ONLY_ADAS")
+	utils.VPrint("MEITRACK_FWD_ONLY_ADAS setting: %s", fwdOnlyADAS)
+	elasticDocName = os.Getenv("ELASTIC_DOC_NAME")
+	if elasticDocName == "" {
+		elasticDocName = "meitrack"
+	}
+	// Check if the environment variable is set to "Y" or "N"
+	send_to_elastic = os.Getenv("SEND_TO_ELASTIC")
+	if send_to_elastic == "" {
+		send_to_elastic = "N"
+	}
+	utils.VPrint("SEND_TO_ELASTIC: %s", send_to_elastic)
+
+	meitrack_mock_imei = os.Getenv("MEITRACK_MOCK_IMEI")
+	if meitrack_mock_imei == "" {
+		meitrack_mock_imei = "N"
+	}
+	utils.VPrint("MEITRACK_MOCK_IMEI: %s", meitrack_mock_imei)
+	meitrack_mock_value = os.Getenv("MEITRACK_MOCK_VALUE")
+	if meitrack_mock_value == "" {
+		meitrack_mock_value = ""
+	}
+	utils.VPrint("MEITRACK_MOCK_VALUE: %s", meitrack_mock_value)
+
+	// Get verbose logging setting
+	verbose_logging = os.Getenv("MEITRACK_VERBOSE_LOGGING")
+	if verbose_logging == "" {
+		verbose_logging = "N"
+	}
+	utils.VPrint("MEITRACK_VERBOSE_LOGGING: %s", verbose_logging)
+
+	// MQTT connection options
+	opts := mqtt.NewClientOptions()
+	mqttBrokerHost := os.Getenv("MQTT_BROKER_HOST")
+	if mqttBrokerHost == "" {
+		log.Fatal("MQTT_BROKER_HOST environment variable not set")
+	}
+	brokerURL := fmt.Sprintf("tcp://%s:1883", mqttBrokerHost)
+	opts.AddBroker(brokerURL)
+	clientID := fmt.Sprintf("MEITRACK_%s_%s_%d",
+		"MEITRACK",
+		os.Getenv("HOSTNAME"),
+		time.Now().UnixNano()%100000)
+	opts.SetClientID(clientID)
+
+	// Configure settings for multiple listeners
+	opts.SetCleanSession(false) // Maintain persistent session
+	opts.SetAutoReconnect(true) // Auto reconnect on connection loss
+	opts.SetKeepAlive(60 * time.Second)
+	opts.SetOrderMatters(true) // Maintain message order
+	opts.SetResumeSubs(true)   // Resume stored subscriptions
+
+	// Define MQTT message handler
+	var mqttClient mqtt.Client
+	opts.SetDefaultPublishHandler(func(client mqtt.Client, msg mqtt.Message) {
+		// Post the received data to the server
+
+	})
+
+	// Attempt to connect to the MQTT broker in a loop until successful
+	for {
+		mqttClient = mqtt.NewClient(opts)
+		if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+			utils.VPrint("Error connecting to MQTT broker at %s: %v. Retrying in 5 seconds...", brokerURL, token.Error())
+			time.Sleep(5 * time.Second) // Wait before retrying
+			continue                    // Retry the connection
+		}
+		utils.VPrint("Successfully connected to the MQTT broker")
+		break // Exit the loop once connected
+	}
+
+	// Start message processing counter reporting
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute) // Report every 5 minutes instead of 30 seconds
+		defer ticker.Stop()
+		lastCount := int64(0)
+		for {
+			select {
+			case <-ticker.C:
+				currentCount := atomic.LoadInt64(&messageCounter)
+				messagesInInterval := currentCount - lastCount
+				utils.VPrint("Messages processed: %d total, %d in last 5 minutes", currentCount, messagesInInterval)
+				lastCount = currentCount
+			}
+		}
+	}()
+
+	// Subscribe to jonoprotocol topic
+	subscribe_topic := "tracker/jonoprotocol"
+	utils.VPrint("Subscribe topic: %s", subscribe_topic)
+	messageHandler := func(client mqtt.Client, msg mqtt.Message) {
+		// Process each message in a separate goroutine to avoid blocking the MQTT handler
+		go func() {
+			// Increment message counter
+			count := atomic.AddInt64(&messageCounter, 1)
+			
+			// Only log individual messages if verbose logging is enabled
+			if strings.ToUpper(verbose_logging) == "Y" {
+				utils.VPrint("Processing message #%d on topic %s", count, msg.Topic())
+			}
+
+			trackerData := string(msg.Payload())
+
+		messageToForward, isADASEvent, err := meitrack_integrator.Initialize(trackerData, meitrack_mock_imei, meitrack_mock_value)
+		if err != nil {
+			utils.VPrint("Error processing tracker data: %v", err)
+			return // Don't continue on error
+		}
+
+		if len(messageToForward) == 0 {
+			utils.VPrint("No messages to forward")
+			return // Don't continue if no messages
+		}
+
+		// Check if we should post based on ADAS settings
+		shouldPost := true
+		if strings.ToUpper(fwdOnlyADAS) == "Y" && !isADASEvent {
+			if strings.ToUpper(verbose_logging) == "Y" {
+				utils.VPrint("Skipping non-ADAS event. MEITRACK_FWD_ONLY_ADAS=Y and isADASEvent=%v", isADASEvent)
+			}
+			shouldPost = false
+		}
+
+		if shouldPost {
+			if strings.ToUpper(verbose_logging) == "Y" {
+				utils.VPrint("Posting %s event", map[bool]string{true: "ADAS", false: "non-ADAS"}[isADASEvent])
+			}
+			message_send := strings.Join(messageToForward, "")
+
+			// Post to all configured servers
+			postDataToMultipleServers(message_send, serverAddresses)
+			if strings.ToUpper(verbose_logging) == "Y" {
+				utils.VPrint("Posting:%v", message_send)
+			}
+
+			if send_to_elastic == "Y" {
+				fields := strings.Split(message_send, ",")
+				imei := ""
+				// Check if there are enough fields
+				if len(fields) > 1 {
+					imei = fields[1]
+				} else {
+					utils.VPrint("Invalid input format")
+				}
+
+				info := fmt.Sprint(message_send)
+				logData := utils.ElasticLogData{
+					Client:     elasticDocName,
+					IMEI:       imei,
+					Payload:    info,
+					Time:       time.Now().Format(time.RFC3339),
+					StatusCode: 200,
+					StatusText: "OK",
+				}
+				if err := utils.SendToElastic(logData, elasticDocName); err != nil {
+					utils.VPrint("Error sending to Elasticsearch: %v", err)
+				}
+			}
+		}
+		}() // End of goroutine
+	}
+	if token := mqttClient.Subscribe(subscribe_topic, 1, messageHandler); token.Wait() && token.Error() != nil {
+		log.Fatalf("Error subscribing to topic %s: %v", subscribe_topic, token.Error())
+	}
+	utils.VPrint("Subscribed to topic: %s", subscribe_topic)
+	// Keep the application running
+	select {}
+}

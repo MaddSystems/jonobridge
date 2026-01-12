@@ -1,0 +1,9 @@
+apiVersion: jonobridge.dwim.mx/v1alpha1
+kind: Jonobridge
+metadata:
+  labels:
+    app.kubernetes.io/name: jonobridge
+    app.kubernetes.io/managed-by: kustomize
+  name: jonobridge-sample
+spec:
+  # TODO(user): Add fields here

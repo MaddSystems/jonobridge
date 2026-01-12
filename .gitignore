@@ -1,0 +1,15 @@
+# Environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Binaries
+grule-engine
+pinoprotocol
+
+# Log files
+logs.txt
+proxy.txt

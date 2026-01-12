@@ -1,0 +1,32 @@
+// ═══════════════════════════════════════════════════════════════════
+// name: Speed Alert - Movimiento Detectado
+// category: Alerts  
+// description: Dispara una alerta por Telegram cuando el vehículo está en movimiento (velocidad > 20 km/h)
+// ═══════════════════════════════════════════════════════════════════
+
+rule SpeedAlert "Alerta cuando está en movimiento (velocidad > 20 km/h)" salience 100 {
+    when
+        Jono.Speed > 20 &&
+        (Jono.PositioningStatus == "A" || Jono.PositioningStatus == "true") &&
+        property.Cond1Processed == false
+    then
+        // Log del evento
+        actions.Log("🚨 ALERTA DE MOVIMIENTO - IMEI: " + Jono.IMEI);
+        actions.Log("📍 Ubicación: Lat=" + Jono.Latitude + ", Lon=" + Jono.Longitude);
+        actions.Log("⏱️  Hora: " + Jono.Datetime.String());
+        actions.Log("📏 Velocidad: " + Jono.Speed + " km/h");
+        
+        // Enviar alerta por Telegram
+        actions.SendTelegram(
+            "🚨 ALERTA DE MOVIMIENTO\n" +
+            "IMEI: " + Jono.IMEI + "\n" +
+            "Velocidad: " + Jono.Speed + " km/h\n" +
+            "Ubicación: (" + Jono.Latitude + ", " + Jono.Longitude + ")\n" +
+            "Hora: " + Jono.Datetime.String()
+        );
+        
+        // AUDITORÍA: Marcar flags para que se registre en la base de datos
+        property.SetCond1Processed(true);  // Marca que se procesó (para contar steps)
+        property.SetCond1Passed(true);      // Marca que pasó exitosamente (para status)
+        Jono.AlertFired = true;             // Marca que hubo alerta (para alert_fired column)
+}

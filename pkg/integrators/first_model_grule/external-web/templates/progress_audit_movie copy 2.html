@@ -1,0 +1,404 @@
+{% extends "base.html" %}
+
+{% block title %}Progress Audit - Movie Frames{% endblock %}
+
+{% block content %}
+<div class="audit-container">
+    <div class="header-section">
+        <h1><i class="bi bi-film"></i> Auditoría de Progreso (Movie Frames)</h1>
+    </div>
+
+    <div class="grid-section">
+        <div class="row align-items-end">
+            <div class="col-md-5">
+                <label for="rule-selector" class="form-label">Filtrar por Regla:</label>
+                <select id="rule-selector" class="form-select">
+                    <option selected value="">Todas las reglas</option>
+                </select>
+            </div>
+            <div class="col-md-4">
+                <label for="imei-search" class="form-label">Buscar por IMEI:</label>
+                <div class="input-group">
+                    <input type="text" class="form-control" id="imei-search" placeholder="Ingrese IMEI y presione Enter...">
+                    <button id="search-btn" class="btn btn-outline-primary"><i class="bi bi-search"></i></button>
+                    <button id="clear-search-btn" class="btn btn-outline-secondary"><i class="bi bi-x-lg"></i></button>
+                </div>
+            </div>
+            <div class="col-md-3">
+                 <label class="form-label">&nbsp;</label>
+                <button id="load-imeis-btn" class="btn btn-primary w-100"><i class="bi bi-arrow-clockwise"></i> Cargar / Recargar</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="grid-section">
+        <table id="imeis-grid"></table>
+        <div id="imeis-pager"></div>
+    </div>
+</div>
+
+<style>
+    .audit-container {
+        padding-top: 20px;
+    }
+
+    .header-section {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 25px;
+        border-radius: 10px;
+        margin-bottom: 30px;
+    }
+
+    .header-section h1 {
+        margin: 0;
+        font-weight: 600;
+        font-size: 2em;
+    }
+
+    .grid-section {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        margin-bottom: 30px;
+    }
+
+    /* jqGrid customizations */
+    .ui-jqgrid {
+        border-radius: 8px;
+        overflow: hidden;
+    }
+
+    .ui-jqgrid .ui-jqgrid-htable {
+        background: #f8f9fa;
+    }
+
+    .ui-jqgrid .ui-jqgrid-htable th {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        font-weight: 600;
+    }
+
+    .ui-jqgrid .ui-jqgrid-btable tr:hover {
+        background: #e7f3ff;
+        cursor: pointer;
+    }
+
+    .badge-imei {
+        background: #e7e7ff;
+        color: #667eea;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 0.9em;
+        font-weight: 600;
+        font-family: 'Courier New', monospace;
+    }
+
+    .accordion-button:not(.collapsed) {
+        background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+        color: #667eea;
+    }
+
+    .accordion-button:focus {
+        border-color: #667eea;
+        box-shadow: 0 0 0 0.25rem rgba(102, 126, 234, 0.25);
+    }
+
+    @media (max-width: 768px) {
+        .grid-toolbar {
+            flex-direction: column;
+        }
+
+        .grid-toolbar > * {
+            width: 100%;
+        }
+
+        .header-section h1 {
+            font-size: 1.5em;
+        }
+
+        .modal-xl {
+            max-width: 95vw;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jqueryui/1.12.1/jquery-ui.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/css/ui.jqgrid.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/jquery.jqgrid.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/js/i18n/grid.locale-es.min.js"></script>
+
+<script>
+    $(document).ready(function() {
+        const API_BASE_URL = "https://jonobridge.madd.com.mx/grule/api/audit/progress";
+
+        // 1. Cargar reglas
+        $.ajax({
+            url: `${API_BASE_URL}/rules`,
+            type: 'GET',
+            success: function(response) {
+                if (response.success) {
+                    const selector = $('#rule-selector');
+                    // Limpiamos solo las opciones, no el "Todas las reglas"
+                    selector.find('option[value!=""]').remove();
+                    response.rules.forEach(rule => {
+                        selector.append(`<option value="${rule.rule_name}">${rule.rule_name} (${rule.total_imeis} IMEIs)</option>`);
+                    });
+                }
+            }
+        });
+
+        // 2. Grid principal con paginación de servidor
+        $("#imeis-grid").jqGrid({
+            url: `${API_BASE_URL}/summary`,
+            datatype: "json",
+            mtype: "GET",
+            colNames: ['IMEI', 'Regla', 'Max Step', 'Frames', 'Última Frame'],
+            colModel: [
+                { name: 'imei', width: 200, formatter: (cell) => `<span class="badge-imei">${cell}</span>`, sortable: true },
+                { name: 'rule_name', width: 250, sortable: true },
+                { name: 'max_step', width: 100, align: 'center', sortable: true },
+                { name: 'total_frames', width: 100, align: 'center', sortable: true },
+                { 
+                  name: 'last_frame_time', 
+                  width: 180, 
+                  sortable: true,
+                  formatter: function(cellvalue) {
+                    if (!cellvalue) return '—';
+                    const date = new Date(cellvalue);
+                    const year = date.getUTCFullYear();
+                    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+                    const day = String(date.getUTCDate()).padStart(2, '0');
+                    const hours = String(date.getUTCHours()).padStart(2, '0');
+                    const minutes = String(date.getUTCMinutes()).padStart(2, '0');
+                    const seconds = String(date.getUTCSeconds()).padStart(2, '0');
+                    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds} UTC`;
+                  }
+                }
+            ],
+            rowNum: 25,
+            rowList: [25, 50, 100, 200],
+            pager: '#imeis-pager',
+            sortname: 'last_frame_time',
+            sortorder: 'desc',
+            viewrecords: true,
+            loadonce: false, // ¡Clave para paginación de servidor!
+            jsonReader: {
+                root: "rows",
+                page: "page",
+                total: "total",
+                records: "records",
+                repeatitems: false,
+                id: "imei" // Asumiendo que la combinación imei+rule_name es única, o ajustar si es necesario
+            },
+            prmNames: {
+                page: "page",
+                rows: "rows",
+                sort: "sidx",
+                order: "sord"
+            },
+            onSelectRow: function(rowid) {
+                if (rowid) {
+                    const rowData = $(this).jqGrid('getRowData', rowid);
+                    const imei = rowData.imei.replace(/<[^>]*>/g, '');
+                    const ruleName = rowData.rule_name;
+                    showTimelineModal(imei, ruleName);
+                }
+            },
+            height: 'auto',
+            autowidth: true,
+        });
+
+        $('#imeis-grid').jqGrid('navGrid', '#imeis-pager', { edit:false, add:false, del:false, search:false, refresh:true });
+
+        function reloadImeisGrid() {
+            const ruleName = $("#rule-selector").val();
+            const imeiSearch = $("#imei-search").val().trim();
+
+            $("#imeis-grid").jqGrid('setGridParam', {
+                url: `${API_BASE_URL}/summary`,
+                postData: {
+                    rule_name: ruleName,
+                    imei: imeiSearch,
+                },
+                page: 1
+            }).trigger("reloadGrid");
+        }
+
+        $("#load-imeis-btn, #search-btn").on("click", reloadImeisGrid);
+        
+        $("#clear-search-btn").on("click", function() {
+            $("#imei-search").val('');
+            reloadImeisGrid();
+        });
+
+        $("#imei-search").on("keypress", function(e) {
+            if (e.which === 13) {
+                reloadImeisGrid();
+            }
+        });
+
+        // Cargar la grilla inicialmente al cargar la página
+        reloadImeisGrid();
+
+        // ====================================================================
+        // FUNCIÓN MEJORADA: Panel Dividido (Master-Detail)
+        // Muestra la tabla a la izquierda y el JSON del Snapshot a la derecha.
+        // ====================================================================
+         function showTimelineModal(imei, ruleName) {
+            // 1. ELIMINAR COMPLETAMENTE el modal anterior (esto es clave)
+            $('#timelineModal').remove();
+            $('.modal-backdrop').remove(); // limpia fondo oscuro residual
+            $('body').removeClass('modal-open').css('padding-right', '');
+
+            // 2. Recrear modal desde cero con la estructura de panel dividido
+            $('body').append(`
+                <div class="modal fade" id="timelineModal" tabindex="-1">
+                    <div class="modal-dialog modal-xl"> 
+                        <div class="modal-content">
+                            <div class="modal-header bg-primary text-white">
+                                <h5 class="modal-title">
+                                    Timeline - IMEI: <strong>${imei}</strong>
+                                </h5>
+                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                            </div>
+                            <div class="modal-body p-0">
+                                <div class="row g-0">
+                                    <div class="col-md-7 border-end">
+                                        <table id="timeline-grid" style="width:100%"></table>
+                                        <div id="timeline-pager"></div>
+                                    </div>
+
+                                    <div class="col-md-5 bg-light p-3">
+                                        <h6><i class="bi bi-code-slash"></i> Detalle del Snapshot (JSON)</h6>
+                                        <hr>
+                                        <div style="max-height: 500px; overflow-y: auto;">
+                                            <pre id="json-viewer" style="
+                                                font-size: 0.85em; 
+                                                background: white; 
+                                                padding: 15px; 
+                                                border-radius: 8px; 
+                                                border: 1px solid #ddd; 
+                                                white-space: pre-wrap;
+                                            ">Selecciona una fila para ver el detalle del Snapshot.
+                                            
+Si la fila no tiene un ícono de ojo, el Snapshot está vacío.
+                                            </pre>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="modal-footer bg-light">
+                                <small class="text-muted">Total frames: <span id="total-frames">0</span></small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `);
+
+            // 3. URL
+            let url = `${API_BASE_URL}/timeline?imei=${imei}&limit=1000`;
+            if (ruleName) url += `&rule_name=${encodeURIComponent(ruleName)}`;
+
+            // 4. Crear jqGrid desde cero
+            $("#timeline-grid").jqGrid({
+                url: url,
+                datatype: "json",
+                mtype: "GET",
+                colNames: ['Timestamp', 'Step', 'Stage', ''], // Título de columna vacío
+                colModel: [
+                    { 
+                        name: 'execution_time', 
+                        width: 180,
+                        formatter: function(cellvalue) {
+                            if (!cellvalue) return '—';
+                            const date = new Date(cellvalue);
+                            return date.toLocaleString('es-MX', { 
+                                year: 'numeric', month: '2-digit', day: '2-digit',
+                                hour: '2-digit', minute: '2-digit', second: '2-digit'
+                            });
+                        }
+                    },
+                    { 
+                        name: 'step_number', 
+                        width: 80, 
+                        align: 'center',
+                        formatter: function(cellvalue) {
+                            return cellvalue ? `<strong>${cellvalue}</strong>` : '?';
+                        }
+                    },
+                    { 
+                        name: 'stage_reached', 
+                        width: 180,
+                        formatter: function(cellvalue) {
+                            if (!cellvalue) return '<code>—</code>';
+                            const s = cellvalue.toLowerCase();
+                            if (s.includes('alert')) return '<span class="badge bg-danger">alert_fired</span>';
+                            if (s.includes('metrics')) return '<span class="badge bg-warning text-dark">metrics_calc</span>';
+                            if (s.includes('buffer')) return '<span class="badge bg-info text-white">buffer_update</span>';
+                            if (s.includes('expression')) return '<span class="badge bg-success">expression_eval</span>';
+                            return `<code>${cellvalue}</code>`;
+                        }
+                    },
+                    { 
+                        name: 'snapshot', 
+                        width: 40, // Reducimos el ancho para solo mostrar el ícono
+                        align: 'center', 
+                        sortable: false,
+                        // El formatter solo muestra el ícono (ya no hace click para abrir ventana)
+                        formatter: (c, o, r) => r.snapshot ? `<i class="bi bi-eye text-primary"></i>` : '' 
+                    }
+                ],
+                rowNum: 20,
+                rowList: [10, 20, 50, 100],
+                pager: '#timeline-pager',
+                sortname: 'execution_time',
+                sortorder: 'asc',
+                viewrecords: true,
+                loadonce: true,
+                height: 500, // Altura ajustada para el nuevo diseño
+                autowidth: true,
+                shrinkToFit: true,
+                jsonReader: {
+                    root: "frames",
+                    records: "count",
+                    repeatitems: false
+                },
+                
+                // *** IMPLEMENTACIÓN DEL MASTER-DETAIL (CLAVE) ***
+                onSelectRow: function(rowid) {
+                    if (rowid) {
+                        // Importante: getLocalRow obtiene el objeto completo, incluyendo 'snapshot'
+                        const rowData = $(this).jqGrid('getLocalRow', rowid);
+                        
+                        const viewer = $('#json-viewer');
+
+                        if (rowData && rowData.snapshot) {
+                            // Mostrar JSON formateado en el panel derecho
+                            const formattedJson = JSON.stringify(rowData.snapshot, null, 2);
+                            viewer.text(formattedJson);
+                        } else {
+                            // Mensaje si no hay snapshot
+                            viewer.html('<span class="text-muted">No hay datos de Snapshot disponibles para este frame.</span>');
+                        }
+                    }
+                },
+                // *** FIN DE IMPLEMENTACIÓN ***
+
+                loadComplete: function(data) {
+                    const count = data.count || (data.frames ? data.frames.length : 0);
+                    $("#total-frames").text(count);
+                }
+            });
+
+            // 5. Mostrar modal
+            const modal = new bootstrap.Modal(document.getElementById('timelineModal'));
+            modal.show();
+        }
+    });
+</script>
+
+{% endblock %}

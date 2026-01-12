@@ -1,0 +1,15 @@
+2026/01/07 19:31:51 Starting GRULE Backend (Jammer) on port 8081...
+2026/01/07 19:31:51 🔌 Connecting to MySQL with DSN: gpscontrol:qazwsxedc@tcp(127.0.0.1:3306)/grule?parseTime=true&charset=utf8mb4
+2026/01/07 19:31:51 ✅ Connected to MySQL (Backend)
+2026/01/07 19:31:51 📁 Current database: grule
+2026/01/07 19:31:51 ✅ fleet_rules table verified/created
+2026/01/07 19:31:51 Creating vehicle_rule_state table...
+2026/01/07 19:31:51 📋 vehicle_rule_state table verified/created
+2026/01/07 19:31:51 Loading rule: AuditIntegrationTest
+2026/01/07 19:31:51 [Manifest] Loaded manifest for rule 'AuditIntegrationTest'
+2026/01/07 19:31:51 Loaded 1 audit rule entries
+2026/01/07 19:31:51 Listening on :8081
+2026/01/07 19:31:51 Connected to MQTT at localhost
+2026/01/07 19:31:56 ✅ Progress Audit ENABLED
+2026/01/07 19:31:56 [Capture] Capturing audit for IMEI TEST_AUDIT_999, Rule AuditIntegrationTest
+2026/01/07 19:31:56 [GRULE] Audit test fired

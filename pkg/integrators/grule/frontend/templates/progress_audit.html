@@ -1,0 +1,391 @@
+{% extends "base.html" %}
+
+{% block title %}Progress Audit - Rule Execution Tracking{% endblock %}
+
+{% block content %}
+<div class="container-fluid">
+    <div class="row mb-4">
+        <div class="col-12">
+            <h2 class="mb-3">
+                <i class="bi bi-activity"></i> Progress Audit - Rule Execution Tracking
+            </h2>
+            <p class="text-muted">
+                Track rule execution states for IMEIs that haven't triggered alerts yet. 
+                Monitor buffer fill status, metrics calculation, geofence evaluation, and stop reasons.
+            </p>
+        </div>
+    </div>
+
+    <!-- Control Panel -->
+    <div class="row mb-4">
+        <div class="col-md-12">
+            <div class="card">
+                <div class="card-header bg-primary text-white">
+                    <h5 class="mb-0"><i class="bi bi-gear"></i> Progress Audit Controls</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row align-items-center">
+                        <div class="col-md-4">
+                            <h6>Status: <span id="status-badge" class="badge bg-secondary">Checking...</span></h6>
+                            <p class="text-muted small mb-0">Auditoría de progreso actualmente <span id="status-text">desconocido</span></p>
+                        </div>
+                        <div class="col-md-8">
+                            <div class="btn-group" role="group">
+                                <button id="btn-enable" class="btn btn-success" onclick="enableProgressAudit()">
+                                    <i class="bi bi-play-circle"></i> Activar
+                                </button>
+                                <button id="btn-disable" class="btn btn-warning" onclick="disableProgressAudit()">
+                                    <i class="bi bi-pause-circle"></i> Desactivar
+                                </button>
+                                <button id="btn-clear" class="btn btn-danger" onclick="clearProgressAudit()">
+                                    <i class="bi bi-trash"></i> Limpiar Datos
+                                </button>
+                                <button class="btn btn-info" onclick="refreshStatus()">
+                                    <i class="bi bi-arrow-clockwise"></i> Actualizar
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Query Section -->
+    <div class="row mb-4">
+        <div class="col-md-12">
+            <div class="card">
+                <div class="card-header bg-info text-white">
+                    <h5 class="mb-0"><i class="bi bi-search"></i> Query Progress by IMEI</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-8">
+                            <input type="text" id="search-imei" class="form-control" 
+                                   placeholder="Enter IMEI (e.g. 860599004199804)" />
+                        </div>
+                        <div class="col-md-2">
+                            <input type="number" id="search-limit" class="form-control" 
+                                   placeholder="Limit" value="50" min="1" max="500" />
+                        </div>
+                        <div class="col-md-2">
+                            <button class="btn btn-primary w-100" onclick="queryProgress()">
+                                <i class="bi bi-search"></i> Buscar
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Results Section -->
+    <div class="row">
+        <div class="col-md-12">
+            <div class="card">
+                <div class="card-header bg-dark text-white">
+                    <h5 class="mb-0">
+                        <i class="bi bi-table"></i> Progress Audit Results
+                        <span id="results-count" class="badge bg-light text-dark ms-2">0 records</span>
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <div id="results-container">
+                        <div class="alert alert-info">
+                            <i class="bi bi-info-circle"></i> 
+                            Enter an IMEI above to view execution progress
+                        </div>
+                    </div>
+
+                    <div id="results-table" style="display: none;">
+                        <div class="table-responsive">
+                            <table class="table table-striped table-hover">
+                                <thead class="table-dark">
+                                    <tr>
+                                        <th>Execution Time</th>
+                                        <th>Rule Name</th>
+                                        <th>DEFCON</th>
+                                        <th>Stage reached</th>
+                                        <th>Stop Reason</th>
+                                        <th>Buffer Size</th>
+                                        <th>Metrics Ready</th>
+                                        <th>Geofence Eval</th>
+                                        <th>Details</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="results-tbody">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Modal for Packet Data Details -->
+<div class="modal fade" id="detailsModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-dark text-white">
+                <h5 class="modal-title">Packet Data Details</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <pre id="details-json" class="bg-light p-3" style="max-height: 500px; overflow-y: auto;"></pre>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .badge-stage-buffer_update { background-color: #0d6efd; }
+    .badge-stage-metrics_calc { background-color: #6610f2; }
+    .badge-stage-expression_eval { background-color: #fd7e14; }
+    .badge-stage-alert_fired { background-color: #dc3545; }
+    
+    .badge-stop-waiting { background-color: #6c757d; }
+    .badge-stop-valid { background-color: #198754; }
+    .badge-stop-geofence { background-color: #ffc107; color: #000; }
+    .badge-stop-triggered { background-color: #dc3545; }
+</style>
+
+<script>
+let progressModal;
+
+document.addEventListener('DOMContentLoaded', function() {
+    progressModal = new bootstrap.Modal(document.getElementById('detailsModal'));
+    refreshStatus();
+    
+    // Allow Enter key to trigger search
+    document.getElementById('search-imei').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') {
+            queryProgress();
+        }
+    });
+});
+
+function refreshStatus() {
+    fetch('https://jonobridge.madd.com.mx/grule/api/audit/progress/status')
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                const enabled = data.enabled;
+                const badge = document.getElementById('status-badge');
+                const text = document.getElementById('status-text');
+                
+                if (enabled) {
+                    badge.textContent = 'ACTIVO';
+                    badge.className = 'badge bg-success';
+                    text.textContent = 'activo';
+                    document.getElementById('btn-enable').disabled = true;
+                    document.getElementById('btn-disable').disabled = false;
+                } else {
+                    badge.textContent = 'INACTIVO';
+                    badge.className = 'badge bg-secondary';
+                    text.textContent = 'inactivo';
+                    document.getElementById('btn-enable').disabled = false;
+                    document.getElementById('btn-disable').disabled = true;
+                }
+            }
+        })
+        .catch(error => {
+            console.error('Error fetching status:', error);
+            showAlert('Error obteniendo estado', 'danger');
+        });
+}
+
+function enableProgressAudit() {
+    if (!confirm('¿Activar auditoría de progreso? Esto comenzará a registrar todos los estados de ejecución.')) {
+        return;
+    }
+    
+    fetch('https://jonobridge.madd.com.mx/grule/api/audit/progress/enable', { method: 'POST' })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                showAlert('Auditoría de progreso ACTIVADA', 'success');
+                refreshStatus();
+            } else {
+                showAlert('Error: ' + (data.error || 'Unknown error'), 'danger');
+            }
+        })
+        .catch(error => {
+            console.error('Error enabling:', error);
+            showAlert('Error activando auditoría', 'danger');
+        });
+}
+
+function disableProgressAudit() {
+    if (!confirm('¿Desactivar auditoría de progreso? No se registrarán más estados.')) {
+        return;
+    }
+    
+    fetch('https://jonobridge.madd.com.mx/grule/api/audit/progress/disable', { method: 'POST' })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                showAlert('Auditoría de progreso DESACTIVADA', 'warning');
+                refreshStatus();
+            } else {
+                showAlert('Error: ' + (data.error || 'Unknown error'), 'danger');
+            }
+        })
+        .catch(error => {
+            console.error('Error disabling:', error);
+            showAlert('Error desactivando auditoría', 'danger');
+        });
+}
+
+function clearProgressAudit() {
+    if (!confirm('⚠️ ¿BORRAR TODOS los datos de auditoría de progreso?\n\nEsta acción NO se puede deshacer.')) {
+        return;
+    }
+    
+    fetch('https://jonobridge.madd.com.mx/grule/api/audit/progress/clear', { method: 'POST' })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                showAlert('Datos de auditoría BORRADOS', 'info');
+                document.getElementById('results-table').style.display = 'none';
+                document.getElementById('results-container').innerHTML = `
+                    <div class="alert alert-info">
+                        <i class="bi bi-info-circle"></i> 
+                        All progress audit data has been cleared
+                    </div>
+                `;
+            } else {
+                showAlert('Error: ' + (data.error || 'Unknown error'), 'danger');
+            }
+        })
+        .catch(error => {
+            console.error('Error clearing:', error);
+            showAlert('Error borrando datos', 'danger');
+        });
+}
+
+function queryProgress() {
+    const imei = document.getElementById('search-imei').value.trim();
+    const limit = document.getElementById('search-limit').value || 50;
+    
+    if (!imei) {
+        showAlert('Por favor ingrese un IMEI', 'warning');
+        return;
+    }
+    
+    fetch(`https://jonobridge.madd.com.mx/grule/api/audit/progress/query?imei=${encodeURIComponent(imei)}&limit=${limit}`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                displayResults(data.data || [], data.imei);
+                document.getElementById('results-count').textContent = `${data.count || 0} records`;
+            } else {
+                showAlert('Error: ' + (data.error || 'Unknown error'), 'danger');
+            }
+        })
+        .catch(error => {
+            console.error('Error querying:', error);
+            showAlert('Error consultando datos', 'danger');
+        });
+}
+
+function displayResults(results, imei) {
+    const container = document.getElementById('results-container');
+    const table = document.getElementById('results-table');
+    const tbody = document.getElementById('results-tbody');
+    
+    if (!results || results.length === 0) {
+        container.innerHTML = `
+            <div class="alert alert-warning">
+                <i class="bi bi-exclamation-triangle"></i> 
+                No progress data found for IMEI: <strong>${imei}</strong>
+            </div>
+        `;
+        table.style.display = 'none';
+        return;
+    }
+    
+    // Show table
+    container.innerHTML = '';
+    table.style.display = 'block';
+    tbody.innerHTML = '';
+    
+    results.forEach(record => {
+        const row = document.createElement('tr');
+        
+        const stageBadgeClass = getStageBadgeClass(record.stage_reached);
+        const stopBadgeClass = getStopBadgeClass(record.stop_reason);
+        
+        row.innerHTML = `
+            <td>${formatDateTime(record.execution_time)}</td>
+            <td><code>${record.rule_name}</code></td>
+            <td><span class="badge ${stageBadgeClass}">${record.stage_reached}</span></td>
+            <td><span class="badge ${stopBadgeClass}">${record.stop_reason}</span></td>
+            <td><strong>${record.buffer_size}</strong>/10</td>
+            <td>${record.metrics_ready ? '<i class="bi bi-check-circle-fill text-success"></i>' : '<i class="bi bi-x-circle-fill text-danger"></i>'}</td>
+            <td><span class="badge bg-secondary">${record.geofence_eval}</span></td>
+            <td>
+                <button class="btn btn-sm btn-info" onclick='showDetails(${JSON.stringify(record).replace(/'/g, "&apos;")})'>
+                    <i class="bi bi-eye"></i> Ver
+                </button>
+            </td>
+        `;
+        
+        tbody.appendChild(row);
+    });
+}
+
+function getStageBadgeClass(stage) {
+    const mapping = {
+        'buffer_update': 'badge-stage-buffer_update',
+        'metrics_calc': 'badge-stage-metrics_calc',
+        'expression_eval': 'badge-stage-expression_eval',
+        'alert_fired': 'badge-stage-alert_fired'
+    };
+    return mapping[stage] || 'bg-secondary';
+}
+
+function getStopBadgeClass(reason) {
+    if (reason.includes('waiting')) return 'badge-stop-waiting';
+    if (reason.includes('valid')) return 'badge-stop-valid';
+    if (reason.includes('geofence') || reason.includes('taller')) return 'badge-stop-geofence';
+    if (reason.includes('triggered') || reason.includes('alert')) return 'badge-stop-triggered';
+    return 'bg-secondary';
+}
+
+function showDetails(record) {
+    const detailsJson = document.getElementById('details-json');
+    detailsJson.textContent = JSON.stringify(record, null, 2);
+    progressModal.show();
+}
+
+function formatDateTime(dateStr) {
+    const date = new Date(dateStr);
+    return date.toLocaleString('es-MX', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+    });
+}
+
+function showAlert(message, type) {
+    const alertDiv = document.createElement('div');
+    alertDiv.className = `alert alert-${type} alert-dismissible fade show`;
+    alertDiv.innerHTML = `
+        ${message}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    `;
+    
+    const container = document.querySelector('.container-fluid');
+    container.insertBefore(alertDiv, container.firstChild);
+    
+    setTimeout(() => {
+        alertDiv.remove();
+    }, 5000);
+}
+</script>
+{% endblock %}

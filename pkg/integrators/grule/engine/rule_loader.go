@@ -1,0 +1,684 @@
+package engine
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+	"regexp"
+	"time"
+
+	"github.com/MaddSystems/jonobridge/common/models"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/hyperjumptech/grule-rule-engine/ast"
+	"github.com/hyperjumptech/grule-rule-engine/builder"
+	"github.com/hyperjumptech/grule-rule-engine/pkg"
+)
+
+type Rule struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	GRL         string `json:"grl"`
+	Active      bool   `json:"active"`
+	Priority    int    `json:"priority"`
+	CreatedAt   string `json:"created_at,omitempty"`
+	UpdatedAt   string `json:"updated_at,omitempty"`
+}
+
+// db es la conexión compartida a MySQL (privada del paquete engine)
+var db *sql.DB
+
+func Initialize() {
+	initMySQL()
+	loadRules() // carga inicial solamente
+}
+
+func loadRules() {
+	// Aquí pones tu fuente real: Postgres, Redis, archivo, API...
+	rules := loadRulesFromSource()
+	log.Printf("🔍 [RULE_LOADER] Cargadas %d reglas desde MySQL", len(rules))
+
+	var kbs []*ast.KnowledgeBase
+	for i, r := range rules {
+		log.Printf("🔍 [RULE_LOADER] Compilando regla #%d: '%s' (primer 100 chars: %.100s...)", i+1, r.Name, r.GRL)
+
+		kb := ast.NewKnowledgeLibrary()
+		ruleBuilder := builder.NewRuleBuilder(kb)
+		err := ruleBuilder.BuildRuleFromResource("FleetRules", "0.0.1", pkg.NewBytesResource([]byte(r.GRL)))
+		if err != nil {
+			log.Printf("❌ Error compilando regla %s: %v", r.Name, err)
+			continue
+		}
+		kbInstance, err := kb.NewKnowledgeBaseInstance("FleetRules", "0.0.1")
+		if err != nil {
+			log.Printf("❌ Error creando instancia de KB para regla %s: %v", r.Name, err)
+			continue
+		}
+		kbs = append(kbs, kbInstance)
+		log.Printf("✅ [RULE_LOADER] Regla #%d compilada exitosamente", i+1)
+	}
+
+	knowledgeBases.Store(kbs)
+	log.Printf("✅ [RULE_LOADER] Reglas recargadas: %d activas en memoria", len(kbs))
+}
+
+func initMySQL() {
+	dsn := getMySQLDSN()
+	var err error
+	db, err = sql.Open("mysql", dsn)
+	if err != nil {
+		log.Fatalf("❌ Error conectando a MySQL: %v", err)
+	}
+
+	// Configuración del pool de conexiones
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(time.Minute * 5)
+
+	// Verificar conexión
+	if err := db.Ping(); err != nil {
+		log.Fatalf("❌ No se pudo conectar a MySQL: %v", err)
+	}
+
+	log.Println("✅ Conectado a MySQL para carga de reglas")
+
+	// Crear tabla si no existe
+	createTableIfNotExists()
+}
+
+func getMySQLDSN() string {
+	host := getEnvWithDefault("MYSQL_HOST", "127.0.0.1")
+	port := getEnvWithDefault("MYSQL_PORT", "3306")
+	user := getEnvWithDefault("MYSQL_USER", "gpscontrol")
+	pass := getEnvWithDefault("MYSQL_PASS", "qazwsxedc")
+	dbname := getEnvWithDefault("MYSQL_DB", "grule")
+
+	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4", user, pass, host, port, dbname)
+}
+
+func getEnvWithDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func createTableIfNotExists() {
+	// Crear tabla de reglas
+	schema1 := `
+	CREATE TABLE IF NOT EXISTS fleet_rules (
+		id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(100) NOT NULL,
+		description TEXT,
+		grl_content TEXT NOT NULL,
+		audit_manifest TEXT,
+		active BOOLEAN DEFAULT false,
+		priority INT DEFAULT 100,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+		created_by VARCHAR(50),
+		INDEX idx_active_priority (active, priority DESC),
+		UNIQUE KEY unique_name (name)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+
+	if _, err := db.Exec(schema1); err != nil {
+		log.Printf("⚠️  Error creando tabla fleet_rules: %v", err)
+		return
+	}
+
+	log.Println("📋 Tabla fleet_rules verificada/creada")
+
+	// Crear tabla de estado persistente para reglas de timing
+	schema2 := `
+	CREATE TABLE IF NOT EXISTS vehicle_rule_state (
+		imei VARCHAR(20) NOT NULL,
+		key_name VARCHAR(100) NOT NULL,
+		value_text TEXT NULL,
+		value_int BIGINT NULL,
+		value_float DOUBLE NULL,
+		value_time DATETIME(6) NULL,
+		updated_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+		PRIMARY KEY (imei, key_name),
+		INDEX idx_updated (updated_at),
+		INDEX idx_imei (imei),
+		INDEX idx_key_pattern (key_name)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+
+	if _, err := db.Exec(schema2); err != nil {
+		log.Printf("⚠️  Error creando tabla vehicle_rule_state: %v", err)
+		return
+	}
+
+	log.Println("📋 Tabla vehicle_rule_state verificada/creada")
+
+	// Crear tabla de paquetes procesados (para evitar duplicados)
+	schema3 := `
+	CREATE TABLE IF NOT EXISTS processed_packets (
+		id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		imei VARCHAR(20) NOT NULL,
+		packet_key VARCHAR(50) NOT NULL,
+		packet_datetime DATETIME(3) NOT NULL,
+		packet_hash VARCHAR(64) NULL,
+		processed_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6),
+		INDEX idx_imei_datetime (imei, packet_datetime),
+		INDEX idx_imei_packet (imei, packet_key),
+		INDEX idx_processed_at (processed_at),
+		UNIQUE KEY unique_packet (imei, packet_key, packet_datetime)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+
+	if _, err := db.Exec(schema3); err != nil {
+		log.Printf("⚠️  Error creando tabla processed_packets: %v", err)
+		return
+	}
+
+	log.Println("📋 Tabla processed_packets verificada/creada")
+
+	// Crear tabla de registro de paquetes inválidos (tramas vacías/corruptas del tracker)
+	schema4 := `
+	CREATE TABLE IF NOT EXISTS invalid_packets_log (
+		id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		imei VARCHAR(20) NOT NULL,
+		logged_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6),
+		INDEX idx_imei (imei),
+		INDEX idx_logged_at (logged_at)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+
+	if _, err := db.Exec(schema4); err != nil {
+		log.Printf("⚠️  Error creando tabla invalid_packets_log: %v", err)
+		return
+	}
+
+	log.Println("📋 Tabla invalid_packets_log verificada/creada")
+}
+
+// Carga reglas desde MySQL
+func loadRulesFromSource() []Rule {
+	if db == nil {
+		log.Println("⚠️  DB no inicializada")
+		return []Rule{} // Sin reglas - punto
+	}
+
+	// Verificar conexión antes de consultar
+	if err := db.Ping(); err != nil {
+		log.Printf("❌ Error de conexión MySQL: %v", err)
+		return []Rule{} // Sin reglas - punto
+	}
+
+	query := `
+		SELECT id, name, grl_content 
+		FROM fleet_rules 
+		WHERE active = 1
+		ORDER BY priority DESC
+		LIMIT 500
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		log.Printf("❌ Error consultando reglas: %v", err)
+		return []Rule{} // Sin reglas - punto
+	}
+	defer rows.Close()
+
+	var rules []Rule
+	for rows.Next() {
+		var r Rule
+		if err := rows.Scan(&r.ID, &r.Name, &r.GRL); err != nil {
+			log.Printf("⚠️  Error leyendo regla: %v", err)
+			continue
+		}
+		rules = append(rules, r)
+	}
+
+	if len(rules) == 0 {
+		log.Println("ℹ️  No hay reglas activas en MySQL")
+		return []Rule{} // Sin reglas - punto
+	}
+
+	log.Printf("🗄️  Cargadas %d reglas desde MySQL", len(rules))
+	return rules
+}
+
+// ============================================
+// API Functions
+// ============================================
+
+// GetAllRules obtiene todas las reglas de la base de datos
+func GetAllRules() ([]Rule, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+
+	query := `
+		SELECT id, name, COALESCE(description, '') as description, 
+		       grl_content, active, priority, 
+		       created_at, updated_at
+		FROM fleet_rules 
+		ORDER BY priority DESC, id DESC
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []Rule
+	for rows.Next() {
+		var r Rule
+		if err := rows.Scan(&r.ID, &r.Name, &r.Description, &r.GRL,
+			&r.Active, &r.Priority, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			log.Printf("⚠️  Error escaneando regla: %v", err)
+			continue
+		}
+		rules = append(rules, r)
+	}
+
+	return rules, nil
+}
+
+// GetRule obtiene una regla por ID
+func GetRule(id int64) (*Rule, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+
+	var r Rule
+	query := `SELECT id, name, grl_content, active, priority FROM fleet_rules WHERE id = ?`
+	err := db.QueryRow(query, id).Scan(&r.ID, &r.Name, &r.GRL, &r.Active, &r.Priority)
+	if err != nil {
+		return nil, err
+	}
+
+	return &r, nil
+}
+
+// CreateRule crea una nueva regla
+func CreateRule(rule Rule) (int64, error) {
+	if db == nil {
+		return 0, fmt.Errorf("database not initialized")
+	}
+
+	query := `
+		INSERT INTO fleet_rules (name, description, grl_content, priority, active)
+		VALUES (?, ?, ?, ?, ?)
+	`
+
+	priority := rule.Priority
+	if priority == 0 {
+		priority = 100 // default
+	}
+
+	result, err := db.Exec(query, rule.Name, rule.Description, rule.GRL, priority, rule.Active)
+	if err != nil {
+		return 0, err
+	}
+
+	id, err := result.LastInsertId()
+	if err == nil {
+		log.Println("🔄 Recargando reglas después de crear...")
+		loadRules()
+	}
+
+	return id, err
+}
+
+// UpdateRule actualiza una regla existente
+func UpdateRule(rule Rule) error {
+	if db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	query := `
+		UPDATE fleet_rules 
+		SET name = ?, description = ?, grl_content = ?, 
+		    priority = ?, active = ?, updated_at = NOW()
+		WHERE id = ?
+	`
+
+	_, err := db.Exec(query, rule.Name, rule.Description, rule.GRL,
+		rule.Priority, rule.Active, rule.ID)
+
+	if err == nil {
+		log.Println("🔄 Recargando reglas después de actualizar...")
+		loadRules()
+	}
+
+	return err
+}
+
+// DeleteRule elimina una regla
+func DeleteRule(id int64) error {
+	if db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	_, err := db.Exec("DELETE FROM fleet_rules WHERE id = ?", id)
+
+	if err == nil {
+		log.Println("🔄 Recargando reglas después de eliminar...")
+		loadRules()
+	}
+
+	return err
+}
+
+// ValidateRule valida la sintaxis de una regla GRL
+func ValidateRule(grlContent string) error {
+	kb := ast.NewKnowledgeLibrary()
+	ruleBuilder := builder.NewRuleBuilder(kb)
+
+	err := ruleBuilder.BuildRuleFromResource("ValidationTest", "0.0.1", pkg.NewBytesResource([]byte(grlContent)))
+	if err != nil {
+		return err
+	}
+
+	_, err = kb.NewKnowledgeBaseInstance("ValidationTest", "0.0.1")
+	return err
+}
+
+// ForceReload fuerza la recarga inmediata de las reglas
+func ForceReload() {
+	log.Println("🔄 Forzando recarga de reglas...")
+	loadRules()
+}
+
+// SaveProcessedFact registra un paquete como procesado en la base de datos
+func SaveProcessedFact(imei, packetKey string, packetDatetime time.Time) error {
+	if db == nil {
+		return nil // No-op si DB no está disponible
+	}
+
+	log.Printf("🕐 [SAVEPROCESSEDFACT] Recibido: packetDatetime = %v (IsZero=%v, Format=%s)",
+		packetDatetime, packetDatetime.IsZero(), packetDatetime.Format(time.RFC3339))
+
+	query := `
+		INSERT INTO processed_packets (imei, packet_key, packet_datetime)
+		VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE processed_at = CURRENT_TIMESTAMP(6)
+	`
+
+	_, err := db.Exec(query, imei, packetKey, packetDatetime)
+	if err != nil {
+		log.Printf("⚠️  Error guardando paquete procesado %s:%s - %v", imei, packetKey, err)
+		return err
+	}
+
+	return nil
+}
+
+// SaveProcessedFactWithContext registra un paquete como procesado y loguea contexto si hay error
+func SaveProcessedFactWithContext(imei, packetKey string, packetDatetime time.Time, packet *models.JonoModel) error {
+	if db == nil {
+		return nil // No-op si DB no está disponible
+	}
+
+	log.Printf("🕐 [SAVEPROCESSEDFACT] Recibido: packetDatetime = %v (IsZero=%v, Format=%s)",
+		packetDatetime, packetDatetime.IsZero(), packetDatetime.Format(time.RFC3339))
+
+	// CONVERSIÓN: Si datetime es cero (0001-01-01), convertir a NULL para BD
+	var datetimeForDB interface{}
+	if packetDatetime.IsZero() {
+		datetimeForDB = nil
+		log.Printf("⚠️  [DATETIME INVÁLIDO] Convertiendo datetime 0001-01-01 a NULL para BD (problema del tracker)")
+	} else {
+		datetimeForDB = packetDatetime
+	}
+
+	query := `
+		INSERT INTO processed_packets (imei, packet_key, packet_datetime)
+		VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE processed_at = CURRENT_TIMESTAMP(6)
+	`
+
+	_, err := db.Exec(query, imei, packetKey, datetimeForDB)
+	if err != nil {
+		log.Printf("⚠️  Error guardando paquete procesado %s:%s - %v", imei, packetKey, err)
+
+		// Loguear TODOS los campos del JonoModel cuando hay error
+		if packet != nil {
+			log.Printf("📋 [DEBUG CONTEXTO] IMEI=%s", packet.IMEI)
+			log.Printf("📋 [DEBUG CONTEXTO] DataPackets=%d", packet.DataPackets)
+
+			// Loguear cada paquete
+			for key, p := range packet.ListPackets {
+				log.Printf("📋 [DEBUG CONTEXTO] Paquete Key=%s:", key)
+				log.Printf("    - Datetime: %v (IsZero=%v)", p.Datetime, p.Datetime.IsZero())
+				log.Printf("    - Speed: %d m/s", p.Speed)
+				log.Printf("    - Latitude: %f", p.Latitude)
+				log.Printf("    - Longitude: %f", p.Longitude)
+				log.Printf("    - Altitude: %d", p.Altitude)
+				log.Printf("    - Direction: %d", p.Direction)
+				log.Printf("    - Mileage: %d", p.Mileage)
+				log.Printf("    - PositioningStatus: %s", p.PositioningStatus)
+				log.Printf("    - EventCode: %+v", p.EventCode)
+				log.Printf("    - HDOP: %f", p.HDOP)
+				log.Printf("    - NumberOfSatellites: %d", p.NumberOfSatellites)
+				if p.GSMSignalStrength != nil {
+					log.Printf("    - GSMSignalStrength: %d", *p.GSMSignalStrength)
+				} else {
+					log.Printf("    - GSMSignalStrength: nil")
+				}
+			}
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+// IsPacketAlreadyProcessed verifica si un paquete ya fue procesado
+func IsPacketAlreadyProcessed(imei, packetKey string, packetDatetime time.Time) (bool, error) {
+	if db == nil {
+		return false, nil // No-op si DB no está disponible
+	}
+
+	var count int
+	query := `
+		SELECT COUNT(*) FROM processed_packets 
+		WHERE imei = ? AND packet_key = ? AND packet_datetime = ?
+	`
+
+	err := db.QueryRow(query, imei, packetKey, packetDatetime).Scan(&count)
+	if err != nil {
+		log.Printf("⚠️  Error verificando paquete procesado %s:%s - %v", imei, packetKey, err)
+		return false, err
+	}
+
+	return count > 0, nil
+}
+
+// GetProcessedPacketsCount retorna cantidad de paquetes procesados para un IMEI
+func GetProcessedPacketsCount(imei string, since time.Time) (int, error) {
+	if db == nil {
+		return 0, nil
+	}
+
+	var count int
+	query := `
+		SELECT COUNT(*) FROM processed_packets 
+		WHERE imei = ? AND processed_at >= ?
+	`
+
+	err := db.QueryRow(query, imei, since).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
+// CleanupOldProcessedPackets limpia registros antiguos (más de 24 horas)
+func CleanupOldProcessedPackets() error {
+	if db == nil {
+		return nil
+	}
+
+	query := `DELETE FROM processed_packets WHERE processed_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)`
+	result, err := db.Exec(query)
+	if err != nil {
+		log.Printf("⚠️  Error limpiando paquetes antiguos: %v", err)
+		return err
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected > 0 {
+		log.Printf("🧹 Limpiados %d paquetes procesados antiguos", rowsAffected)
+	}
+
+	return nil
+}
+
+// LogInvalidPacket registra un IMEI que envió una trama inválida
+func LogInvalidPacket(imei string) error {
+	if db == nil {
+		return nil // No-op si DB no está disponible
+	}
+
+	query := `
+		INSERT INTO invalid_packets_log (imei)
+		VALUES (?)
+	`
+
+	_, err := db.Exec(query, imei)
+	if err != nil {
+		log.Printf("⚠️  Error registrando IMEI inválido %s: %v", imei, err)
+		return err
+	}
+
+	log.Printf("📝 [INVALID PACKET] IMEI=%s registrado en invalid_packets_log", imei)
+	return nil
+}
+
+// GetInvalidPackets retorna lista de IMEIs inválidos con paginación, búsqueda y ordenamiento
+func GetInvalidPackets(limit, offset int, sortBy, searchText string) ([]map[string]interface{}, int64, error) {
+	if db == nil {
+		return nil, 0, fmt.Errorf("database not initialized")
+	}
+
+	// Determinar la columna de ordenamiento
+	if sortBy == "" {
+		sortBy = "last_seen"
+	}
+	var orderColumn string
+	switch sortBy {
+	case "imei":
+		orderColumn = "imei"
+	case "count":
+		orderColumn = "count"
+	default:
+		orderColumn = "last_seen"
+	}
+
+	// Construir WHERE clause si hay búsqueda
+	whereClause := ""
+	if searchText != "" {
+		whereClause = " WHERE imei LIKE '%" + searchText + "%'"
+	}
+
+	// Obtener el total
+	var total int64
+	countQuery := "SELECT COUNT(DISTINCT imei) FROM invalid_packets_log" + whereClause
+	err := db.QueryRow(countQuery).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Obtener los registros únicos de IMEIs inválidos con su última ocurrencia
+	query := `
+		SELECT imei, COUNT(*) as count, MAX(logged_at) as last_seen
+		FROM invalid_packets_log` + whereClause + `
+		GROUP BY imei
+		ORDER BY ` + orderColumn + ` DESC 
+		LIMIT ? OFFSET ?
+	`
+
+	rows, err := db.Query(query, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var imei string
+		var count int
+		var lastSeen time.Time
+
+		if err := rows.Scan(&imei, &count, &lastSeen); err != nil {
+			continue
+		}
+
+		results = append(results, map[string]interface{}{
+			"imei":      imei,
+			"count":     count,
+			"last_seen": lastSeen.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	return results, total, nil
+}
+
+// GetDB retorna la conexión a la base de datos (útil para inicializar subsistemas como audit)
+func GetDB() *sql.DB {
+	return db
+}
+
+// GetRuleIDByName obtiene el ID de una regla por su nombre
+func GetRuleIDByName(ruleName string) int64 {
+	if db == nil {
+		log.Printf("⚠️ Database not initialized for rule ID lookup")
+		return 0
+	}
+
+	var ruleID int64
+	query := "SELECT id FROM fleet_rules WHERE name = ? LIMIT 1"
+	err := db.QueryRow(query, ruleName).Scan(&ruleID)
+	if err != nil {
+		log.Printf("⚠️ Error obteniendo ID para regla '%s': %v", ruleName, err)
+		return 0
+	}
+
+	return ruleID
+}
+
+// GetInternalRuleNames obtiene los nombres internos de las reglas definidas dentro de un GRL
+// Esto permite mapear un "Nombre de Archivo/Paquete" (ej: "Jammer V4") a sus componentes (ej: "DEFCON0", "DEFCON1")
+func GetInternalRuleNames(packageName string) ([]string, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+
+	var grlContent string
+	query := "SELECT grl_content FROM fleet_rules WHERE name = ? LIMIT 1"
+	err := db.QueryRow(query, packageName).Scan(&grlContent)
+	if err != nil {
+		// Si no se encuentra, retornamos nil (no es un error crítico, puede que sea búsqueda directa)
+		return nil, nil
+	}
+
+	// Regex para encontrar definiciones de reglas: rule NombreRegla "Descripcion" ...
+	// Captura el NombreRegla
+	re := regexp.MustCompile(`rule\s+([a-zA-Z0-9_]+)\s+`)
+	matches := re.FindAllStringSubmatch(grlContent, -1)
+
+	var internalNames []string
+	seen := make(map[string]bool)
+
+	for _, match := range matches {
+		if len(match) > 1 {
+			name := match[1]
+			if !seen[name] {
+				internalNames = append(internalNames, name)
+				seen[name] = true
+			}
+		}
+	}
+
+	return internalNames, nil
+}

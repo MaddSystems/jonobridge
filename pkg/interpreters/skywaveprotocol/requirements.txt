@@ -1,0 +1,18 @@
+# Requirements for ORBCOMM MQTT Test Program
+# Python dependencies for orbcomm_mqtt_test.py
+
+# HTTP requests library for ORBCOMM API calls
+requests>=2.28.0
+
+# MQTT client library for publishing messages
+paho-mqtt>=1.6.0
+
+# Additional useful libraries (optional but recommended)
+# XML parsing (included in Python standard library)
+# JSON handling (included in Python standard library)
+# Datetime handling (included in Python standard library)
+# Logging (included in Python standard library)
+
+# For development/testing (optional)
+# pytest>=7.0.0
+# pylint>=2.15.0

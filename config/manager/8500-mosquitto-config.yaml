@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto-config-8500
+  namespace: client01
+data:
+  mosquitto.conf: |
+    listener 1883
+    allow_anonymous true
+    log_type all
+    persistence true
+    persistence_location /mosquitto/data/
+    log_dest stdout
+    # Uncomment for WebSocket support (optional)
+    # listener 9001
+    # protocol websockets

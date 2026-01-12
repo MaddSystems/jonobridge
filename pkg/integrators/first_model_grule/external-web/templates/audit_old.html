@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+
+{% block title %}Audit Dashboard - Grule Engine{% endblock %}
+
+{% block content %}
+{% raw %}
+<div id="app" class="audit-container">
+    <!-- Search Section -->
+    <div class="audit-search-panel">
+        <h2>Audit Trail Search</h2>
+        <div class="search-form">
+            <div class="form-group">
+                <label for="search-imei">IMEI (or select from recent):</label>
+                <input type="text" id="search-imei" v-model="searchImei" placeholder="e.g., 358240051111110" @input="filterRecentImeis">
+                <!-- Autocomplete Suggestions -->
+                <div v-if="recentImeiFiltered.length > 0" class="imei-suggestions">
+                    <div v-for="item in recentImeiFiltered" :key="item.imei" 
+                         class="suggestion-item" 
+                         @click="selectImei(item.imei)">
+                        <strong>{{ item.imei }}</strong>
+                        <small>Last: {{ formatDate(item.last_execution) }} • Execs: {{ item.total_executions }} • Alerts: {{ item.alert_count }}</small>
+                    </div>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="search-start">Start Date:</label>
+                <input type="date" id="search-start" v-model="searchStartDate">
+            </div>
+            <div class="form-group">
+                <label for="search-end">End Date:</label>
+                <input type="date" id="search-end" v-model="searchEndDate">
+            </div>
+            <button @click="searchExecutions" :disabled="loading" class="btn btn-primary">
+                {{ loading ? 'Searching...' : 'Search' }}
+            </button>
+        </div>
+
+        <!-- Recent IMEIs Quick View -->
+        <div class="recent-imeis" v-if="recentImeis.length > 0 && searchImei === ''">
+            <p><small>📍 Recent IMEIs (Last 24h):</small></p>
+            <div class="imei-quick-list">
+                <button v-for="item in recentImeis.slice(0, 5)" :key="item.imei" 
+                        @click="selectImei(item.imei)" 
+                        class="btn-imei-quick">
+                    {{ item.imei }} <span v-if="item.alert_count > 0" class="badge-alert">{{ item.alert_count }}🚨</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Error Alert -->
+    <div v-if="error" class="alert alert-danger alert-dismissible fade show" role="alert">
+        {{ error }}
+        <button type="button" class="btn-close" @click="error = null"></button>
+    </div>
+
+    <!-- Results Section -->
+    <div class="audit-results-panel" v-if="executions.length > 0">
+        <h2>Executions Found ({{ executions.length }})</h2>
+        <div class="results-timeline">
+            <div v-for="(exec, idx) in executions" :key="exec.id" 
+                 class="result-item" 
+                 :class="{ 'alert-fired': exec.alert_fired }"
+                 @click="viewExecution(exec.id)">
+                <div class="result-header">
+                    <span class="result-date">{{ formatDate(exec.execution_date) }}</span>
+                    <span class="result-steps">{{ exec.total_steps }} steps</span>
+                    <span v-if="exec.alert_fired" class="result-alert">🚨 ALERT FIRED</span>
+                    <span v-else class="result-no-alert">✓ No Alert</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Empty State -->
+    <div class="empty-state" v-if="searched && executions.length === 0">
+        <p>No executions found for the selected criteria</p>
+    </div>
+
+    <!-- Detail Section -->
+    <div class="audit-detail-panel" v-if="selectedExecution">
+        <h2>Execution Detail</h2>
+        <div class="detail-header">
+            <p><strong>IMEI:</strong> {{ selectedExecution.imei }}</p>
+            <p><strong>Date:</strong> {{ formatDate(selectedExecution.execution_date) }}</p>
+            <p><strong>Alert:</strong> <span :class="{ 'text-danger': selectedExecution.alert_fired }">{{ selectedExecution.alert_fired ? '🚨 FIRED' : '✓ Not Fired' }}</span></p>
+        </div>
+
+        <!-- Step Tree -->
+        <div class="step-tree">
+            <div v-for="(step, idx) in selectedExecution.steps" :key="idx" 
+                 class="step" 
+                 :class="step.status.toLowerCase()">
+                
+                <div class="step-header" @click="toggleStepDetail(idx)">
+                    <span class="step-number">{{ step.step_order }}</span>
+                    <span class="step-name">{{ step.rule_name }}</span>
+                    <span class="step-status" :class="step.status.toLowerCase()">{{ step.status }}</span>
+                    <span class="step-duration">{{ step.duration_ms.toFixed(2) }}ms</span>
+                    <span class="step-toggle" v-if="expandedSteps[idx]">▼</span>
+                    <span class="step-toggle" v-else>▶</span>
+                </div>
+
+                <div v-if="expandedSteps[idx]" class="step-detail">
+                    <div class="detail-section">
+                        <h4>Description</h4>
+                        <p>{{ step.description }}</p>
+                    </div>
+
+                    <div class="detail-section">
+                        <h4>Metadata</h4>
+                        <ul>
+                            <li><strong>Salience:</strong> {{ step.salience }}</li>
+                            <li><strong>Duration:</strong> {{ step.duration_ms.toFixed(2) }}ms</li>
+                        </ul>
+                    </div>
+
+                    <div class="detail-section" v-if="step.conditions && Object.keys(step.conditions).length > 0">
+                        <h4>When Conditions</h4>
+                        <ul>
+                            <li v-for="(val, key) in step.conditions" :key="key">
+                                <code>{{ key }}</code> = <strong>{{ formatValue(val) }}</strong>
+                            </li>
+                        </ul>
+                    </div>
+
+                    <div class="detail-section" v-if="step.actions && Object.keys(step.actions).length > 0">
+                        <h4>Then Actions</h4>
+                        <ul>
+                            <li v-for="(val, key) in step.actions" :key="key">
+                                <code>{{ key }}</code> ➜ <strong>{{ formatValue(val) }}</strong>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <button @click="selectedExecution = null" class="btn btn-secondary mt-3">Close Detail</button>
+    </div>
+</div>
+{% endraw %}
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/vue@3"></script>
+<script src="{{ url_for('static', filename='js/audit.js') }}"></script>
+{% endblock %}

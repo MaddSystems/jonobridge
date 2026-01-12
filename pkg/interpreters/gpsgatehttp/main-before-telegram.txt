@@ -1,0 +1,384 @@
+package main
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"regexp"
+	"runtime/debug"
+	"sync"
+	"time"
+
+	"gpsgatehttp/utils"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	_ "github.com/go-sql-driver/mysql"
+)
+
+// Global variables for monitoring and crash prevention
+var lastProcessedMessage time.Time
+var messageCounter int64
+var processingMutex sync.RWMutex
+
+// messageHandler handles MQTT messages with enhanced logging and error handling
+func messageHandler(client mqtt.Client, msg mqtt.Message) {
+	// Add comprehensive panic recovery to prevent service crashes
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC RECOVERED in messageHandler: %v", r)
+			log.Printf("Stack trace: %s", debug.Stack())
+			log.Printf("CRITICAL ERROR: Panic recovered, service continuing. Check logs for stack trace.")
+		}
+	}()
+
+	// Setup monitoring with processing timeout detection
+	startTime := time.Now()
+	defer func() {
+		processingTime := time.Since(startTime)
+		if processingTime > 5*time.Second {
+			log.Printf("WARNING: Message processing took %v seconds (potentially stuck)", processingTime.Seconds())
+		}
+	}()
+
+	// Update message processing tracking
+	processingMutex.Lock()
+	lastProcessedMessage = time.Now()
+	messageCounter++
+	currentCounter := messageCounter
+	processingMutex.Unlock()
+
+	log.Printf("=== MQTT MESSAGE RECEIVED #%d ===", currentCounter)
+	log.Printf("Topic: %s", msg.Topic())
+	log.Printf("Message ID: %d", msg.MessageID())
+	log.Printf("Payload length: %d", len(msg.Payload()))
+
+	trackerPayload := string(msg.Payload())
+	var trackerData []byte
+
+	// Try to decode as hex, if it fails, use the original message
+	bytes, err := hex.DecodeString(trackerPayload)
+	if err != nil {
+		trackerData = []byte(trackerPayload)
+		log.Printf("Using original payload (not hex): %s", trackerPayload)
+	} else {
+		trackerData = bytes
+		log.Printf("Decoded hex payload: %s", string(trackerData))
+	}
+
+	// Sanitize the tracker data to fix invalid URL escapes
+	sanitizedData := SanitizeInvalidURLS(trackerData)
+
+	// Unmarshal JSON into a map with enhanced error handling
+	var data Message
+	if err := json.Unmarshal(sanitizedData, &data); err != nil {
+		log.Printf("ERROR: Failed to unmarshal JSON payload: %v", err)
+		log.Printf("Raw data (first 500 chars): %s", string(sanitizedData)[:min(len(sanitizedData), 500)])
+		log.Printf("CRITICAL: Skipping malformed message to prevent further processing errors")
+		return
+	}
+
+	// Validate that we actually have data to process
+	if len(data) == 0 {
+		log.Printf("WARNING: Received empty data map, skipping processing")
+		return
+	}
+
+	// Get the document name from environment variable with validation
+	elasticDocName := os.Getenv("ELASTIC_DOC_NAME")
+	if elasticDocName == "" {
+		elasticDocName = "gpsgate_default" // Fallback if not set
+		log.Println("Warning: ELASTIC_DOC_NAME not set, using default 'gpsgate_default'")
+	}
+
+	// Decode percent-encoded characters in all string fields
+	log.Printf("Decoding percent-encoded characters in GPS data...")
+	decodedData := decodeAllStringFields(data)
+
+	// Add timeout protection for Elasticsearch operations
+	log.Printf("Sending all message fields dynamically to Elasticsearch - Index: %s", elasticDocName)
+	log.Printf("Available fields: %v", getMapKeys(decodedData))
+
+	// Wrap Elasticsearch call with error recovery
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC RECOVERED in Elasticsearch operation: %v", r)
+				log.Printf("Stack trace: %s", debug.Stack())
+			}
+		}()
+
+		if err := utils.SendDynamicToElastic(decodedData, elasticDocName); err != nil {
+			log.Printf("ERROR: Failed to send to Elasticsearch index '%s': %v", elasticDocName, err)
+			log.Printf("Data that failed to send (truncated): %+v", truncateMapForLogging(decodedData))
+		} else {
+			log.Printf("Successfully sent data to Elasticsearch index: '%s'", elasticDocName)
+		}
+	}()
+}
+
+func processGPSgateData() error {
+	// Set up MQTT client options
+	opts := mqtt.NewClientOptions()
+	mqttBrokerHost := os.Getenv("MQTT_BROKER_HOST")
+	if mqttBrokerHost == "" {
+		log.Fatal("MQTT_BROKER_HOST environment variable not set")
+	}
+	brokerURL := fmt.Sprintf("tcp://%s:1883", mqttBrokerHost)
+	opts.AddBroker(brokerURL)
+
+	// Get hostname with fallback
+	hostname := os.Getenv("HOSTNAME")
+	if hostname == "" {
+		if h, err := os.Hostname(); err == nil {
+			hostname = h
+		} else {
+			hostname = "unknown"
+		}
+	}
+
+	// Use a more stable client ID - remove the random component that changes on restart
+	clientID := fmt.Sprintf("%s", hostname)
+	opts.SetClientID(clientID)
+	log.Printf("Using MQTT Client ID: %s", clientID)
+
+	// CRITICAL FIXES for MQTT connection stability - match working Pino configuration
+	opts.SetCleanSession(false) // Maintain persistent session like working Pino code
+	opts.SetAutoReconnect(true)
+	opts.SetKeepAlive(60 * time.Second) // Match Pino code settings
+	opts.SetOrderMatters(true)          // Match Pino code - maintain message order
+	opts.SetResumeSubs(true)            // Match Pino code - resume stored subscriptions
+
+	// Enhanced connection handlers
+	opts.SetConnectionLostHandler(func(client mqtt.Client, err error) {
+		log.Printf("MQTT Connection lost: %v", err)
+		log.Printf("Client connected status: %t", client.IsConnected())
+	})
+	opts.SetReconnectingHandler(func(client mqtt.Client, opts *mqtt.ClientOptions) {
+		log.Printf("MQTT Attempting to reconnect to broker")
+	})
+
+	// Add connection established handler with re-subscription
+	opts.SetOnConnectHandler(func(client mqtt.Client) {
+		log.Printf("MQTT Client connected successfully")
+		// Re-subscribe on reconnect
+		if token := client.Subscribe("gpsgate", 0, messageHandler); token.Wait() && token.Error() != nil {
+			log.Printf("Error re-subscribing on reconnect: %v", token.Error())
+		} else {
+			log.Printf("Successfully re-subscribed to topic: gpsgate")
+		}
+	})
+
+	// Create and connect MQTT client
+	mqttClient := mqtt.NewClient(opts)
+
+	log.Printf("Attempting to connect to MQTT broker at %s", brokerURL)
+	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("error connecting to MQTT broker: %v", token.Error())
+	}
+	log.Printf("Connected to MQTT broker at %s", brokerURL)
+	log.Printf("Client connection status: %t", mqttClient.IsConnected())
+
+	// The OnConnectHandler will handle the subscription, so no need to subscribe here.
+	// The listener will start receiving messages once the connection is established.
+
+	log.Printf("Successfully subscribed via OnConnectHandler. MQTT listener is running, waiting for messages...")
+
+	// Add enhanced periodic health check with comprehensive connection monitoring
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				connected := mqttClient.IsConnected()
+				log.Printf("Health check - MQTT client connected: %t", connected)
+				if !connected {
+					log.Printf("MQTT client not connected, attempting reconnect...")
+					// Add retry logic with exponential backoff
+					retryCount := 0
+					maxRetries := 3
+					for retryCount < maxRetries && !mqttClient.IsConnected() {
+						retryCount++
+						log.Printf("Reconnection attempt %d/%d", retryCount, maxRetries)
+						if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+							log.Printf("Reconnection attempt %d failed: %v", retryCount, token.Error())
+							if retryCount < maxRetries {
+								time.Sleep(time.Duration(retryCount*5) * time.Second) // Exponential backoff
+							}
+						} else {
+							log.Printf("Reconnection successful on attempt %d", retryCount)
+							break
+						}
+					}
+					if !mqttClient.IsConnected() {
+						log.Printf("CRITICAL: Failed to reconnect after %d attempts", maxRetries)
+					}
+				}
+			}
+		}
+	}()
+
+	// Keep the connection alive
+	select {}
+}
+
+func SanitizeInvalidURLS(data []byte) []byte {
+	// This regex finds the invalid URL escape sequence "%u00e1" and similar
+	re := regexp.MustCompile(`%u00([0-9a-fA-F]{2})`)
+
+	// Replace the invalid sequence with a standard URL-encoded equivalent
+	// For example, %u00e1 becomes %e1
+	sanitized := re.ReplaceAllString(string(data), `%$1`)
+
+	return []byte(sanitized)
+}
+
+// getMapKeys returns the keys of a map for debugging purposes
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// truncateMapForLogging truncates large map values for safe logging
+func truncateMapForLogging(m map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+	for k, v := range m {
+		if str, ok := v.(string); ok && len(str) > 100 {
+			result[k] = str[:100] + "...[truncated]"
+		} else {
+			result[k] = v
+		}
+		// Limit to first 10 keys for logging
+		if len(result) >= 10 {
+			result["..."] = "more fields truncated for logging"
+			break
+		}
+	}
+	return result
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// decodePercentEncoded decodes percent-encoded strings like %e9 → é, %e1 → á
+// This matches the behavior of the Python test script for Latin-1 encoding
+func decodePercentEncoded(text string) string {
+	// Regex to match percent-encoded sequences like %XX
+	re := regexp.MustCompile(`%([0-9A-Fa-f]{2})`)
+
+	result := re.ReplaceAllStringFunc(text, func(match string) string {
+		// Extract the hex part (without the %)
+		hexStr := match[1:]
+
+		// Convert hex to byte
+		if hexByte, err := hex.DecodeString(hexStr); err == nil && len(hexByte) == 1 {
+			// Convert the byte to Latin-1 character and then to UTF-8
+			// This handles characters like é (0xE9) and á (0xE1) correctly
+			char := rune(hexByte[0])
+			return string(char)
+		}
+
+		// If conversion fails, return the original match
+		return match
+	})
+
+	return result
+}
+
+// decodeAllStringFields recursively decodes percent-encoded strings in a map
+func decodeAllStringFields(data map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	for key, value := range data {
+		switch v := value.(type) {
+		case string:
+			// Decode percent-encoded characters in string fields
+			decoded := decodePercentEncoded(v)
+			if decoded != v {
+				log.Printf("Decoded field '%s': '%s' → '%s'", key, v, decoded)
+			}
+			result[key] = decoded
+		case map[string]interface{}:
+			// Recursively decode nested maps
+			result[key] = decodeAllStringFields(v)
+		case []interface{}:
+			// Handle arrays - decode strings within arrays
+			decodedArray := make([]interface{}, len(v))
+			for i, item := range v {
+				if str, ok := item.(string); ok {
+					decodedArray[i] = decodePercentEncoded(str)
+				} else if nestedMap, ok := item.(map[string]interface{}); ok {
+					decodedArray[i] = decodeAllStringFields(nestedMap)
+				} else {
+					decodedArray[i] = item
+				}
+			}
+			result[key] = decodedArray
+		default:
+			// Keep other types unchanged
+			result[key] = value
+		}
+	}
+
+	return result
+}
+
+func main() {
+	// Define our own -v flag since we're not using the common utils library anymore
+	verbose := flag.Bool("v", false, "Enable verbose logging")
+	flag.Parse()
+
+	// Set verbose logging based on our flag
+	if *verbose {
+		utils.SetVerbose(true)
+		log.Println("Verbose logging enabled")
+	}
+
+	log.Println("Starting MQTT listener for GPSgate data...")
+
+	// Initialize monitoring system
+	processingMutex.Lock()
+	lastProcessedMessage = time.Now()
+	processingMutex.Unlock()
+
+	// Start monitoring goroutine to detect if service gets stuck
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				processingMutex.RLock()
+				timeSinceLastMessage := time.Since(lastProcessedMessage)
+				currentCount := messageCounter
+				processingMutex.RUnlock()
+
+				if timeSinceLastMessage > 2*time.Minute {
+					log.Printf("WARNING: No messages processed in %v (last message #%d at %v)",
+						timeSinceLastMessage, currentCount, lastProcessedMessage.Format("15:04:05"))
+				} else {
+					log.Printf("Service healthy: Last message processed %v ago (total: %d)",
+						timeSinceLastMessage, currentCount)
+				}
+			}
+		}
+	}()
+
+	log.Printf("GPS Gate HTTP service started successfully - monitoring for crashes and deadlocks")
+
+	if err := processGPSgateData(); err != nil {
+		log.Fatal(err)
+	}
+}

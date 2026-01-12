@@ -1,0 +1,137 @@
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"forwarder/features/meitrack_integrator"
+	"log"
+	"net"
+	"os"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+)
+
+var (
+	verbose = flag.Bool("v", false, "Enable verbose logging") // Verbose flag
+)
+
+// Helper function to print verbose logs if enabled
+func vPrint(format string, v ...interface{}) {
+	if *verbose {
+		log.Printf(format, v...)
+	}
+}
+
+// TrackerData represents the JSON structure to send via HTTP
+type TrackerData struct {
+	TrackerData string `json:"trackerdata"`
+}
+
+// Function to post data to the HTTP server
+func postDataToServer(message string) {
+	// Retrieve FORWARDER_HOST from environment; default if not set
+	serverAddress := os.Getenv("FORWARDER_HOST")
+	if serverAddress == "" {
+		serverAddress = "server1.gpscontrol.com.mx:8500"
+		vPrint("FORWARDER_HOST not set. Using default server address: %s", serverAddress)
+	} else {
+		vPrint("Using FORWARDER_HOST: %s", serverAddress)
+	}
+
+	// Attempt to establish a TCP connection to the server
+	conn, err := net.DialTimeout("tcp", serverAddress, 5*time.Second)
+	if err != nil {
+		vPrint("Failed to connect to %s: %v", serverAddress, err)
+		return // Exit the function if connection fails
+	}
+	defer func() {
+		err := conn.Close()
+		if err != nil {
+			vPrint("Error closing connection: %v", err)
+		} else {
+			vPrint("Connection closed.")
+		}
+	}()
+	vPrint("Successfully connected to %s", serverAddress)
+
+	// Set a deadline for the write operation
+	deadline := time.Now().Add(10 * time.Second)
+	err = conn.SetDeadline(deadline)
+	if err != nil {
+		vPrint("Failed to set deadline: %v", err)
+		return
+	}
+
+	// Send the message
+	bytesWritten, err := fmt.Fprintf(conn, "%s\n", message)
+	if err != nil {
+		vPrint("Failed to send message: %v", err)
+		return
+	}
+	vPrint("Sent %d bytes to %s", bytesWritten, serverAddress)
+
+	// Optionally, read a response from the server
+	reader := bufio.NewReader(conn)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		vPrint("No response received or failed to read response: %v", err)
+	} else {
+		vPrint("Received response: %s", response)
+	}
+}
+
+func main() {
+	// Parse command-line flags
+	flag.Parse()
+
+	// MQTT connection options
+	opts := mqtt.NewClientOptions()
+	mqttBrokerHost := os.Getenv("MQTT_BROKER_HOST")
+	if mqttBrokerHost == "" {
+		log.Fatal("MQTT_BROKER_HOST environment variable not set")
+	}
+	brokerURL := fmt.Sprintf("tcp://%s:1883", mqttBrokerHost)
+	opts.AddBroker(brokerURL)
+	opts.SetClientID("go_mqtt_client")
+
+	// Define MQTT message handler
+	opts.SetDefaultPublishHandler(func(client mqtt.Client, msg mqtt.Message) {
+		vPrint("Received message on topic %s: %s", msg.Topic(), msg.Payload())
+		// Post the received data to the server
+		trackerData := string(msg.Payload())
+		events, err := meitrack_integrator.Initialize(trackerData)
+		if err != nil {
+			vPrint("Error initializing tracker integrator: %v", err)
+			return
+		}
+		for _, event := range events {
+			vPrint("Processing event: %s", event)
+			postDataToServer(event)
+		}
+	})
+
+	// Attempt to connect to the MQTT broker in a loop until successful
+	var client mqtt.Client
+	for {
+		client = mqtt.NewClient(opts)
+		if token := client.Connect(); token.Wait() && token.Error() != nil {
+			vPrint("Error connecting to MQTT broker at %s: %v. Retrying in 5 seconds...", brokerURL, token.Error())
+			time.Sleep(5 * time.Second) // Wait before retrying
+			continue                    // Retry the connection
+		}
+		vPrint("Successfully connected to the MQTT broker")
+		break // Exit the loop once connected
+	}
+
+	// Subscribe to the topic
+	topic := "tracker/data"
+	if token := client.Subscribe(topic, 1, nil); token.Wait() && token.Error() != nil {
+		log.Fatalf("Error subscribing to topic %s: %v", topic, token.Error())
+	}
+	vPrint("Subscribed to topic: %s", topic)
+
+	// Keep the application running
+	select {}
+}

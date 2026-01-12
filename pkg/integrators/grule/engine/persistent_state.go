@@ -1,0 +1,656 @@
+package engine
+
+import (
+	"database/sql"
+	"encoding/json"
+	"log"
+	"math"
+	"sync"
+	"time"
+)
+
+// HistoryPoint stores a single data point for historical analysis (e.s., Jammer detection).
+type HistoryPoint struct {
+	Speed     int64     `json:"speed"`
+	GSMSignal int64     `json:"gsm_signal"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type PersistentState struct {
+	imei       string
+	prevInside map[string]bool
+	mutex      sync.RWMutex
+	// Campos públicos para que Grule pueda modificarlos directamente y ver los cambios
+	BotonPanicoExecuted     bool
+	ExcesoVelocidadExecuted bool
+
+	// === CONTADORES PÚBLICOS PARA JAMMER DETECTION ===
+	// Grule modifica estos valores directamente, y los cambios se sincronizan con BD
+	JammerPositions     int64 // Contador de posiciones inválidas
+	JammerAvgSpeed90min int64 // Velocidad promedio últimos 90 min
+	JammerAvgGsm5       int64 // Señal GSM promedio últimos 5 puntos
+	JammerAlertSent     bool  // Flag de alerta enviada
+
+	// === PROPIEDADES DE TRACKING PARA EVITAR LOOPS ===
+	JammerProcessed bool // Flag que indica si ya procesó esta trama
+
+	// === FLAGS DE CONDICIONES PARA AUDIT TRAIL ===
+	// Estos flags marcan qué condición específica se cumplió para auditoría
+	Cond2Checked bool // Cond2: Contador >= 10
+	Cond3Checked bool // Cond3: Velocidad promedio >= 10
+	Cond4Checked bool // Cond4: Señal GSM >= 9
+
+	// === NUEVO CAMPO PARA EXPRESIÓN 4 GPSgate ===
+	lastValidPosition time.Time // Última posición válida para calcular offline
+	currentPacketTime time.Time // Timestamp del paquete actual (referencia para cálculo offline)
+}
+
+// GetSnapshot returns a map of all relevant state variables for auditing
+func (s *PersistentState) GetSnapshot() map[string]interface{} {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	return map[string]interface{}{
+		"jammer_positions":       s.JammerPositions,
+		"jammer_avg_speed_90min": s.JammerAvgSpeed90min,
+		"jammer_avg_gsm_last5":   s.JammerAvgGsm5,
+		"jammer_alert_sent":      s.JammerAlertSent,
+		"last_valid_position":    s.lastValidPosition,
+		"current_packet_time":    s.currentPacketTime,
+	}
+}
+
+var states = make(map[string]*PersistentState)
+var statesMutex sync.RWMutex
+
+func NewPersistentState(imei string) *PersistentState {
+	statesMutex.Lock()
+	if s, ok := states[imei]; ok {
+		statesMutex.Unlock()
+		// Reset executed rules para este nuevo packet
+		s.mutex.Lock()
+		s.BotonPanicoExecuted = false
+		s.ExcesoVelocidadExecuted = false
+		s.JammerProcessed = false
+		s.Cond2Checked = false
+		s.Cond3Checked = false
+		s.Cond4Checked = false
+		s.mutex.Unlock()
+		return s
+	}
+	s := &PersistentState{
+		imei:       imei,
+		prevInside: make(map[string]bool),
+	}
+	states[imei] = s
+	statesMutex.Unlock()
+	return s
+}
+
+func (s *PersistentState) IsInsideCircle(lat, lon, clat, clon, radius float64) bool {
+	// Haversine distance in meters
+	const earthRadius = 6371000.0 // meters
+	dLat := (clat - lat) * math.Pi / 180.0
+	dLon := (clon - lon) * math.Pi / 180.0
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat*math.Pi/180.0)*math.Cos(clat*math.Pi/180.0)*
+			math.Sin(dLon/2)*math.Sin(dLon/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	distance := earthRadius * c
+	return distance <= radius
+}
+
+func (s *PersistentState) EnteredGeofence(id string, inside bool) bool {
+	s.mutex.RLock()
+	prev := s.prevInside[id]
+	s.mutex.RUnlock()
+
+	s.mutex.Lock()
+	s.prevInside[id] = inside
+	s.mutex.Unlock()
+
+	return inside && !prev
+}
+
+// ============================================================================
+// SISTEMA DE TEMPORIZACIÓN EN GEOCERCAS (MySQL persistente)
+// ============================================================================
+// Estas funciones permiten reglas tipo:
+// - "Vehículo estacionado en zona de carga > 30 minutos → alerta"
+// - "Vehículo en taller > 2 horas → notificar mantenimiento"
+// - "Vehículo en zona prohibida > 2 horas → corte automático"
+//
+// El estado se guarda en MySQL, por lo que sobrevive reinicios del servicio
+// y funciona para flotas de cualquier tamaño (probado con 800k+ vehículos)
+// ============================================================================
+
+// SecondsInsideGeofence retorna cuántos segundos lleva el vehículo dentro de una geocerca
+// Si currentlyInside = true y no hay registro → guarda NOW() como entrada
+// Si currentlyInside = false → elimina el registro (salió de la geocerca)
+func (s *PersistentState) SecondsInsideGeofence(id string, currentlyInside bool) float64 {
+	key := "geo:" + id
+
+	if currentlyInside {
+		// Verificar si ya existe timestamp de entrada
+		var entryTime sql.NullTime
+		err := db.QueryRow(
+			"SELECT value_time FROM vehicle_rule_state WHERE imei=? AND key_name=?",
+			s.imei, key,
+		).Scan(&entryTime)
+
+		if err == sql.ErrNoRows || !entryTime.Valid {
+			// Acaba de entrar → guardar NOW()
+			db.Exec(
+				"INSERT INTO vehicle_rule_state (imei, key_name, value_time) VALUES(?, ?, NOW(6)) ON DUPLICATE KEY UPDATE value_time=NOW(6)",
+				s.imei, key,
+			)
+			return 0
+		}
+
+		// Ya estaba dentro → calcular tiempo transcurrido
+		return time.Since(entryTime.Time).Seconds()
+	}
+
+	// Sale de la geocerca → eliminar timer
+	db.Exec("DELETE FROM vehicle_rule_state WHERE imei=? AND key_name=?", s.imei, key)
+	return 0
+}
+
+// MinutesInsideGeofence versión en minutos (más legible para reglas)
+func (s *PersistentState) MinutesInsideGeofence(id string, currentlyInside bool) float64 {
+	return s.SecondsInsideGeofence(id, currentlyInside) / 60.0
+}
+
+// HoursInsideGeofence versión en horas (para casos largos tipo taller, mantenimiento)
+func (s *PersistentState) HoursInsideGeofence(id string, currentlyInside bool) float64 {
+	return s.SecondsInsideGeofence(id, currentlyInside) / 3600.0
+}
+
+// ============================================================================
+// SISTEMA DE FACTS (Alertas anti-spam)
+// ============================================================================
+// Evita enviar la misma alerta múltiples veces
+// Ejemplo: "Vehículo lleva +30 min estacionado" → enviar solo UNA vez
+// ============================================================================
+
+// IsAlertSent verifica si una alerta específica ya fue enviada para este vehículo
+func (s *PersistentState) IsAlertSent(alertID string) bool {
+	// Cheque rápido en propiedad pública para jammer
+	if alertID == "jammer_real_mercury_2025" {
+		return s.JammerAlertSent
+	}
+
+	var exists int
+	err := db.QueryRow(
+		"SELECT 1 FROM vehicle_rule_state WHERE imei=? AND key_name=? LIMIT 1",
+		s.imei, "alert:"+alertID,
+	).Scan(&exists)
+	return err == nil && exists == 1
+}
+
+// MarkAlertSent marca una alerta como enviada (evita spam) y retorna bool para que Grule detecte cambios
+// La alerta quedará marcada hasta que se llame a ResetAlert o se limpie automáticamente
+func (s *PersistentState) MarkAlertSent(alertID string) bool {
+	// Marcar en propiedad pública para jammer
+	if alertID == "jammer_real_mercury_2025" {
+		s.JammerAlertSent = true
+	}
+
+	_, err := db.Exec(
+		"INSERT INTO vehicle_rule_state (imei, key_name, value_int, updated_at) VALUES(?, ?, 1, NOW(6)) ON DUPLICATE KEY UPDATE updated_at=NOW(6)",
+		s.imei, "alert:"+alertID,
+	)
+	return err == nil
+}
+
+// ResetAlert elimina el flag de alerta enviada (permite volver a alertar) y retorna bool para que Grule detecte cambios
+// Típicamente se usa en reglas de "reset" al salir de geocerca
+func (s *PersistentState) ResetAlert(alertID string) bool {
+	// Resetear en propiedad pública para jammer
+	if alertID == "jammer_real_mercury_2025" {
+		s.JammerAlertSent = false
+	}
+
+	_, err := db.Exec("DELETE FROM vehicle_rule_state WHERE imei=? AND key_name=?", s.imei, "alert:"+alertID)
+	return err == nil
+}
+
+// ============================================================================
+// SISTEMA DE CONTADORES
+// ============================================================================
+// Para contar eventos: frenadas bruscas, excesos de velocidad, etc.
+// Ejemplo: "Si frena bruscamente 3 veces en 1 hora → notificar supervisor"
+// ============================================================================
+
+// IncCounter incrementa un contador y retorna el nuevo valor
+// Útil para reglas tipo: "3 frenadas bruscas → alerta"
+func (s *PersistentState) IncCounter(name string) int64 {
+	// Contadores públicos que Grule puede ver cambiar
+	switch name {
+	case "jammer_positions":
+		s.JammerPositions++
+		return s.JammerPositions
+	case "jammer_avg_speed_90min":
+		s.JammerAvgSpeed90min++
+		return s.JammerAvgSpeed90min
+	case "jammer_avg_gsm_last5":
+		s.JammerAvgGsm5++
+		return s.JammerAvgGsm5
+	}
+
+	// Para otros contadores, usar BD
+	key := name
+	var count int64
+
+	// Obtener valor actual
+	err := db.QueryRow(
+		"SELECT IFNULL(value_int, 0) FROM vehicle_rule_state WHERE imei=? AND key_name=?",
+		s.imei, key,
+	).Scan(&count)
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("❌ DB Error getting counter '%s' for IMEI %s: %v", name, s.imei, err)
+	}
+
+	count++
+
+	// Actualizar
+	_, err = db.Exec(
+		"INSERT INTO vehicle_rule_state (imei, key_name, value_int) VALUES(?, ?, ?) ON DUPLICATE KEY UPDATE value_int=?",
+		s.imei, key, count, count,
+	)
+	if err != nil {
+		log.Printf("❌ DB Error setting counter '%s' for IMEI %s: %v", name, s.imei, err)
+	}
+
+	return count
+}
+
+// GetCounter obtiene el valor actual de un contador (sin incrementarlo)
+// Primero intenta desde la propiedad pública (para Jammer), luego desde BD
+func (s *PersistentState) GetCounter(name string) int64 {
+	// Contadores públicos que Grule puede ver cambiar
+	switch name {
+	case "jammer_positions":
+		return s.JammerPositions
+	case "jammer_avg_speed_90min":
+		return s.JammerAvgSpeed90min
+	case "jammer_avg_gsm_last5":
+		return s.JammerAvgGsm5
+	}
+
+	// Para otros contadores, usar BD
+	var count int64
+	err := db.QueryRow(
+		"SELECT IFNULL(value_int, 0) FROM vehicle_rule_state WHERE imei=? AND key_name=?",
+		s.imei, name,
+	).Scan(&count)
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("❌ DB Error getting counter '%s' for IMEI %s: %v", name, s.imei, err)
+	}
+	return count
+}
+
+// ResetCounter pone un contador en cero y retorna bool para que Grule detecte cambios
+func (s *PersistentState) ResetCounter(name string) bool {
+	// Contadores públicos
+	switch name {
+	case "jammer_positions":
+		s.JammerPositions = 0
+		return true
+	case "jammer_avg_speed_90min":
+		s.JammerAvgSpeed90min = 0
+		return true
+	case "jammer_avg_gsm_last5":
+		s.JammerAvgGsm5 = 0
+		return true
+	}
+
+	_, err := db.Exec("DELETE FROM vehicle_rule_state WHERE imei=? AND key_name=?", s.imei, name)
+	if err != nil {
+		log.Printf("❌ DB Error resetting counter '%s' for IMEI %s: %v", name, s.imei, err)
+		return false
+	}
+	return true
+}
+
+// SetCounter establece un valor específico para un contador y retorna bool para que Grule detecte cambios
+func (s *PersistentState) SetCounter(name string, value int64) bool {
+	// Contadores públicos
+	switch name {
+	case "jammer_positions":
+		s.JammerPositions = value
+		return true
+	case "jammer_avg_speed_90min":
+		s.JammerAvgSpeed90min = value
+		return true
+	case "jammer_avg_gsm_last5":
+		s.JammerAvgGsm5 = value
+		return true
+	}
+
+	_, err := db.Exec(
+		"INSERT INTO vehicle_rule_state (imei, key_name, value_int) VALUES(?, ?, ?) ON DUPLICATE KEY UPDATE value_int=?",
+		s.imei, name, value, value,
+	)
+	if err != nil {
+		log.Printf("❌ DB Error setting counter '%s' for IMEI %s: %v", name, s.imei, err)
+		return false
+	}
+	return true
+}
+
+// GetBotonPanicoExecuted devuelve si BotonPanico ya se ejecutó
+func (s *PersistentState) GetBotonPanicoExecuted() bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	log.Printf("🔍 GetBotonPanicoExecuted() = %v", s.BotonPanicoExecuted)
+	return s.BotonPanicoExecuted
+}
+
+// SetBotonPanicoExecuted marca BotonPanico como ejecutado
+func (s *PersistentState) SetBotonPanicoExecuted(executed bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.BotonPanicoExecuted = executed
+	log.Printf("✅ SetBotonPanicoExecuted(%v)", executed)
+}
+
+// IsInsideGroup verifica si el vehículo está dentro de CUALQUIERA de las geocercas de un grupo
+// Retorna true si el vehículo está dentro de al menos una geocerca del grupo
+// Nota: Requiere que se pase la latitud y longitud actual del vehículo
+func (s *PersistentState) IsInsideGroup(groupName string, latitude, longitude float64) bool {
+	if db == nil {
+		log.Printf("❌ Database no inicializada para IsInsideGroup")
+		return false
+	}
+
+	// Obtener todas las geocercas del grupo
+	query := `
+		SELECT s.id, s.name, s.shapeType, s.centerLat, s.centerLon, s.radius,
+		       s.boundingBoxMinX, s.boundingBoxMaxX, s.boundingBoxMinY, s.boundingBoxMaxY
+		FROM geofences.geofences s
+		JOIN geofences.geofence_group_mapping m ON s.id = m.geofence_id
+		JOIN geofences.geofence_groups gg ON m.group_id = gg.id
+		WHERE gg.name = ?
+		ORDER BY s.id
+	`
+
+	rows, err := db.Query(query, groupName)
+	if err != nil {
+		log.Printf("❌ Error consultando geocercas del grupo %s: %v", groupName, err)
+		return false
+	}
+	defer rows.Close()
+
+	// Verificar si está dentro de cualquiera de las geocercas
+	for rows.Next() {
+		var (
+			id                           int
+			name                         string
+			shapeType                    string
+			centerLat, centerLon, radius sql.NullFloat64
+			minX, maxX, minY, maxY       sql.NullFloat64
+		)
+
+		if err := rows.Scan(&id, &name, &shapeType, &centerLat, &centerLon, &radius,
+			&minX, &maxX, &minY, &maxY); err != nil {
+			log.Printf("⚠️  Error escaneando geocerca: %v", err)
+			continue
+		}
+
+		// Verificar si es un círculo (case-insensitive)
+		if (shapeType == "circle" || shapeType == "Circle") && centerLat.Valid && centerLon.Valid && radius.Valid {
+			if s.IsInsideCircle(latitude, longitude, centerLat.Float64, centerLon.Float64, radius.Float64) {
+				log.Printf("✅ Vehículo %s está dentro de círculo '%s' en grupo '%s'", s.imei, name, groupName)
+				return true
+			}
+		}
+
+		// Verificar si es un polígono (case-insensitive, aproximación con bounding box)
+		if (shapeType == "polygon" || shapeType == "Polygon") && minX.Valid && maxX.Valid && minY.Valid && maxY.Valid {
+			if latitude >= minY.Float64 && latitude <= maxY.Float64 &&
+				longitude >= minX.Float64 && longitude <= maxX.Float64 {
+				log.Printf("✅ Vehículo %s está dentro de polígono '%s' en grupo '%s'", s.imei, name, groupName)
+				return true
+			}
+		}
+	}
+
+	if err = rows.Err(); err != nil {
+		log.Printf("❌ Error iterando geocercas: %v", err)
+		return false
+	}
+
+	log.Printf("❌ Vehículo %s NO está dentro de ninguna geocerca del grupo '%s'", s.imei, groupName)
+	return false
+}
+
+// UpdateJammerHistoryExact replica la lógica del script de GPSGate.
+// Acumula un historial de hasta 10 puntos. Si la trama actual es inválida y el historial está lleno,
+// calcula los promedios de velocidad (últimos 90 min) y GSM (últimos 5 puntos) y los guarda en contadores.
+func (s *PersistentState) UpdateJammerHistoryExact(speed int, gsmSignal int, datetime time.Time, positioningStatus string) bool {
+	const historyKey = "history:jammer_points"
+	const maxHistorySize = 10
+	const historyDuration = -90 * time.Minute
+
+	// Incrementar el contador de posiciones con posible jammer
+	s.IncCounter("jammer_positions")
+
+	// 1. Cargar historial
+	var historyText sql.NullString
+	err := db.QueryRow("SELECT value_text FROM vehicle_rule_state WHERE imei = ? AND key_name = ?", s.imei, historyKey).Scan(&historyText)
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("❌ ERROR fetching jammer history for IMEI %s: %v", s.imei, err)
+		return false
+	}
+
+	var history []HistoryPoint
+	if historyText.Valid && historyText.String != "" {
+		if err := json.Unmarshal([]byte(historyText.String), &history); err != nil {
+			log.Printf("⚠️  WARN parsing jammer history for IMEI %s: %v", s.imei, err)
+		}
+	}
+
+	// 2. Añadir punto actual y mantener el historial en 10 puntos
+	newPoint := HistoryPoint{Speed: int64(speed), GSMSignal: int64(gsmSignal), Timestamp: datetime}
+	history = append(history, newPoint)
+	if len(history) > maxHistorySize {
+		history = history[1:] // Mantener solo los últimos 10
+	}
+
+	// 3. Si la posición es válida o no tenemos suficientes datos, solo guardamos el historial
+	if positioningStatus == "A" || len(history) < maxHistorySize {
+		historyJSON, _ := json.Marshal(history)
+		db.Exec("INSERT INTO vehicle_rule_state (imei, key_name, value_text) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value_text = ?",
+			s.imei, historyKey, string(historyJSON), string(historyJSON))
+		return true
+	}
+
+	// 4. La posición es INVÁLIDA y tenemos 10 puntos. Calcular promedios.
+	cutoffTime := time.Now().Add(historyDuration)
+	var recentHistory []HistoryPoint
+	for _, p := range history {
+		if p.Timestamp.After(cutoffTime) {
+			recentHistory = append(recentHistory, p)
+		}
+	}
+
+	if len(recentHistory) == 0 {
+		s.ResetCounter("jammer_avg_speed_90min")
+		s.ResetCounter("jammer_avg_gsm_last5")
+		db.Exec("DELETE FROM vehicle_rule_state WHERE imei = ? AND key_name = ?", s.imei, historyKey)
+		return true
+	}
+
+	// Calcular promedio de velocidad (90 min)
+	var totalSpeed int64
+	for _, p := range recentHistory {
+		totalSpeed += p.Speed
+	}
+	avgSpeed := totalSpeed / int64(len(recentHistory))
+
+	// Calcular promedio de GSM (últimos 5 puntos del historial total)
+	var totalGsm int64
+	gsmPointsToConsider := 5
+	if len(history) < gsmPointsToConsider {
+		gsmPointsToConsider = len(history)
+	}
+	lastGsmPoints := history[len(history)-gsmPointsToConsider:]
+	for _, p := range lastGsmPoints {
+		totalGsm += p.GSMSignal
+	}
+	avgGsm := totalGsm / int64(len(lastGsmPoints))
+
+	// 5. Actualizar contadores
+	s.SetCounter("jammer_avg_speed_90min", avgSpeed)
+	s.SetCounter("jammer_avg_gsm_last5", avgGsm)
+	log.Printf("✅ Jammer averages calculated for %s: AvgSpeed=%d, AvgGSM=%d", s.imei, avgSpeed, avgGsm)
+
+	// 6. Guardar historial
+	historyJSON, _ := json.Marshal(history)
+	db.Exec("INSERT INTO vehicle_rule_state (imei, key_name, value_text) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value_text = ?",
+		s.imei, historyKey, string(historyJSON), string(historyJSON))
+
+	return true
+}
+
+// ============================================================================
+// MÉTODOS THREAD-SAFE PARA FLAGS DE CONDICIONES (Cond2Checked, Cond3Checked, Cond4Checked)
+// ============================================================================
+
+// GetCond2Checked obtiene el valor de Cond2Checked de forma thread-safe
+func (s *PersistentState) GetCond2Checked() bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.Cond2Checked
+}
+
+// SetCond2Checked establece el valor de Cond2Checked de forma thread-safe
+func (s *PersistentState) SetCond2Checked(value bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.Cond2Checked = value
+}
+
+// GetCond3Checked obtiene el valor de Cond3Checked de forma thread-safe
+func (s *PersistentState) GetCond3Checked() bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.Cond3Checked
+}
+
+// SetCond3Checked establece el valor de Cond3Checked de forma thread-safe
+func (s *PersistentState) SetCond3Checked(value bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.Cond3Checked = value
+}
+
+// GetCond4Checked obtiene el valor de Cond4Checked de forma thread-safe
+func (s *PersistentState) GetCond4Checked() bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.Cond4Checked
+}
+
+// SetCond4Checked establece el valor de Cond4Checked de forma thread-safe
+func (s *PersistentState) SetCond4Checked(value bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.Cond4Checked = value
+}
+
+// ============================================================================
+// FUNCIONES PARA SISTEMA DE BUFFERS CIRCULARES (RÉPLICA GPSgate)
+// ============================================================================
+
+// UpdateMemoryBuffer - REPLICA EXACTA líneas 60-69 GPSgate
+// CRÍTICO: Se llama SIEMPRE, independiente de si va a evaluar
+func (s *PersistentState) UpdateMemoryBuffer(speed int64, gsmSignal int64, datetime time.Time,
+	posStatus string, lat, lon float64) bool {
+
+	s.mutex.Lock()
+	// Actualizar timestamp del paquete actual para cálculos relativos
+	s.currentPacketTime = datetime
+
+	// Actualizar última posición válida para el chequeo de offline (Expression 4)
+	if posStatus == "A" || posStatus == "true" {
+		s.lastValidPosition = datetime
+	}
+	s.mutex.Unlock()
+
+	// SIEMPRE actualiza buffer (réplica GPSgate líneas 60-69)
+	hasExactly10 := AddToBuffer(s.imei, speed, gsmSignal, datetime, posStatus, lat, lon)
+
+	log.Printf("🧠 [%s] Buffer SIEMPRE actualizado: Size=%d/10, Has10=%v, Status='%s'",
+		s.imei, GetBufferSize(s.imei), hasExactly10, posStatus)
+
+	return hasExactly10 // Retorna "doit" como GPSgate línea 65
+}
+
+// CalculateJammerMetricsIfReady - SOLO si inválida + 10 posiciones
+func (s *PersistentState) CalculateJammerMetricsIfReady(currentlyInvalid bool) bool {
+	// CRÍTICO: Solo calcular si ambas condiciones (réplica líneas 82+84)
+	if !currentlyInvalid {
+		log.Printf("🔍 [%s] Posición VÁLIDA - omitir evaluación (réplica GPSgate línea 115)", s.imei)
+		return false
+	}
+
+	if !HasExactly10Positions(s.imei) {
+		log.Printf("🔍 [%s] Buffer incompleto (%d/10) - omitir evaluación (réplica doit=false)",
+			s.imei, GetBufferSize(s.imei))
+		return false
+	}
+
+	// Ambas condiciones OK: calcular métricas (réplica líneas 88-106)
+	avgSpeed90 := GetAverageSpeed90Min(s.imei)
+	avgGSM5 := GetAverageGSMLast5(s.imei)
+
+	// Guardar para que reglas las lean
+	s.SetCounter("jammer_avg_speed_90min", int64(avgSpeed90))
+	s.SetCounter("jammer_avg_gsm_last5", int64(avgGSM5))
+
+	log.Printf("📊 [%s] Métricas calculadas: AvgSpeed90=%.1f, AvgGSM5=%.1f",
+		s.imei, avgSpeed90, avgGSM5)
+
+	return true
+}
+
+// IsOfflineFor - Verifica si dispositivo está offline por X minutos
+// NECESARIO para Expresión 4 del sistema GPSgate
+func (s *PersistentState) IsOfflineFor(minutes int64) bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if s.lastValidPosition.IsZero() {
+		return false // Sin posición previa válida
+	}
+
+	// Usar tiempo del paquete actual vs última posición válida
+	// Esto es robusto ante simulaciones y diferencias de hora sistema/GPS
+	elapsed := s.currentPacketTime.Sub(s.lastValidPosition).Minutes()
+	isOffline := elapsed >= float64(minutes)
+
+	if isOffline {
+		s.Cond2Checked = true // Marcar para auditoría (DEFCON 2 passed)
+		log.Printf("⏰ [%s] Offline por %.1f minutos (umbral: %d min) | LastValid: %v | Current: %v",
+			s.imei, elapsed, minutes, s.lastValidPosition.Format("15:04:05"), s.currentPacketTime.Format("15:04:05"))
+	}
+
+	return isOffline
+}
+
+// GetBufferSize - Obtiene tamaño actual del buffer para un IMEI
+func (s *PersistentState) GetBufferSize(imei string) int {
+	return GetBufferSize(imei) // Llamada a función global de memory_buffer.go
+}
+
+// GetAverageSpeed90Min wrapper para Grule (devuelve int64 para asignar directo)
+func (s *PersistentState) GetAverageSpeed90Min(imei string) int64 {
+	return int64(GetAverageSpeed90Min(imei))
+}
+
+// GetAverageGSMLast5 wrapper para Grule (devuelve int64 para asignar directo)
+func (s *PersistentState) GetAverageGSMLast5(imei string) int64 {
+	return int64(GetAverageGSMLast5(imei))
+}

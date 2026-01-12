@@ -1,0 +1,28 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - jonobridge.dwim.mx
+  resources:
+  - forwarders
+  - jonobridges
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - jonobridge.dwim.mx
+  resources:
+  - forwarders/status
+  - jonobridges/status
+  verbs:
+  - get
+  - patch
+  - update

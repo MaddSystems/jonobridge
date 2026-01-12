@@ -1,0 +1,15 @@
+name: timing
+version: "1.0.0"
+description: Timing analysis for offline detection
+grule_context_name: timing
+
+functions:
+  - name: IsOfflineFor
+    description: Check if device has been offline for X minutes relative to current packet time
+    parameters:
+      - name: imei
+        type: string
+      - name: minutes
+        type: int64
+    return_type: bool
+    example: 'timing.IsOfflineFor(packet.IMEI, 5)'

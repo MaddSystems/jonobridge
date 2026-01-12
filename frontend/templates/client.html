@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Client Services</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <link href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jqueryui/1.12.1/jquery-ui.min.css">
+    <style>
+        #service-menu {
+            max-width: 250px;
+            max-height: 500px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 10px;
+        }
+        #drop-area {
+            min-height: 500px;
+            border: 2px dashed #ccc;
+            padding: 20px;
+        }
+        .service {
+            padding: 8px;
+            margin-bottom: 10px;
+            background-color: #f0f0f0;
+            cursor: move;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .connected {
+            border: 2px solid green;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+            background-color: #e8f5e9;
+        }
+        #parameter-form {
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0px 0px 15px rgba(0, 0, 0, 0.3);
+            width: 300px;
+        }
+        .parameter-display {
+            margin-top: 10px;
+        }
+        .remove-service {
+            margin-top: 10px;
+        }
+
+        @keyframes slideIn {
+            0% {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            100% {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        .alert {
+            margin-bottom: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            animation: slideIn 0.5s ease-in-out;
+        }
+
+        .modal-header {
+            border-bottom: 0;
+        }
+
+        .modal-footer {
+            border-top: 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2>Client: {{ client.name }}</h2>
+            <a href="{{ url_for('index') }}" class="btn btn-secondary">
+                <i class="fas fa-arrow-left me-2"></i>Back to Home
+            </a>
+        </div>
+
+        <div class="row mt-4">
+            <!-- Left Column: Available Services -->
+            <div class="col-md-3">
+                <div id="service-menu" class="bg-light rounded shadow-sm">
+                    <h4 class="text-center">Available Services</h4>
+                    {% for service_name, service_info in available_services.items() %}
+                        <div class="service" data-service="{{ service_name }}">
+                            {{ service_name }}
+                        </div>
+                    {% endfor %}
+                </div>
+            </div>
+
+            <!-- Right Column: Assigned Services -->
+            <div class="col-md-9">
+                <div id="drop-area" class="bg-white rounded shadow-sm">
+                    <h4 class="text-center">Assigned Services</h4>
+                    <div id="assigned-services">
+                        {% for service_name, service in client_services.items() %}
+                            <div class="service connected" data-service="{{ service_name }}" data-parameters='{{ service | tojson | safe }}'>
+                                <h5>{{ service_name }}</h5>
+                                <ul class="parameter-display list-unstyled">
+                                    {% for param, value in service.items() %}
+                                        {% if param != 'id' and param != 'client_id' %}
+                                            <li><strong>{{ param }}:</strong> {{ value }}</li>
+                                        {% endif %}
+                                    {% endfor %}
+                                </ul>
+                                <button class="btn btn-sm btn-outline-danger remove-service" data-service="{{ service_name }}">Remove</button>
+                            </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="text-center mt-4">
+            <button id="create-automation" class="btn btn-primary">Save Services</button>
+        </div>
+    </div>
+
+    <!-- Modal Form for Parameters -->
+    <div id="parameter-form" class="p-3">
+        <h4>Configure Parameters</h4>
+        <form id="parameters-form">
+            <div id="form-fields"></div>
+            <button type="button" id="save-parameters" class="btn btn-primary btn-block mt-3">Save</button>
+        </form>
+    </div>
+
+    <!-- Add this modal for automation success -->
+    <div class="modal fade" id="automationSuccessModal" tabindex="-1" aria-labelledby="automationSuccessModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header bg-success text-white">
+                    <h5 class="modal-title" id="automationSuccessModalLabel">
+                        <i class="fas fa-check-circle me-2"></i>Success
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="alert alert-success mb-0" role="alert">
+                        <p class="mb-0">Services have been successfully assigned to the client!</p>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-success" data-bs-dismiss="modal">OK</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add this for floating alerts -->
+    <div id="alertPlaceholder" style="position: fixed; top: 20px; right: 20px; z-index: 1050;"></div>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jqueryui/1.12.1/jquery-ui.min.js"></script>
+    <script>
+        const servicesConfig = {{ available_services | tojson | safe }};
+        const clientServices = {{ client_services | tojson | safe }};
+        const removedServices = new Set();
+
+        $(function () {
+            // Initialize assigned services with existing parameters
+            for (const [serviceName, parameters] of Object.entries(clientServices)) {
+                const parametersJson = JSON.stringify(parameters || {});
+                if ($("#assigned-services .connected[data-service='" + serviceName + "']").length === 0) {
+                    const serviceElement = $("<div class='service connected' data-service='" + serviceName + "'></div>")
+                        .append(`<h5>${serviceName}</h5>`)
+                        .attr("data-parameters", parametersJson)
+                        .append(`<ul class="parameter-display list-unstyled"></ul>`)
+                        .append(`<button class="btn btn-sm btn-outline-danger remove-service" data-service="${serviceName}">Remove</button>`);
+
+                    const parameterDisplay = Object.entries(parameters)
+                        .filter(([key]) => key !== 'id' && key !== 'client_id')
+                        .map(([key, value]) => `<li><strong>${key}:</strong> ${value}</li>`)
+                        .join("");
+                    serviceElement.find(".parameter-display").html(parameterDisplay);
+
+                    $("#assigned-services").append(serviceElement);
+                }
+            }
+
+            $(".service").draggable({
+                helper: "clone",
+                revert: "invalid"
+            });
+
+            $("#drop-area").droppable({
+                accept: ".service",
+                drop: function (event, ui) {
+                    const serviceName = ui.helper.data("service");
+                    const existingService = $("#assigned-services .connected[data-service='" + serviceName + "']");
+
+                    if (existingService.length === 0) {
+                        const serviceElement = $("<div class='service connected' data-service='" + serviceName + "'></div>")
+                            .append(`<h5>${serviceName}</h5>`)
+                            .attr("data-parameters", JSON.stringify({}))
+                            .append(`<ul class="parameter-display list-unstyled"></ul>`)
+                            .append(`<button class="btn btn-sm btn-outline-danger remove-service" data-service="${serviceName}">Remove</button>`);
+
+                        $("#assigned-services").append(serviceElement);
+                    } else {
+                        showAlert("Service is already added.", "warning");
+                    }
+                }
+            });
+
+            $(document).on('click', '.remove-service', function () {
+                const serviceElement = $(this).parent();
+                const serviceName = serviceElement.data("service");
+                removedServices.add(serviceName);
+                serviceElement.remove();
+            });
+
+            $(document).on('dblclick', '.connected', function () {
+                const serviceName = $(this).data("service");
+                let parameters = $(this).attr("data-parameters");
+
+                try {
+                    parameters = JSON.parse(parameters);
+                } catch (e) {
+                    parameters = {};
+                }
+
+                const fieldsConfig = servicesConfig[serviceName].parameters;
+                let formFieldsHtml = "";
+                for (const [param, type] of Object.entries(fieldsConfig)) {
+                    const currentValue = parameters[param] || "";
+                    formFieldsHtml += `<label>${param}:</label><input type="${type.startsWith('varchar') ? 'text' : 'number'}" name="${param}" value="${currentValue}" class="form-control mb-2">`;
+                }
+
+                $("#form-fields").html(formFieldsHtml);
+                $("#parameter-form").data("serviceElement", $(this)).show();
+            });
+
+            $("#save-parameters").click(function () {
+                const $serviceElement = $("#parameter-form").data("serviceElement");
+                const serviceName = $serviceElement.data("service");
+                const parameters = {};
+
+                $("#parameters-form").serializeArray().forEach(function (field) {
+                    parameters[field.name] = field.value;
+                });
+
+                $serviceElement.attr("data-parameters", JSON.stringify(parameters));
+
+                const parameterDisplay = Object.entries(parameters)
+                    .filter(([key]) => key !== 'id' && key !== 'client_id')
+                    .map(([key, value]) => `<li><strong>${key}:</strong> ${value}</li>`)
+                    .join("");
+                $serviceElement.find(".parameter-display").html(parameterDisplay);
+
+                $("#parameter-form").hide();
+            });
+
+            $("#create-automation").click(function () {
+                const clientId = {{ client.id }};
+                const assignedServices = [];
+
+                $("#assigned-services .connected").each(function () {
+                    const serviceName = $(this).data("service");
+                    let parameters = $(this).attr("data-parameters");
+
+                    try {
+                        parameters = JSON.parse(parameters);
+                    } catch (e) {
+                        parameters = {};
+                    }
+
+                    if (typeof parameters === 'object' && Object.keys(parameters).length > 0) {
+                        const serviceEntry = { name: serviceName, ...parameters };
+                        assignedServices.push(serviceEntry);
+                    }
+                });
+
+                $.ajax({
+                    url: "/create_automation",
+                    method: "POST",
+                    contentType: "application/json",
+                    data: JSON.stringify({
+                        client_id: clientId,
+                        services: assignedServices,
+                        removed_services: Array.from(removedServices)
+                    }),
+                    success: function (response) {
+                        // Show success modal
+                        var successModal = new bootstrap.Modal(document.getElementById('automationSuccessModal'));
+                        successModal.show();
+                        
+                        // Automatically hide after 2 seconds and reload
+                        setTimeout(() => {
+                            successModal.hide();
+                            location.reload();
+                        }, 2000);
+                    },
+                    error: function (xhr) {
+                        const errorResponse = JSON.parse(xhr.responseText);
+                        if (errorResponse.message) {
+                            showAlert(errorResponse.message, "danger");
+                        } else {
+                            showAlert("An error occurred while saving the services.", "danger");
+                        }
+                    }
+                });
+            });
+        });
+
+        // Helper function to show alerts
+        function showAlert(message, type) {
+            const alertPlaceholder = document.getElementById('alertPlaceholder');
+            const wrapper = document.createElement('div');
+            
+            wrapper.innerHTML = [
+                `<div class="alert alert-${type} alert-dismissible fade show" role="alert">`,
+                `   <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'} me-2"></i>`,
+                `   ${message}`,
+                '   <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>',
+                '</div>'
+            ].join('');
+
+            // Clear any existing alerts
+            alertPlaceholder.innerHTML = '';
+            alertPlaceholder.append(wrapper);
+
+            // Auto-dismiss after 3 seconds
+            setTimeout(() => {
+                const alert = bootstrap.Alert.getOrCreateInstance(wrapper.querySelector('.alert'));
+                alert.close();
+            }, 3000);
+        }
+    </script>
+</body>
+</html>

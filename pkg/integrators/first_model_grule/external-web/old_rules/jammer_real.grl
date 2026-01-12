@@ -1,0 +1,147 @@
+// ═══════════════════════════════════════════════════════════════════
+// name: Jammer-Real-DEFCON
+// category: Jammer Detection
+// description: Replica de GPSgate con flujo de 6 pasos secuenciales y auditables.
+//              Cada condición es una regla separada para respetar la sintaxis GRL.
+// ═══════════════════════════════════════════════════════════════════
+
+// REGLA DE PREPARACIÓN: LIMPIEZA Y EJECUCIÓN DEL COMPONENTE 1
+rule Jammer_Initialization_Component1 "PREP: Inicialización y Buffer Update" salience 1000 {
+    when
+        Jono.DebugProcessed
+    then
+        // Resetear flags
+        Jono.Cond1Passed = false; Jono.Cond1Processed = false;
+        Jono.Cond2Passed = false; Jono.Cond2Processed = false;
+        Jono.Cond3Passed = false; Jono.Cond3Processed = false;
+        Jono.Cond4Passed = false; Jono.Cond4Processed = false;
+        Jono.Cond5Passed = false; Jono.Cond5Processed = false;
+        Jono.BufferUpdated = false; Jono.BufferHas10 = false;
+        Jono.MetricsReady = false; Jono.EvaluationSkipped = false;
+        Jono.AlertFired = false;
+
+        // Sincronizar reseteo
+        property.SetBufferUpdated(false); property.SetBufferHas10(false);
+        property.SetMetricsReady(false); property.SetEvaluationSkipped(false);
+        property.SetAlertFired(false);
+
+        // Componente 1: UpdateCircularBuffer
+        Jono.BufferHas10 = state.UpdateMemoryBuffer(Jono.Speed, Jono.GSMSignalStrength, Jono.Datetime, Jono.PositioningStatus, Jono.Latitude, Jono.Longitude);
+        Jono.BufferUpdated = true;
+        property.SetBufferUpdated(true); property.SetBufferHas10(Jono.BufferHas10);
+        actions.Audit("Component1_UpdateCircularBuffer", "DEFCON 0: Buffer actualizado ("+state.GetBufferSize(Jono.IMEI)+"/10).", 1000, false);
+        Changed("Jono");
+}
+
+// DEFCON 1: EvaluateOnlyOnInvalid
+rule JammerStep1_Pass "DEFCON 1: PASA" salience 900 {
+    when
+        Jono.BufferUpdated && !Jono.Cond1Processed && Jono.CurrentlyInvalid && Jono.BufferHas10
+    then
+        Jono.Cond1Processed = true; Jono.Cond1Passed = true;
+        actions.Audit("Component2_EvaluateOnlyOnInvalid", "PASA: Trama inválida y buffer lleno.", 900, false);
+        Changed("Jono");
+}
+rule JammerStep1_Fail_Valid "DEFCON 1: FALLA (Trama Válida)" salience 899 {
+    when
+        Jono.BufferUpdated && !Jono.Cond1Processed && !Jono.CurrentlyInvalid
+    then
+        Jono.Cond1Processed = true;
+        actions.Audit("Jammer_Stop_Valid", "DETENIDO: Trama válida.", 899, false);
+        Changed("Jono");
+}
+rule JammerStep1_Fail_Buffer "DEFCON 1: FALLA (Buffer Incompleto)" salience 898 {
+    when
+        Jono.BufferUpdated && !Jono.Cond1Processed && Jono.CurrentlyInvalid && !Jono.BufferHas10
+    then
+        Jono.Cond1Processed = true;
+        actions.Audit("Jammer_Stop_Buffer", "DETENIDO: Buffer incompleto.", 898, false);
+        Changed("Jono");
+}
+
+// DEFCON 2: CheckOfflineStatus
+rule JammerStep2_Pass "DEFCON 2: PASA" salience 800 {
+    when
+        Jono.Cond1Passed && !Jono.Cond2Processed && state.IsOfflineFor(5)
+    then
+        Jono.Cond2Processed = true; Jono.Cond2Passed = true;
+        actions.Audit("Component3_CheckOfflineStatus", "PASA: Offline por 5+ minutos.", 800, false);
+        Changed("Jono");
+}
+rule JammerStep2_Fail "DEFCON 2: FALLA" salience 799 {
+    when
+        Jono.Cond1Passed && !Jono.Cond2Processed && !state.IsOfflineFor(5)
+    then
+        Jono.Cond2Processed = true;
+        actions.Audit("Jammer_Stop_Offline", "DETENIDO: No cumple tiempo offline.", 799, false);
+        Changed("Jono");
+}
+
+// DEFCON 3: CalculateBufferMetrics
+rule JammerStep3_Execute "DEFCON 3: Execute" salience 700 {
+    when
+        Jono.Cond2Passed && !Jono.Cond3Processed
+    then
+        Jono.Cond3Processed = true;
+        state.CalculateJammerMetricsIfReady(true);
+        Jono.MetricsReady = true; property.SetMetricsReady(true);
+        actions.Audit("Component4_CalculateBufferMetrics", "Métricas calculadas.", 700, false);
+        Jono.Cond3Passed = true;
+        Changed("Jono");
+}
+
+// DEFCON 4: CheckMetricThresholds
+rule JammerStep4_Pass "DEFCON 4: PASA" salience 600 {
+    when
+        Jono.Cond3Passed && !Jono.Cond4Processed && state.GetCounter("jammer_avg_speed_90min") >= 10 && state.GetCounter("jammer_avg_gsm_last5") >= 9
+    then
+        Jono.Cond4Processed = true; Jono.Cond4Passed = true;
+        actions.Audit("Component5_CheckMetricThresholds", "PASA: Umbrales OK (Velocidad y GSM).", 600, false);
+        Changed("Jono");
+}
+rule JammerStep4_Fail "DEFCON 4: FALLA" salience 599 {
+    when
+        Jono.Cond3Passed && !Jono.Cond4Processed && (state.GetCounter("jammer_avg_speed_90min") < 10 || state.GetCounter("jammer_avg_gsm_last5") < 9)
+    then
+        Jono.Cond4Processed = true;
+        actions.Audit("Jammer_Stop_Thresholds", "DETENIDO: Métricas no cumplen umbrales.", 599, false);
+        Changed("Jono");
+}
+
+// DEFCON 5: CheckGeofenceExclusion
+rule JammerStep5_Pass "DEFCON 5: PASA" salience 500 {
+    when
+        Jono.Cond4Passed && !Jono.Cond5Processed && !state.IsInsideGroup("Taller", Jono.Latitude, Jono.Longitude) && !state.IsInsideGroup("CLIENTES", Jono.Latitude, Jono.Longitude) && !state.IsInsideGroup("Resguardo/Cedis/Puerto", Jono.Latitude, Jono.Longitude)
+    then
+        Jono.Cond5Processed = true; Jono.Cond5Passed = true;
+        actions.Audit("Component6_CheckGeofenceExclusion", "PASA: Fuera de zonas seguras.", 500, false);
+        Changed("Jono");
+}
+rule JammerStep5_Fail "DEFCON 5: FALLA" salience 499 {
+    when
+        Jono.Cond4Passed && !Jono.Cond5Processed && (state.IsInsideGroup("Taller", Jono.Latitude, Jono.Longitude) || state.IsInsideGroup("CLIENTES", Jono.Latitude, Jono.Longitude) || state.IsInsideGroup("Resguardo/Cedis/Puerto", Jono.Latitude, Jono.Longitude))
+    then
+        Jono.Cond5Processed = true;
+        actions.Audit("Jammer_Stop_Geofence", "DETENIDO: Dentro de zona segura.", 499, false);
+        Changed("Jono");
+}
+
+// DEFCON 6: DISPARAR ALERTA
+rule JammerStep6_FireAlert "DEFCON 6: Disparar Alerta de Jammer Real" salience 400 {
+    when
+        Jono.Cond5Passed && !state.IsAlertSent("jammer_real_mercury_2025")
+    then
+        state.MarkAlertSent("jammer_real_mercury_2025");
+        Jono.AlertFired = true;
+        property.SetAlertFired(true);
+        actions.SendTelegram(
+            "🚨 JAMMER REAL DETECTADO - IMEI: " + Jono.IMEI + "\n" +
+            "📋 DEFCON 6 Alcanzado (Todos los pasos OK)\n" +
+            "   🚗 Vel Prom (90m): " + state.GetCounter("jammer_avg_speed_90min") + " km/h\n" +
+            "   📡 GSM Prom (últ 5): " + state.GetCounter("jammer_avg_gsm_last5") + "\n" +
+            "📍 " + Jono.Latitude + ", " + Jono.Longitude + "\n" +
+            "🕐 " + Jono.Datetime.String()
+        );
+        actions.Audit("Component7_FireAlert", "ALERTA DISPARADA: Jammer Real Detectado.", 400, true);
+        Changed("Jono");
+}

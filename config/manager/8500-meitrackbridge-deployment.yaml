@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meitrackbridge
+  namespace: client01
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: meitrackbridge
+  template:
+    metadata:
+      labels:
+        app: meitrackbridge
+    spec:
+      initContainers:
+        - name: wait-for-mosquitto
+          image: busybox
+          command: ['sh', '-c', 'until nc -z mosquitto-8500 1883; do echo waiting for mosquitto; sleep 2; done']
+      containers:
+        - name: meitrackbridge
+          image: jordy33/meitrackbridge:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+            - containerPort: 8500
+          env:
+            - name: MQTT_BROKER_HOST
+              value: "mosquitto-8500"
+            - name: MEITRACK_HOST
+              value: "mdvr.trackermexico.com.mx:50005"

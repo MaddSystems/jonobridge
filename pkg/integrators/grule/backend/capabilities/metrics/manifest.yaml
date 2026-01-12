@@ -1,0 +1,18 @@
+name: metrics
+version: "1.0.0"
+description: Metric calculations based on buffer history
+grule_context_name: metrics
+
+functions:
+  - name: GetAverageSpeed90Min
+    description: Calculate average speed over last 90 minutes
+    parameters:
+      - name: imei
+        type: string
+    return_type: int64
+  - name: GetAverageGSMLast5
+    description: Calculate average GSM signal strength for last 5 entries
+    parameters:
+      - name: imei
+        type: string
+    return_type: int64

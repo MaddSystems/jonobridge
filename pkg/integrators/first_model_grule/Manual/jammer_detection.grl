@@ -1,0 +1,87 @@
+// ============================================================================
+// REGLA JAMMER DETECTION - Sistema Universal
+// ============================================================================
+// Detecta señales de jamming GPS analizando el comportamiento de la señal
+// NO necesita geofences - analiza parámetros GPS directamente
+// ============================================================================
+
+rule IncrementarContadorJammerMercury "Incrementar contador de señal jammer (Cond 1)" salience 200 {
+    when
+        // Condición 1: Detectar señal irregular (GSM > 0, pero GPS = 0 o señal débil)
+        Jono.GsmSignal > 0 &&
+        (Jono.SatelliteNumber == 0 || Jono.SatelliteNumber < 4)
+    then
+        // ✅ Auditoría universal: captura automática del contexto
+        actions.Audit("IncrementarContadorJammerMercury", "Señal GPS irregular detectada - posible jamming", 200, false);
+        
+        property.SetCond1Passed(true);
+        memoryBuffer.IncrementarContadorJammer();
+        actions.Log("Jammer Cond1 PASSED - IMEI: %s, GSM: %v, Sats: %v", 
+            Jono.IMEI, Jono.GsmSignal, Jono.SatelliteNumber);
+        Retract("IncrementarContadorJammerMercury");
+}
+
+rule CondicionContadorMinimo "Verificar contador mínimo de eventos jammer (Cond 2)" salience 190 {
+    when
+        property.Cond1Passed == true &&
+        memoryBuffer.ContadorJammer >= 3
+    then
+        // ✅ Auditoría universal
+        actions.Audit("CondicionContadorMinimo", "Contador de jamming alcanzó umbral mínimo", 190, false);
+        
+        property.SetCond2Passed(true);
+        actions.Log("Jammer Cond2 PASSED - Contador: %v", memoryBuffer.ContadorJammer);
+        Retract("CondicionContadorMinimo");
+}
+
+rule RevisarSiYaFueReportado "Verificar si ya fue reportado en 24h (Cond 3)" salience 180 {
+    when
+        property.Cond2Passed == true &&
+        persistentState.FueReportadoJammer24h(Jono.IMEI) == false
+    then
+        // ✅ Auditoría universal
+        actions.Audit("RevisarSiYaFueReportado", "Jammer no reportado en últimas 24h - proceder con alerta", 180, false);
+        
+        property.SetCond3Passed(true);
+        actions.Log("Jammer Cond3 PASSED - No reportado previamente");
+        Retract("RevisarSiYaFueReportado");
+}
+
+rule EnviarAlertaTelegram "Enviar alerta de jammer por Telegram (Cond 4)" salience 170 {
+    when
+        property.Cond3Passed == true
+    then
+        // 🚨 ALERTA: alertFired = true (captura completa del contexto)
+        actions.Audit("EnviarAlertaTelegram", "🚨 ALERTA DE JAMMING GPS CONFIRMADA", 170, true);
+        
+        property.SetCond4Passed(true);
+        
+        actions.SendTelegram(
+            "🚨 *ALERTA: Jamming GPS Detectado*\n" +
+            "IMEI: " + Jono.IMEI + "\n" +
+            "Eventos: " + memoryBuffer.ContadorJammer + "\n" +
+            "Señal GSM: " + Jono.GsmSignal + "\n" +
+            "Satélites: " + Jono.SatelliteNumber
+        );
+        
+        persistentState.MarcarReportadoJammer(Jono.IMEI);
+        memoryBuffer.ResetearContadorJammer();
+        
+        actions.Log("✅ Jammer Cond4 PASSED - Alerta enviada exitosamente");
+        Retract("EnviarAlertaTelegram");
+}
+
+rule ResetearPropertiesAlFinal "Resetear properties al finalizar ciclo" salience 1 {
+    when
+        property.Cond1Passed == true ||
+        property.Cond2Passed == true ||
+        property.Cond3Passed == true ||
+        property.Cond4Passed == true
+    then
+        // ✅ Auditoría universal
+        actions.Audit("ResetearPropertiesAlFinal", "Reseteo de condiciones para próximo ciclo", 1, false);
+        
+        property.ResetAll();
+        actions.Log("Properties reseteadas para IMEI: %s", Jono.IMEI);
+        Retract("ResetearPropertiesAlFinal");
+}

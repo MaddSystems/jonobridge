@@ -1,0 +1,2357 @@
+from flask import Flask, request, render_template, redirect, jsonify, url_for, flash, session
+import mysql.connector
+import json
+import subprocess
+import yaml
+from services import ServiceFactory
+import os
+from kubernetes import client as k8s_client, config
+import traceback
+import sys
+import time
+from datetime import datetime, timedelta
+import requests
+from functools import wraps
+
+app = Flask(__name__, static_url_path='/static', static_folder='static')
+app.secret_key = 'your_secret_key_here'
+
+# User credentials (in a real application, these should be stored securely in a database)
+USERS = {
+    'admin': 'password123',
+    'jorge': 'qazwsxedc',
+    'soporte': 'GPSc0ntr0l1'
+}
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'username' not in session:
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        if username in USERS and USERS[username] == password:
+            session['username'] = username
+            return redirect(url_for('clients'))
+        else:
+            flash('Invalid username or password', 'danger')
+            return redirect(url_for('index'))
+    
+    if 'username' in session:
+        return redirect(url_for('clients'))
+        
+    return render_template('index.html')
+
+@app.route('/clients')
+@login_required
+def clients():
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients')
+        clients = cursor.fetchall()
+        cursor.close()
+        db.close()
+        return render_template('clients.html', clients=clients)
+    except Exception as e:
+        flash(f'Error: {str(e)}', 'error')
+        return render_template('clients.html', clients=[])
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('index'))
+
+def get_minikube_ip():
+    """Get and verify Minikube IP address."""
+    try:
+        print("Environment variables:")
+        print(os.environ)
+
+        # Debugging Minikube Command
+        print("Running minikube ip command...")
+        result = subprocess.run(
+            ['minikube', 'ip'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        minikube_ip = result.stdout.strip()
+        print(f"Minikube IP: {minikube_ip}")
+
+        if not minikube_ip:
+            raise subprocess.CalledProcessError(1, 'minikube ip', 'Empty IP returned')
+
+        subprocess.run(['ping', '-c', '1', minikube_ip], check=True, capture_output=True)
+        print(f"Minikube IP {minikube_ip} is accessible")
+        return minikube_ip
+    except subprocess.CalledProcessError as e:
+        print(f"Command failed: {e.cmd}")
+        print(f"Return code: {e.returncode}")
+        print(f"Output: {e.output}")
+        print(f"Stderr: {e.stderr}")
+        sys.exit(1)
+
+# Get Minikube IP at startup
+MINIKUBE_IP = get_minikube_ip()
+
+MOSQUITTO_TEMPLATE = {
+    'configmap': {
+        'apiVersion': 'v1',
+        'kind': 'ConfigMap',
+        'metadata': {
+            'name': 'mosquitto-config',
+            'namespace': None
+        },
+        'data': {
+            'mosquitto.conf': '''
+listener 1883
+allow_anonymous true
+max_queued_messages 1000
+max_inflight_messages 100
+persistence true
+persistence_location /mosquitto/data/
+autosave_interval 60
+queue_qos0_messages true
+'''
+        }
+    },
+    'deployment': {
+        'apiVersion': 'apps/v1',
+        'kind': 'Deployment',
+        'metadata': {
+            'name': 'mosquitto',
+            'namespace': None
+        },
+        'spec': {
+            'replicas': 1,
+            'selector': {
+                'matchLabels': {
+                    'app': 'mosquitto'
+                }
+            },
+            'template': {
+                'metadata': {
+                    'labels': {
+                        'app': 'mosquitto'
+                    }
+                },
+                'spec': {
+                    'containers': [{
+                        'name': 'mosquitto',
+                        'image': 'eclipse-mosquitto:latest',
+                        'ports': [{
+                            'containerPort': 1883
+                        }],
+                        'volumeMounts': [{
+                            'name': 'config',
+                            'mountPath': '/mosquitto/config'
+                        }]
+                    }],
+                    'volumes': [{
+                        'name': 'config',
+                        'configMap': {
+                            'name': 'mosquitto-config'
+                        }
+                    }]
+                }
+            }
+        }
+    },
+    'service': {
+        'apiVersion': 'v1',
+        'kind': 'Service',
+        'metadata': {
+            'name': 'mosquitto',
+            'namespace': None
+        },
+        'spec': {
+            'type': 'NodePort',
+            'selector': {
+            'app': 'mosquitto'
+            },
+            'ports': [
+            {
+                'name': 'mqtt',
+                'port': 1883,
+                'targetPort': 1883,
+            },
+            {
+                'name': 'mqtt-websocket',
+                'port': 9001,
+                'targetPort': 9001,
+            }
+            ]
+        }
+    }
+}
+
+def check_and_create_missing_tables():
+    """Check for missing tables and create them if needed."""
+    try:
+        db = get_db_connection()
+        cursor = db.cursor()
+
+        # Get required tables from schema
+        required_tables = get_required_tables()
+
+        # Get existing tables
+        cursor.execute("SHOW TABLES")
+        existing_tables = {table[0] for table in cursor.fetchall()}
+
+        # Find and create missing tables
+        missing_tables = []
+        for table_name, create_statement in required_tables.items():
+            if table_name not in existing_tables:
+                missing_tables.append(table_name)
+                print(f"Creating missing table: {table_name}")
+                cursor.execute(create_statement)
+
+        db.commit()
+        return missing_tables
+
+    except Exception as e:
+        print(f"Error checking/creating tables: {str(e)}")
+        raise
+    finally:
+        cursor.close()
+        db.close()
+
+def get_db_connection():
+    try:
+        connection = mysql.connector.connect(
+            host=DB_CONFIG['host'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            database=DB_NAME
+        )
+        return connection
+    except mysql.connector.Error as err:
+        print(f"Error connecting to database: {err}")
+        raise
+
+def get_service_data(client_id: int, action: str) -> dict:
+    """Get service data for a client."""
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        services_data = {}
+        
+        # Get all available services from the factory
+        available_services = service_factory.get_all_services()
+        
+        # For each service, check if client has configuration
+        for service_name, service_instance in available_services.items():
+            table_name = service_instance.service_name
+            print(f"Checking {table_name} configuration for client {client_id}")
+            
+            try:
+                cursor.execute(f'SELECT * FROM {table_name} WHERE client_id = %s', (client_id,))
+                service_data = cursor.fetchone()
+                
+                if service_data:
+                    # Remove id and client_id from service data
+                    service_params = {k: v for k, v in service_data.items() 
+                                  if k not in ['id', 'client_id', 'created_at']}
+                    services_data[service_name] = service_params
+                    print(f"Found {service_name} configuration:", service_params)
+            except Exception as e:
+                print(f"Error checking {service_name}: {e}")
+        
+        cursor.close()
+        db.close()
+
+        if not services_data:
+            print(f"No services found for client {client_id}")
+            return {}
+
+        print(f"Retrieved services for client {client_id}:", services_data)
+        return services_data
+        
+    except Exception as e:
+        print(f"Error getting service data: {e}")
+        return {}
+
+def generate_kubernetes_manifests(namespace: str, service_name: str, service_data: dict) -> dict:
+    """Generate Kubernetes manifests for a service."""
+    try:
+        service = service_factory.get_all_services().get(service_name)
+        if not service:
+            print(f"Service {service_name} not found")
+            return {}
+
+        return service.get_kubernetes_manifests(namespace, service_data)
+    except Exception as e:
+        print(f"Error generating manifests for {service_name}: {e}")
+        return {}
+
+def configure_nginx_stream(namespace, client_id):
+    """Configure nginx stream for a namespace with improved error handling and validation."""
+    print(f"\n=== Starting nginx configuration for client: {namespace} ===")
+    results = []
+    
+    try:
+        # Verify nginx service is running
+        print("1. Checking nginx service status...")
+        nginx_status = subprocess.run(['sudo', 'systemctl', 'is-active', 'nginx'], 
+                                    capture_output=True, text=True)
+        print(f"Nginx status: {nginx_status.stdout.strip()}")
+        if nginx_status.returncode != 0:
+            error_msg = "Nginx service is not running"
+            results.append({'command': 'nginx-status', 'success': False, 'output': error_msg})
+            return False, results
+
+        # Create streams.d directory with proper permissions
+        streams_dir = '/etc/nginx/streams.d'
+        print(f"2. Setting up streams directory: {streams_dir}")
+        
+        try:
+            # Check if directory exists
+            dir_exists = os.path.exists(streams_dir)
+            print(f"Streams directory exists: {dir_exists}")
+            
+            if not dir_exists:
+                print("Creating streams directory...")
+                subprocess.run(['sudo', 'mkdir', '-p', streams_dir], check=True)
+                print("Setting directory permissions...")
+                subprocess.run(['sudo', 'chown', 'root:root', streams_dir], check=True)
+                subprocess.run(['sudo', 'chmod', '755', streams_dir], check=True)
+            
+            results.append({'command': 'create-streams-dir', 'success': True, 
+                          'output': f"Streams directory ready: {streams_dir}"})
+            
+        except Exception as e:
+            error_msg = f"Failed to create/setup streams directory: {str(e)}"
+            print(error_msg)
+            results.append({'command': 'create-streams-dir', 'success': False, 'output': error_msg})
+            return False, results
+
+        # Load kubernetes configuration
+        print("3. Loading kubernetes configuration...")
+        config.load_kube_config()
+        v1 = k8s_client.CoreV1Api()
+        
+        # Get services and find bridge service
+        print("4. Finding proxy service...")
+        services = v1.list_namespaced_service(namespace=namespace)
+        proxy_service = None
+
+        for svc in services.items:
+            if svc.metadata.name.endswith('listener-service'):
+                proxy_service = svc
+                break
+        
+        if not proxy_service:
+            error_msg = f"No proxy service found for {namespace}"
+            print(error_msg)
+            results.append({'command': 'find-proxy-service', 'success': False, 'output': error_msg})
+            return True, results
+        
+        print(f"Found proxy service: {proxy_service.metadata.name}")
+        print("SVC:", svc.metadata.name)
+        print("client_id:", client_id)  
+        print("namespace:", namespace)
+
+        # Set timeout to 1 minute from now
+        timeout = datetime.now() + timedelta(minutes=1)
+        nodeport = None
+        nodeport_api = None
+
+        while datetime.now() < timeout:
+            # Get main TCP port
+            nodeport, port = get_nodeport_and_tcp(svc.metadata.name, namespace, 'tcp')
+            
+            # Get TCP-API port if available
+            nodeport_api_result = get_nodeport_and_tcp(svc.metadata.name, namespace, 'tcp-api')
+            port_api, nodeport_api = nodeport_api_result if nodeport_api_result else (None, None)
+            
+            if isinstance(nodeport, int):
+                print(f"Successfully got nodeport: {nodeport}")
+                break
+            print("Waiting for NodePort to be available...")
+            time.sleep(5)
+
+        if not isinstance(nodeport, int):
+            print("Timeout reached while waiting for NodePort")
+            return False, results
+
+        print(f"Main Nodeport:{nodeport}, Main port:{port}")
+        if nodeport_api:
+            print(f"API Nodeport:{nodeport_api}, API port:{port_api}")
+        
+        # Get port mappings
+        print("5. Getting port mappings...")
+        port_info = next((port for port in proxy_service.spec.ports), None)
+        if not port_info or not port_info.node_port:
+            error_msg = f"Could not find port mappings for service {proxy_service.metadata.name}"
+            print(error_msg)
+            results.append({'command': 'get-ports', 'success': False, 'output': error_msg})
+            return False, results
+        
+        print(f"Port mappings - Port: {port_info.port}, NodePort: {port_info.node_port}")
+
+        # Verify Minikube IP
+        print("6. Verifying Minikube IP...")
+        results.append({'command': 'verify-minikube', 'success': True, 
+                      'output': f"Minikube IP {MINIKUBE_IP} is accessible"})
+
+        # Create or update nginx configuration
+        print("7. Creating/updating nginx configuration...")
+        nginx_file_path = f'/etc/nginx/streams.d/port-{port_info.port}.conf'
+        temp_path = f'/tmp/port-{port_info.port}.conf'
+
+        existing_servers = set()  # Use a set to prevent duplicates
+        if os.path.exists(nginx_file_path):
+            # Read existing configuration to extract current servers
+            with open(nginx_file_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if 'server' in line and MINIKUBE_IP in line:
+                        existing_servers.add(line)
+
+        # Add new server if not already present
+        new_server = f"    server {MINIKUBE_IP}:{port_info.node_port};"
+        existing_servers.add(new_server)
+
+        # Convert set back to sorted list for consistent output
+        server_list = sorted(list(existing_servers))
+
+        # Create updated nginx configuration
+        nginx_config = f"""upstream port{port_info.port}_tcp {{
+{chr(10).join(server_list)}
+}}
+upstream port{port_info.port}_udp {{
+{chr(10).join(server_list)}
+}}
+server {{
+    listen {port_info.port};
+    proxy_pass port{port_info.port}_tcp;
+    proxy_timeout 10m;
+    proxy_connect_timeout 1m;
+}}
+server {{
+    listen {port_info.port} udp;
+    proxy_pass port{port_info.port}_udp;
+    proxy_timeout 10m;
+    proxy_connect_timeout 1m;
+}}
+"""
+
+        # Add API port configuration if available
+        if nodeport_api and port_api:
+            api_server = f"    server {MINIKUBE_IP}:{nodeport_api};"
+            nginx_config += f"""
+upstream port{port_api}_tcp {{
+    {api_server}
+}}
+server {{
+    listen {port_api};
+    proxy_pass port{port_api}_tcp;
+    proxy_timeout 10m;
+    proxy_connect_timeout 1m;
+}}
+"""
+        print("Configuration content:")
+        print(nginx_config)
+        
+        print(f"8. Writing configuration to temporary file: {temp_path}")
+        with open(temp_path, 'w') as f:
+            f.write(nginx_config)
+        
+        print(f"9. Moving configuration to final location: {nginx_file_path}")
+        try:
+            subprocess.run(['sudo', 'mv', temp_path, nginx_file_path], check=True)
+            subprocess.run(['sudo', 'chown', 'root:root', nginx_file_path], check=True)
+            subprocess.run(['sudo', 'chmod', '644', nginx_file_path], check=True)
+            
+            if not os.path.exists(nginx_file_path):
+                raise Exception(f"File was not created at {nginx_file_path}")
+                
+            print(f"Configuration file created successfully")
+            results.append({'command': 'write-config', 'success': True, 
+                          'output': f"Created configuration file {nginx_file_path}"})
+        except Exception as e:
+            error_msg = f"Failed to create configuration file: {str(e)}"
+            print(error_msg)
+            results.append({'command': 'write-config', 'success': False, 'output': error_msg})
+            return False, results
+
+        # Test configuration
+        print("10. Testing nginx configuration...")
+        test_result = subprocess.run(['sudo', 'nginx', '-t'], capture_output=True, text=True)
+        if test_result.returncode != 0:
+            error_msg = f"Nginx configuration test failed: {test_result.stderr}"
+            print(error_msg)
+            results.append({'command': 'test-config', 'success': False, 'output': error_msg})
+            subprocess.run(['sudo', 'rm', nginx_file_path], check=False)
+            return False, results
+        
+        print("Configuration test passed")
+        results.append({'command': 'test-config', 'success': True, 'output': "Configuration test passed"})
+        # Setting api port
+        
+        # Reload nginx
+        print("11. Reloading nginx...")
+        reload_result = subprocess.run(['sudo', 'systemctl', 'reload', 'nginx'], capture_output=True, text=True)
+        if reload_result.returncode != 0:
+            error_msg = f"Nginx reload failed: {reload_result.stderr}"
+            print(error_msg)
+            results.append({'command': 'reload-nginx', 'success': False, 'output': error_msg})
+            subprocess.run(['sudo', 'rm', nginx_file_path], check=False)
+            return False, results
+
+        print("Nginx reloaded successfully")
+        results.append({'command': 'reload-nginx', 'success': True, 'output': "Nginx reloaded successfully"})
+        
+        # Update port and api_port in the clients table
+        print("12. Updating client table with port and API port...")
+        try:
+            db = get_db_connection()
+            cursor = db.cursor()
+            # Check if api_port is None and set default value to 9 if it is
+            if port_api is None:
+                port_api = 0
+                print(f"API port is null, setting default value: {port_api}")
+            
+            update_query = "UPDATE clients SET port = %s, api_port = %s WHERE id = %s"
+            cursor.execute(update_query, (port_info.port, port_api, client_id))
+            db.commit()
+            cursor.close()
+            db.close()
+            print(f"Client table updated with port={port_info.port}, api_port={port_api}")
+            results.append({'command': 'update-client-table', 'success': True, 
+                           'output': f"Client ports updated: port={port_info.port}, api_port={port_api}"})
+        except Exception as e:
+            error_msg = f"Failed to update client table: {str(e)}"
+            print(error_msg)
+            results.append({'command': 'update-client-table', 'success': False, 'output': error_msg})
+            # Continue execution even if update fails
+        
+        print("\n=== Nginx configuration completed successfully ===")
+        return True, results
+
+    except Exception as e:
+        error_msg = f"Error configuring nginx stream: {str(e)}"
+        print(error_msg)
+        traceback.print_exc()
+        results.append({'command': 'configure-nginx', 'success': False, 'output': error_msg})
+        return False, results
+
+def cleanup_nginx_config(namespace: str) -> None:
+    """Clean up nginx configuration for a namespace."""
+    print(f"\n=== Cleaning up nginx configuration for {namespace} ===")
+    try:
+        # Load kubernetes configuration to get the port information
+        config.load_kube_config()
+        v1 = k8s_client.CoreV1Api()
+        
+        # Get services to find the port
+        services = v1.list_namespaced_service(namespace=namespace)
+        port = None
+        
+        for svc in services.items:
+            if svc.metadata.name.endswith('listener-service'):
+                port_info = next((port for port in svc.spec.ports), None)
+                if port_info:
+                    port = port_info.port
+                break
+        
+        if not port:
+            print(f"No port found for namespace {namespace}, skipping cleanup")
+            return
+
+        # Clean up in streams.d directory
+        nginx_streams_path = f"/etc/nginx/streams.d/port-{port}.conf"
+        if os.path.exists(nginx_streams_path):
+            print(f"Removing nginx configuration: {nginx_streams_path}")
+            subprocess.run(['sudo', 'rm', nginx_streams_path], check=True)
+            
+            # Test and reload nginx configuration
+            print("Testing nginx configuration...")
+            subprocess.run(['sudo', 'nginx', '-t'], check=True)
+            print("Reloading nginx...")
+            subprocess.run(['sudo', 'systemctl', 'reload', 'nginx'], check=True)
+            print(f"Successfully cleaned up nginx configurations for {namespace}")
+            
+    except Exception as e:
+        print(f"Error cleaning up nginx config: {e}")
+        raise
+
+@app.route('/status/<int:client_id>')
+@login_required
+def status_page(client_id):
+    db = get_db_connection()
+    cursor = db.cursor(dictionary=True)
+    cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+    client = cursor.fetchone()
+    cursor.close()
+    db.close()
+    
+    if not client:
+        flash('Client not found', 'error')
+        return redirect(url_for('index'))
+        
+    return render_template('status.html', client=client)
+
+@app.route('/setup/<int:client_id>')
+@login_required
+def setup_page(client_id):
+    db = get_db_connection()
+    cursor = db.cursor(dictionary=True)
+    cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+    client = cursor.fetchone()
+
+    if not client:
+        flash('Client not found', 'error')
+        return redirect(url_for('index'))
+
+    available_services = service_factory.get_all_services()
+    setup_inputs = []
+    setup_interpreters = []
+    setup_integrations = []
+    client_nodes = {}
+    structure = {}
+    for service_name, service_instance in available_services.items():
+        service_info = {
+            "service_name": service_instance.service_name,
+            "parameters": service_instance.parameters,
+            "parameters_helpers": service_instance.parameters_helpers,
+            "service_inputs": service_instance.inputs,
+            "services_outputs": service_instance.outputs
+        }
+        
+        if service_instance.service_type == "input":
+            setup_inputs.append(service_info)
+            structure
+        elif service_instance.service_type == "interpreter":
+            setup_interpreters.append(service_info)
+        elif service_instance.service_type == "integration":
+            setup_integrations.append(service_info)
+        try:
+            query=f'SELECT * FROM {service_name} WHERE client_id = {client_id}'
+            print("query:   ", query)
+            cursor.execute(query)
+            service_data = cursor.fetchone()
+            if service_data:
+                # Remove id and client_id from service data
+                cleaned_data = {k: v for k, v in service_data.items() 
+                                if k not in ['id', 'client_id', 'created_at']}
+                client_nodes[service_name] = {
+                    'parameters': cleaned_data,
+                    'service_name': service_name
+                }
+                print(f"Loaded node data for {service_name}:", client_nodes[service_name])
+        except Exception as e:
+            print(f"Error fetching {service_name} config: {str(e)}")
+            continue
+
+    # Get existing connections
+    cursor.execute('''
+        SELECT source_service, target_service, source_id, target_id 
+        FROM service_connections 
+        WHERE client_id = %s
+    ''', (client_id,))
+    connections = cursor.fetchall()
+    
+    # Convert connections to serializable format
+    serializable_connections = []
+    for conn in connections:
+        serializable_connections.append({
+            'source': {
+                'service': conn['source_service']
+            },
+            'target': {
+                'service': conn['target_service']
+            }
+        })
+
+    # Prepare service lists for template
+    setup_services = []
+    setup_interpreters = []
+    setup_integrations = []
+
+    for service_name, service_instance in available_services.items():
+        service_info = {
+            "service_name": service_instance.service_name,
+            "parameters": service_instance.parameters if hasattr(service_instance, 'parameters') else {},
+            "parameters_helpers": service_instance.parameters_helpers if hasattr(service_instance, 'parameters_helpers') else {},
+            "inputs": service_instance.inputs if hasattr(service_instance, 'inputs') else [],
+            "outputs": service_instance.outputs if hasattr(service_instance, 'outputs') else []
+        }
+        
+        if service_instance.service_type == "input":
+            setup_services.append(service_info)
+        elif service_instance.service_type == "interpreter":
+            setup_interpreters.append(service_info)
+        elif service_instance.service_type == "integration":
+            setup_integrations.append(service_info)
+
+    # Convert client_nodes to serializable format
+    serializable_client_nodes = {}
+    for service_name, node_data in client_nodes.items():
+        serializable_client_nodes[service_name] = {
+            'parameters': node_data.get('parameters', {}),
+            'service_name': node_data.get('service_name', '')
+        }
+        
+    print("setup_services:", setup_services)
+    print("setup_interpreters:", setup_interpreters)
+    print("setup_integrations:", setup_integrations)
+    print("")
+    print("client_nodes:", client_nodes)
+    print("connections:", serializable_connections)
+    
+    cursor.close()
+    db.close()
+        
+    # Build the service hierarchy
+    service_hierarchy = build_service_hierarchy(available_services)
+    print("\nService Hierarchy:")
+    print(json.dumps(service_hierarchy, indent=2))
+        
+    return render_template('setup.html', 
+                         client=client, 
+                         setup_services=setup_services,
+                         setup_interpreters=setup_interpreters,
+                         setup_integrations=setup_integrations,
+                         client_nodes=serializable_client_nodes,
+                         connections=serializable_connections,
+                         service_hierarchy=service_hierarchy)
+
+def build_service_hierarchy(available_services):
+    # Initialize the structure
+    hierarchy = {
+        "Input": []
+    }
+    
+    # First, identify all input services (services with no inputs or only have outputs)
+    input_services = {}
+    interpreter_services = {}
+    integration_services = {}
+    
+    for service_name, service_instance in available_services.items():
+        service_info = {
+            "service_name": service_instance.service_name,
+            "inputs": getattr(service_instance, 'inputs', []),
+            "outputs": getattr(service_instance, 'outputs', []),
+            "service_type": service_instance.service_type
+        }
+        
+        if service_instance.service_type == "input":
+            input_services[service_name] = service_info
+        elif service_instance.service_type == "interpreter":
+            interpreter_services[service_name] = service_info
+        elif service_instance.service_type == "integration":
+            integration_services[service_name] = service_info
+
+    # Build the hierarchy for each input service
+    for input_name, input_service in input_services.items():
+        input_node = {
+            "name": input_name,
+            "Interpreter": []
+        }
+        
+        # Find interpreters that can accept this input service's outputs
+        for interpreter_name, interpreter_service in interpreter_services.items():
+            # Check if any output from input service matches any input of interpreter
+            if any(output in interpreter_service['inputs'] 
+                  for output in input_service['outputs']):
+                
+                interpreter_node = {
+                    "name": interpreter_name,
+                    "integration": []
+                }
+                
+                # Find integrations that can accept this interpreter's outputs
+                for integration_name, integration_service in integration_services.items():
+                    if any(output in integration_service['inputs'] 
+                          for output in interpreter_service['outputs']):
+                        interpreter_node["integration"].append(integration_name)
+                
+                input_node["Interpreter"].append(interpreter_node)
+        
+        hierarchy["Input"].append(input_node)
+    
+    return hierarchy
+
+@app.route('/check_status/<int:client_id>')
+@login_required
+def check_status(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT name FROM clients WHERE id = %s', (client_id,))
+        client_data = cursor.fetchone()
+        print(f"Client data from DB: {client_data}")
+        cursor.close()
+        db.close()
+        
+        if not client_data:
+            return jsonify({'success': False, 'error': 'Client not found'})
+            
+        namespace = client_data['name']
+        print(f"Using namespace: {namespace}")
+        
+        # Load kubernetes configuration
+        print("Loading kubernetes config...")
+        config.load_kube_config()
+        print("Creating CoreV1Api client...")
+        api = k8s_client.CoreV1Api()
+        print("CoreV1Api client created successfully")
+        
+        # Get pods
+        pods = []
+        print("Fetching pods...")
+        pod_list = api.list_namespaced_pod(namespace=namespace)
+        print(f"Found {len(pod_list.items)} pods")
+        for pod in pod_list.items:
+            pod_info = {
+                'name': pod.metadata.name,
+                'status': pod.status.phase,
+                'ready': all(container.ready for container in pod.status.container_statuses) if pod.status.container_statuses else False,
+                'restarts': sum(container.restart_count for container in pod.status.container_statuses) if pod.status.container_statuses else 0,
+                'age': pod.metadata.creation_timestamp.isoformat()
+            }
+            print(f"Pod info: {pod_info}")
+            pods.append(pod_info)
+        
+        # Get services
+        services = []
+        print("Fetching services...")
+        svc_list = api.list_namespaced_service(namespace=namespace)
+        print(f"Found {len(svc_list.items)} services")
+        for svc in svc_list.items:
+            ports = []
+            for port in svc.spec.ports:
+                port_info = {
+                    'name': port.name,
+                    'port': port.port,
+                }
+                if hasattr(port, 'node_port'):
+                    port_info['node_port'] = port.node_port
+                ports.append(port_info)
+            
+            svc_info = {
+                'name': svc.metadata.name,
+                'type': svc.spec.type,
+                'cluster_ip': svc.spec.cluster_ip,
+                'ports': ports,
+                'age': svc.metadata.creation_timestamp.isoformat()
+            }
+            print(f"Service info: {svc_info}")
+            services.append(svc_info)
+        
+        return jsonify({
+            'success': True,
+            'pods': pods,
+            'services': services
+        })
+        
+    except Exception as e:
+        print(f"Error checking status: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        })
+
+@app.route('/stop/<int:client_id>')
+@login_required
+def stop_page(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+        client = cursor.fetchone()
+        cursor.close()
+        db.close()
+        
+        if not client:
+            flash('Client not found', 'error')
+            return redirect(url_for('index'))
+            
+        namespace = client['name']
+        print(f"Stopping services for namespace: {namespace}")
+        
+        return render_template('stop.html', client=client)
+        
+    except Exception as e:
+        print(f"Error in stop_page: {str(e)}")
+        flash(f'Error: {str(e)}', 'error')
+        return redirect(url_for('index'))
+
+def reset_client_ports(client_id):
+    """Reset client port and api_port to 0 in the database.
+    
+    Args:
+        client_id: The ID of the client to update
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        db = get_db_connection()
+        cursor = db.cursor()
+        update_query = "UPDATE clients SET port = %s, api_port = %s WHERE id = %s"
+        cursor.execute(update_query, (0, 0, client_id))
+        db.commit()
+        cursor.close()
+        db.close()
+        print(f"Reset port and api_port to 0 for client {client_id}")
+        return True
+    except Exception as e:
+        print(f"Error resetting port values: {str(e)}")
+        return False
+
+@app.route('/stop_services/<int:client_id>', methods=['GET'])
+@login_required
+def stop_services(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+        client = cursor.fetchone()
+        cursor.close()
+        db.close()
+
+        if not client:
+            return jsonify({'error': 'Client not found'}), 404
+
+        namespace = client['name']
+        print(f"Processing service stop for namespace: {namespace}")
+
+        # Clean up nginx configuration first
+        print("Cleaning up nginx configuration...")
+        cleanup_nginx_config(namespace)
+
+        # Stop all services first
+        print("Stopping Kubernetes services...")
+        try:
+            # Load kubernetes configuration
+            config.load_kube_config()
+            v1 = k8s_client.CoreV1Api()
+            
+            # Delete the namespace which will delete all resources in it
+            print(f"Deleting namespace: {namespace}")
+            try:
+                v1.delete_namespace(name=namespace)
+                print(f"Successfully deleted namespace: {namespace}")
+                
+                # Reset port and api_port to 0 after successfully stopping services
+                reset_client_ports(client_id)
+                
+                return jsonify({'message': 'Services stopping, ports reset'}), 200
+            except k8s_client.rest.ApiException as e:
+                if e.status != 404:  # Ignore if namespace doesn't exist
+                    print(f"Error deleting namespace: {str(e)}")
+                    return jsonify({'error': f'Error deleting namespace: {str(e)}'}), 500
+                
+                # Reset port and api_port to 0 even if namespace was already deleted
+                reset_client_ports(client_id)
+                
+                return jsonify({'message': 'Namespace already deleted, ports reset'}), 200
+            
+        except Exception as e:
+            print(f"Error stopping Kubernetes services: {str(e)}")
+            return jsonify({'error': f'Error stopping services: {str(e)}'}), 500
+        
+    except Exception as e:
+        print(f"Error in stop_services: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/delete/<int:client_id>')
+@login_required
+def delete_page(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+        client = cursor.fetchone()
+        cursor.close()
+        db.close()
+        
+        if not client:
+            flash('Client not found', 'error')
+            return redirect(url_for('clients'))
+            
+        namespace = client['name']
+        print(f"Delete page for namespace: {namespace}")
+        
+        return render_template('delete.html', client=client)
+        
+    except Exception as e:
+        print(f"Error in delete_page: {str(e)}")
+        flash(f'Error: {str(e)}', 'error')
+        return redirect(url_for('clients'))
+
+@app.route('/delete_client/<int:client_id>', methods=['POST'])
+@login_required
+def delete_client(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+        client = cursor.fetchone()
+        
+        if not client:
+            flash('Client not found', 'error')
+            return redirect(url_for('clients'))
+            
+        namespace = client['name']
+        results = []
+        print(f"Processing client deletion for namespace: {namespace}")
+        
+        # Clean up nginx configuration first (must be done before deleting namespace)
+        print("Cleaning up nginx configuration...")
+        try:
+            cleanup_nginx_config(namespace)
+            results.append(('Nginx configuration cleanup', 'success', 'Configuration removed successfully'))
+        except Exception as e:
+            print(f"Error cleaning up nginx config: {str(e)}")
+            results.append(('Nginx configuration cleanup', 'error', str(e)))
+        
+        # Reset client ports to 0 first
+        reset_result = reset_client_ports(client_id)
+        results.append((
+            'Port reset', 
+            'success' if reset_result else 'error',
+            'Client ports reset to 0' if reset_result else 'Failed to reset ports'
+        ))
+        
+        # Delete namespace after nginx cleanup
+        cmd = ['kubectl', 'delete', 'namespace', namespace]
+        try:
+            print(f"Executing command: {' '.join(cmd)}")
+            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+            results.append(('Kubernetes namespace deletion', 'success', output.decode()))
+        except subprocess.CalledProcessError as e:
+            if b'not found' not in e.output:
+                print(f"Error deleting namespace: {e.output.decode()}")
+                results.append(('Kubernetes namespace deletion', 'error', e.output.decode()))
+        
+        # Delete from database
+        print("Deleting client from database...")
+        try:
+            cursor.execute('DELETE FROM clients WHERE id = %s', (client_id,))
+            db.commit()
+            results.append(('Database deletion', 'success', 'Client removed from database'))
+        except Exception as e:
+            print(f"Error deleting from database: {str(e)}")
+            results.append(('Database deletion', 'error', str(e)))
+            
+        cursor.close()
+        db.close()
+        
+        # Check results and set appropriate flash message
+        has_error = any(result[1] == 'error' for result in results)
+        if has_error:
+            flash('Some operations failed during client deletion. Check the logs for details.', 'warning')
+        else:
+            flash('Client deleted successfully', 'success')
+            
+        return redirect(url_for('clients'))
+        
+    except Exception as e:
+        print(f"Error in delete_client: {str(e)}")
+        flash(f'Error: {str(e)}', 'error')
+        return redirect(url_for('clients'))
+
+@app.route('/deploy/<int:client_id>')
+@login_required
+def deploy(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+        client = cursor.fetchone()
+        cursor.close()
+        db.close()
+
+        if not client:
+            flash('Client not found', 'error')
+            return redirect(url_for('index'))
+
+        services = []
+        all_manifests = {'services': {}}
+        debug_info = []
+        namespace = client['name'].lower().replace(' ', '')
+
+        # Get all services for this client
+        service_data = get_service_data(client_id, 'deploy')
+        debug_info.append(f"Service data: {service_data}")
+
+        # Add namespace manifest
+        all_manifests['namespace'] = {
+            'apiVersion': 'v1',
+            'kind': 'Namespace',
+            'metadata': {
+                'name': namespace
+            }
+        }
+
+        # Add mosquitto manifests
+        mosquitto_config = dict(MOSQUITTO_TEMPLATE['configmap'])
+        mosquitto_deployment = dict(MOSQUITTO_TEMPLATE['deployment'])
+        mosquitto_service = dict(MOSQUITTO_TEMPLATE['service'])
+        
+        # Update namespace in mosquitto manifests
+        mosquitto_config['metadata']['namespace'] = namespace
+        mosquitto_deployment['metadata']['namespace'] = namespace
+        mosquitto_service['metadata']['namespace'] = namespace
+        
+        all_manifests['mosquitto'] = {
+            'config': mosquitto_config,
+            'deployment': mosquitto_deployment,
+            'service': mosquitto_service
+        }
+
+        # Process each service
+        available_services = service_factory.get_all_services()
+        for service_name, service_instance in available_services.items():
+            debug_info.append(f"Processing service: {service_name}")
+            
+            if service_name in service_data:
+                service_params = service_data[service_name]
+                debug_info.append(f"Found data for {service_name}: {service_params}")
+                
+                try:
+                    # Generate manifests for this service
+                    service_manifests = service_instance.get_kubernetes_manifests(namespace, service_params)
+                    debug_info.append(f"Generated manifests for {service_name}: {service_manifests.keys() if service_manifests else 'None'}")
+                    
+                    if service_manifests:
+                        all_manifests['services'][service_name] = service_manifests
+                        services.append(service_name)
+                except Exception as e:
+                    debug_info.append(f"Error generating manifests for {service_name}: {str(e)}")
+
+        # Create yaml directory if it doesn't exist
+        os.makedirs('yaml', exist_ok=True)
+
+        # Write namespace manifest
+        with open(f'yaml/{namespace}-namespace.yaml', 'w') as f:
+            yaml.dump(all_manifests['namespace'], f)
+
+        # Write mosquitto manifests
+        with open(f'yaml/{namespace}-mosquitto-config.yaml', 'w') as f:
+            yaml.dump(all_manifests['mosquitto']['config'], f)
+        with open(f'yaml/{namespace}-mosquitto-deployment.yaml', 'w') as f:
+            yaml.dump(all_manifests['mosquitto']['deployment'], f)
+        with open(f'yaml/{namespace}-mosquitto-service.yaml', 'w') as f:
+            yaml.dump(all_manifests['mosquitto']['service'], f)
+
+        # Write service manifests
+        for service_name, manifests in all_manifests['services'].items():
+            if 'deployment' in manifests:
+                with open(f'yaml/{namespace}-{service_name}-deployment.yaml', 'w') as f:
+                    yaml.dump(manifests['deployment'], f)
+            if 'service' in manifests:
+                with open(f'yaml/{namespace}-{service_name}-service.yaml', 'w') as f:
+                    yaml.dump(manifests['service'], f)
+
+        return render_template('deploy.html',
+                           client=client,
+                           manifests=all_manifests,
+                           services=services,
+                           debug_info=debug_info)
+
+    except Exception as e:
+        print(f"Error in deploy: {str(e)}")
+        traceback.print_exc()
+        flash(f'Error: {str(e)}', 'error')
+        return redirect(url_for('clients'))
+
+@app.route('/deploy_services/<int:client_id>', methods=['POST'])
+@login_required
+def deploy_services(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+        client = cursor.fetchone()
+        
+        if not client:
+            return jsonify({
+                'success': False,
+                'message': 'Client not found',
+            }), 404
+
+        namespace = client['name'].lower().replace(' ', '')
+        print(f"Deploying services for namespace: {namespace}")
+
+        # Check if services are already deployed
+        try:
+            print("=== Checking for existing pods ===")
+            # Check for existing pods
+            pod_cmd = ['kubectl', 'get', 'pods', '--namespace', namespace]
+            print(f"Running command: {' '.join(pod_cmd)}")
+            result = subprocess.run(pod_cmd, capture_output=True, text=True)
+            print(f"Pod check stdout: '{result.stdout}'")
+            print(f"Pod check stderr: '{result.stderr}'")
+            print(f"Pod check return code: {result.returncode}")
+            
+            if result.returncode == 0 and "No resources found" not in result.stdout and len(result.stdout.strip()) > 0:
+                print("Found existing pods, returning error response")
+                return jsonify({
+                    'success': False,
+                    'message': 'Services are already deployed for this client. Please stop the services first if you want to redeploy.'
+                }), 400
+
+            print("=== Checking for existing services ===")
+            # Check for existing services
+            svc_cmd = ['kubectl', 'get', 'services', '--namespace', namespace]
+            print(f"Running command: {' '.join(svc_cmd)}")
+            result = subprocess.run(svc_cmd, capture_output=True, text=True)
+            print(f"Service check stdout: '{result.stdout}'")
+            print(f"Service check stderr: '{result.stderr}'")
+            print(f"Service check return code: {result.returncode}")
+            
+            if result.returncode == 0 and "No resources found" not in result.stdout and len(result.stdout.strip()) > 0:
+                print("Found existing services, returning error response")
+                return jsonify({
+                    'success': False,
+                    'message': 'Services are already deployed for this client. Please stop the services first if you want to redeploy.'
+                }), 400
+
+            print("=== No existing resources found, proceeding with deployment ===")
+
+        except subprocess.CalledProcessError as e:
+            print(f"Error checking deployment status: {e}")
+            print(f"Error output: {e.stderr}")
+            pass
+
+        # Load kubernetes configuration
+        config.load_kube_config()
+        v1 = k8s_client.CoreV1Api()
+        apps_v1 = k8s_client.AppsV1Api()
+
+        # Create namespace if it doesn't exist
+        try:
+            v1.create_namespace(body={"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace}})
+            print(f"Created namespace: {namespace}")
+        except k8s_client.rest.ApiException as e:
+            if e.status != 409:  # Ignore if namespace already exists
+                raise
+
+        # Deploy Mosquitto first
+        print("Deploying Mosquitto...")
+        try:
+            # Create ConfigMap
+            MOSQUITTO_TEMPLATE['configmap']['metadata']['namespace'] = namespace
+            v1.create_namespaced_config_map(namespace=namespace, body=MOSQUITTO_TEMPLATE['configmap'])
+            
+            # Create Deployment
+            MOSQUITTO_TEMPLATE['deployment']['metadata']['namespace'] = namespace
+            apps_v1.create_namespaced_deployment(namespace=namespace, body=MOSQUITTO_TEMPLATE['deployment'])
+            
+            # Create Service
+            MOSQUITTO_TEMPLATE['service']['metadata']['namespace'] = namespace
+            v1.create_namespaced_service(namespace=namespace, body=MOSQUITTO_TEMPLATE['service'])
+            
+            print("Mosquitto deployed successfully")
+        except k8s_client.rest.ApiException as e:
+            if e.status != 409:  # Ignore if resources already exist
+                print(f"Error deploying Mosquitto: {e}")
+                raise
+
+        # Get all available services
+        available_services = service_factory.get_all_services()
+        print(f"\nDeploying services for client {client_id}...")
+        print(f"Available services: {list(available_services.keys())}")
+
+        # Deploy each service
+        for service_name, service_instance in available_services.items():
+            print(f"\nChecking service: {service_name}")
+            try:
+                # Get service data from database
+                cursor.execute(f'SELECT * FROM {service_name} WHERE client_id = %s', (client_id,))
+                service_data = cursor.fetchone()
+                
+                if service_data:
+                    print(f"Found configuration for {service_name}:", service_data)
+                    
+                    # Remove id and client_id from service data
+                    service_params = {k: v for k, v in service_data.items() 
+                                  if k not in ['id', 'client_id', 'created_at']}
+                    
+                    try:
+                        # Generate manifests
+                        manifests = service_instance.get_kubernetes_manifests(namespace, service_params)
+                        print(f"Generated manifests for {service_name}")
+                        
+                        # Deploy service
+                        if 'deployment' in manifests:
+                            try:
+                                apps_v1.create_namespaced_deployment(
+                                    namespace=namespace,
+                                    body=manifests['deployment']
+                                )
+                                print(f"{service_name} deployment created")
+                            except k8s_client.rest.ApiException as e:
+                                if e.status != 409:  # Ignore if deployment already exists
+                                    raise
+
+                        if 'service' in manifests:
+                            try:
+                                v1.create_namespaced_service(
+                                    namespace=namespace,
+                                    body=manifests['service']
+                                )
+                                print(f"{service_name} service created")
+                            except k8s_client.rest.ApiException as e:
+                                if e.status != 409:  # Ignore if service already exists
+                                    raise
+                                    
+                    except Exception as e:
+                        print(f"Error deploying {service_name}: {str(e)}")
+                        raise
+                else:
+                    print(f"No configuration found for {service_name}")
+            except Exception as e:
+                print(f"Error processing {service_name}: {str(e)}")
+                raise
+        # Configure Nginx after services are deployed
+        print("\nConfiguring Nginx streams...")
+        try:
+            nginx_success, nginx_results = configure_nginx_stream(namespace,client_id)
+            if not nginx_success:
+                error_msg = "\n".join([r['output'] for r in nginx_results if not r['success']])
+                raise Exception(f"Failed to configure Nginx: {error_msg}")
+            print("Nginx configuration completed successfully")
+        except Exception as e:
+            print(f"Error configuring Nginx: {str(e)}")
+            raise
+        return jsonify({
+            'success': True,
+            'message': f'Successfully deployed services for client {client["name"]}',
+            'redirect': url_for('clients')
+        })
+
+    except Exception as e:
+        print(f"Error in deploy_services: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'message': f'Error deploying services: {str(e)}',
+            'redirect': url_for('clients')
+        }), 400
+    finally:
+        cursor.close()
+        db.close()
+
+@app.route('/client/<int:client_id>')
+@login_required
+def client_details(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+
+        # Get client info
+        cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+        client = cursor.fetchone()
+        if not client:
+            flash('Client not found', 'error')
+            return redirect(url_for('index'))
+
+        # Get available services and their configurations
+        available_services = service_factory.get_all_services()
+        client_services = {}
+
+        # Get existing service configurations
+        for service_name, service_instance in available_services.items():
+            try:
+                cursor.execute(f'SELECT * FROM {service_name} WHERE client_id = %s', (client_id,))
+                service_data = cursor.fetchone()
+                if service_data:
+                    # Remove internal fields and structure the data properly
+                    cleaned_data = {k: v for k, v in service_data.items() 
+                                  if k not in ['id', 'client_id', 'created_at']}
+                    client_services[service_name] = cleaned_data
+            except Exception as e:
+                print(f"Error fetching {service_name} config: {str(e)}")
+                continue
+
+        # Convert service instances to dict with parameters
+        available_services = {name: {"parameters": instance.parameters} 
+                            for name, instance in available_services.items()}
+
+        return render_template('client.html',
+                           client=client,
+                           available_services=available_services,
+                           client_services=client_services)
+
+    except Exception as e:
+        print(f"Error in client_details: {str(e)}")
+        flash(f'Error: {str(e)}', 'error')
+        return redirect(url_for('clients'))
+    finally:
+        cursor.close()
+        db.close()
+
+def generate_schema_from_services():
+    """Generate database schema from service classes."""
+    schema = []
+    
+    # Get all services
+    available_services = service_factory.get_all_services()
+    
+    # Generate tables for each service
+    for service_name, service_instance in available_services.items():
+        # Get parameters schema from service
+        params = service_instance.parameters
+        if not params:
+            continue
+            
+        # Build CREATE TABLE statement
+        columns = [
+            "id INT AUTO_INCREMENT PRIMARY KEY",
+            "client_id INT NOT NULL",
+            *[f"{name} {dtype}" for name, dtype in params.items()],
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE"
+        ]
+        
+        create_table = f"""
+        CREATE TABLE IF NOT EXISTS {service_name} (
+            {', '.join(columns)}
+        )"""
+        schema.append(create_table)
+        
+    return schema
+
+@app.route('/create_database', methods=['POST'])
+@login_required
+def create_database():
+    connection = None
+    cursor = None
+    try:
+        # Connect to MySQL without specifying a database
+        connection = mysql.connector.connect(
+            host=DB_CONFIG['host'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password']
+        )
+        cursor = connection.cursor()
+
+        # Create the database if it doesn't exist
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}")
+        print(f"Database {DB_NAME} created successfully")
+
+        # Switch to the new database
+        cursor.execute(f"USE {DB_NAME}")
+
+        # Generate and execute schema
+        schema_statements = generate_schema_from_services()
+        for statement in schema_statements:
+            if statement.strip():
+                try:
+                    print(f"Executing: {statement}")
+                    cursor.execute(statement)
+                except mysql.connector.Error as e:
+                    if e.errno == 1050:  # Table already exists
+                        print(f"Table already exists, continuing...")
+                        continue
+                    raise
+        
+        connection.commit()
+        print("Schema created successfully")
+
+        flash('Database created successfully', 'success')
+        return redirect(url_for('admin'))
+
+    except Exception as e:
+        print(f"Error creating database: {str(e)}")
+        flash(f'Error creating database: {str(e)}', 'error')
+        return redirect(url_for('index'))
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+@app.route('/delete_database', methods=['POST'])
+@login_required
+def delete_database():
+    try:
+        # Connect to MySQL without specifying a database
+        connection = mysql.connector.connect(
+            host=DB_CONFIG['host'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password']
+        )
+        cursor = connection.cursor()
+
+        # Drop the database if it exists
+        cursor.execute(f"DROP DATABASE IF EXISTS {DB_NAME}")
+        print(f"Database {DB_NAME} dropped successfully")
+
+        # Recreate the database
+        cursor.execute(f"CREATE DATABASE {DB_NAME}")
+        print(f"Database {DB_NAME} created successfully")
+
+        # Switch to the new database
+        cursor.execute(f"USE {DB_NAME}")
+
+        # Read and execute schema.sql
+        schema_file = os.path.join(os.path.dirname(__file__), 'schema.sql')
+        with open(schema_file, 'r') as f:
+            schema = f.read()
+            # Split into individual statements
+            statements = schema.split(';')
+            for statement in statements:
+                if statement.strip():
+                    cursor.execute(statement)
+        
+        connection.commit()
+        print("Schema recreated successfully")
+
+        flash('Database reset successfully', 'success')
+        return redirect(url_for('admin'))
+
+    except Exception as e:
+        print(f"Error resetting database: {str(e)}")
+        flash(f'Error resetting database: {str(e)}', 'error')
+        return redirect(url_for('admin'))
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+def get_required_tables():
+    """Get the list of required tables and their create statements from schema.sql."""
+    schema_file = os.path.join(os.path.dirname(__file__), 'schema.sql')
+    print(f"Reading schema from: {schema_file}")
+    
+    with open(schema_file, 'r') as f:
+        schema = f.read()
+    print(f"Schema content length: {len(schema)}")
+    
+    # Extract CREATE TABLE statements and table names
+    tables = {}
+    statements = schema.split(';')
+    print(f"Found {len(statements)} statements")
+    
+    for statement in statements:
+        statement = statement.strip()
+        print(f"\nProcessing statement: {statement[:100]}...")  # Print first 100 chars
+        
+        if statement.upper().startswith('CREATE TABLE'):
+            print("Found CREATE TABLE statement")
+            # Extract table name - handle both with and without backticks
+            try:
+                if '`' in statement:
+                    # Extract name between backticks
+                    table_name = statement.split('`')[1]
+                else:
+                    # Extract name between 'EXISTS' and '('
+                    table_name = statement.split('EXISTS')[1].split('(')[0].strip()
+                print(f"Found table in schema: {table_name}")
+                tables[table_name] = statement + ';'  # Add back the semicolon
+            except Exception as e:
+                print(f"Error extracting table name from statement: {statement}")
+                print(f"Error: {str(e)}")
+                continue
+    
+    print(f"Final tables found: {list(tables.keys())}")
+    return tables
+
+@app.route('/check_database', methods=['POST'])
+@login_required
+def check_database():
+    try:
+        # Try to connect to the database
+        db = get_db_connection()
+        cursor = db.cursor()
+
+        # Check if all required tables exist
+        missing_tables = check_and_create_missing_tables()
+
+        if missing_tables:
+            flash(f'Created missing tables: {", ".join(missing_tables)}', 'success')
+        else:
+            flash('All required tables exist', 'success')
+
+        return redirect(url_for('admin'))
+
+    except mysql.connector.Error as e:
+        if e.errno == 1049:  # Database doesn't exist
+            flash('Database does not exist. Please create it first.', 'error')
+        else:
+            flash(f'Database error: {str(e)}', 'error')
+        return redirect(url_for('admin'))
+    except Exception as e:
+        flash(f'Error checking database: {str(e)}', 'error')
+        return redirect(url_for('admin'))
+
+@app.route('/add_missing_tables', methods=['POST'])
+@login_required
+def add_missing_tables():
+    try:
+        # Try to connect to the database
+        db = get_db_connection()
+        cursor = db.cursor()
+
+        # Get existing tables
+        cursor.execute("SHOW TABLES")
+        existing_tables = {table[0] for table in cursor.fetchall()}
+        print(f"Existing tables: {existing_tables}")
+
+        # Get tables from schema.sql
+        schema_tables = get_required_tables()
+        print(f"Schema tables found: {list(schema_tables.keys())}")
+        
+        # Generate schema statements from services
+        service_schema = generate_schema_from_services()
+        
+        # Combine both sources
+        missing_tables = []
+        
+        # Create tables from schema.sql
+        for table_name, statement in schema_tables.items():
+            if table_name not in existing_tables:
+                print(f"Creating missing table from schema.sql: {table_name}")
+                print(f"Using statement: {statement}")
+                try:
+                    cursor.execute(statement)
+                    missing_tables.append(table_name)
+                except Exception as e:
+                    print(f"Error creating table {table_name}: {str(e)}")
+                    print(f"Statement that failed: {statement}")
+                    raise
+        
+        # Create tables from service schema
+        for statement in service_schema:
+            if statement.strip():
+                # Extract table name from CREATE TABLE statement
+                try:
+                    table_name = statement.split('CREATE TABLE IF NOT EXISTS')[1].split('(')[0].strip()
+                    if table_name not in existing_tables:
+                        print(f"Creating missing table from service schema: {table_name}")
+                        print(f"Using statement: {statement}")
+                        cursor.execute(statement)
+                        missing_tables.append(table_name)
+                except Exception as e:
+                    print(f"Error with service table: {str(e)}")
+                    print(f"Statement that failed: {statement}")
+                    raise
+        
+        # Ensure service_connections table exists
+        if 'service_connections' not in existing_tables:
+            create_service_connections_table()
+            missing_tables.append('service_connections')
+        
+        db.commit()
+
+        if missing_tables:
+            message = f'Created missing tables: {", ".join(missing_tables)}'
+            print(message)
+            flash(message, 'success')
+        else:
+            message = 'All required tables exist'
+            print(message)
+            flash(message, 'success')
+
+        return redirect(url_for('admin'))
+
+    except mysql.connector.Error as e:
+        error_message = f'Database error: {str(e)}'
+        print(error_message)
+        flash(error_message, 'error')
+        return redirect(url_for('index'))
+    except Exception as e:
+        error_message = f'Error checking/creating tables: {str(e)}'
+        print(error_message)
+        flash(error_message, 'error')
+        return redirect(url_for('index'))
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
+
+@app.route('/add_client', methods=['POST'])
+@login_required
+def add_client():
+    try:
+        # Get client details from form
+        client_name = request.form.get('client_name')
+        port = request.form.get('port')
+        api_port = request.form.get('api_port')
+        
+        if not client_name:
+            flash('Client name is required', 'error')
+            return redirect(url_for('index'))
+
+        # Clean client name (remove spaces and convert to lowercase)
+        client_name = client_name.strip().lower()
+
+        # Connect to database
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+
+        # Check if client already exists
+        cursor.execute('SELECT * FROM clients WHERE name = %s', (client_name,))
+        if cursor.fetchone():
+            flash(f'Client {client_name} already exists', 'error')
+            return redirect(url_for('index'))
+        if port==None:
+            port = 0
+        if api_port==None:
+            api_port = 0
+        # Add new client with port and API port
+        cursor.execute('INSERT INTO clients (name, port, api_port) VALUES (%s, %s, %s)', 
+                      (client_name, port, api_port))
+        client_id = cursor.lastrowid
+        db.commit()
+
+        print(f"Added new client: {client_name} (ID: {client_id})")
+        flash(f'Client {client_name} added successfully', 'success')
+        
+        return redirect(url_for('clients'))
+
+    except mysql.connector.Error as e:
+        error_message = f'Database error: {str(e)}'
+        print(error_message)
+        flash(error_message, 'error')
+        return redirect(url_for('clients'))
+    except Exception as e:
+        error_message = f'Error adding client: {str(e)}'
+        print(error_message)
+        flash(error_message, 'error')
+        return redirect(url_for('clients'))
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
+
+@app.route('/create_automation', methods=['POST'])
+@login_required
+def create_automation():
+    db = None
+    cursor = None
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'message': 'No data provided'}), 400
+
+        client_id = data.get('client_id')
+        print("Client ID: ", client_id)
+        services = data.get('services', [])
+        print("Services: ", services)
+        removed_services = data.get('removed_services', [])
+        connections = data.get('connections', [])
+        print("Removed Services: ", removed_services)
+        print("Connections:", connections)
+        
+        if not client_id:
+            return jsonify({'message': 'Client ID is required'}), 400
+
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True, buffered=True)
+
+        # Verify client exists
+        cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+        client = cursor.fetchone()
+        if not client:
+            return jsonify({'message': 'Client not found'}), 404
+
+        # Remove services that were deleted
+        for service_name in removed_services:
+            try:
+                cursor.execute(f'DELETE FROM {service_name} WHERE client_id = %s', (client_id,))
+                print(f"Removed service {service_name} for client {client_id}")
+            except Exception as e:
+                print(f"Error removing service {service_name}: {str(e)}")
+
+        # Store service IDs for connections
+        service_ids = {}
+
+        # Update or insert new services
+        for service in services:
+            service_name = service.get('name')
+            print(f"Processing service: {service_name}")
+            if not service_name:
+                continue
+
+            service_params = {k: v for k, v in service.items() if k != 'name'}
+            print(f"Processing service {service_name} with params:", service_params)
+            
+            try:
+                # Check if service exists
+                cursor.execute(f'SELECT id FROM {service_name} WHERE client_id = %s', (client_id,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    # Update existing service
+                    set_clause = ', '.join(f'{k} = %s' for k in service_params.keys())
+                    values = list(service_params.values()) + [client_id]
+                    update_query = f'UPDATE {service_name} SET {set_clause} WHERE client_id = %s'
+                    cursor.execute(update_query, values)
+                    service_ids[service_name] = existing['id']
+                    print(f"Updated existing service {service_name}")
+                else:
+                    # Insert new service
+                    columns = ['client_id'] + list(service_params.keys())
+                    placeholders = ', '.join(['%s'] * (len(service_params) + 1))
+                    values = [client_id] + list(service_params.values())
+                    insert_query = f'INSERT INTO {service_name} ({", ".join(columns)}) VALUES ({placeholders})'
+                    cursor.execute(insert_query, values)
+                    service_ids[service_name] = cursor.lastrowid
+                    print(f"Inserted new service {service_name}")
+
+                print(f"Updated service {service_name} for client {client_id}")
+            except Exception as e:
+                print(f"Error updating service {service_name}: {str(e)}")
+                if db:
+                    db.rollback()
+                return jsonify({'message': f'Error updating service {service_name}: {str(e)}'}), 500
+
+        # Save new connections
+        if connections:
+            connection_values = []
+            for conn in connections:
+                source = conn.get('source', {})
+                target = conn.get('target', {})
+                source_service = source.get('service')
+                target_service = target.get('service')
+                print(f"Processing connection from {source_service} to {target_service}")
+                
+                if source_service and target_service:
+                    # Get the actual service IDs from the database
+                    try:
+                        # Get source service ID
+                        cursor.execute(f'SELECT id FROM {source_service} WHERE client_id = %s', (client_id,))
+                        source_result = cursor.fetchone()
+                        source_id = source_result['id'] if source_result else None
+                        
+                        # Get target service ID
+                        cursor.execute(f'SELECT id FROM {target_service} WHERE client_id = %s', (client_id,))
+                        target_result = cursor.fetchone()
+                        target_id = target_result['id'] if target_result else None
+                        
+                        if source_id is not None and target_id is not None:
+                            connection_values.append((
+                                client_id,
+                                source_service,
+                                source_id,
+                                target_service,
+                                target_id
+                            ))
+                            print(f"Added connection: {source_service}({source_id}) -> {target_service}({target_id})")
+                    except Exception as e:
+                        print(f"Error getting service IDs: {str(e)}")
+                        continue
+
+            if connection_values:
+                cursor.executemany(
+                    'INSERT INTO service_connections (client_id, source_service, source_id, target_service, target_id) VALUES (%s, %s, %s, %s, %s)',
+                    connection_values
+                )
+                print(f"Saved {len(connection_values)} connections")
+        db.commit()
+        return jsonify({'message': 'Services and connections updated successfully'})
+
+    except Exception as e:
+        if db:
+            db.rollback()
+        print(f"Error in create_automation: {str(e)}")
+        return jsonify({'message': f'Error: {str(e)}'}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
+
+def get_service_nodeport(service_name: str, namespace: str) -> int:
+    """
+    Get the NodePort of a Kubernetes service by executing kubectl describe service command.
+    
+    Args:
+        service_name (str): Name of the service
+        namespace (str): Kubernetes namespace
+        
+    Returns:
+        int: The NodePort number, or None if not found
+    """
+    try:
+        # Execute kubectl describe service command
+        cmd = ['kubectl', 'describe', 'service', service_name, '-n', namespace]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"Error getting service description: {result.stderr}")
+            return None
+            
+        # Parse the output to find NodePort
+        for line in result.stdout.split('\n'):
+            if 'NodePort:' in line and 'TCP' in line:
+                # Extract the numeric value from something like "NodePort: tcp  30099/TCP"
+                parts = line.split()
+                for part in parts:
+                    if '/' in part:
+                        nodeport = part.split('/')[0]
+                        return int(nodeport)
+        
+        print(f"NodePort not found in service description")
+        return None
+        
+    except Exception as e:
+        print(f"Error getting NodePort: {str(e)}")
+        return None
+
+def get_nodeport_and_tcp(service_name: str, namespace: str, port_type) -> int:
+    """
+    Get the TCP-api NodePort (typically port 8080) of a Kubernetes service.
+    
+    Args:
+        service_name (str): Name of the service
+        namespace (str): Kubernetes namespace
+        
+    Returns:
+        int: The TCP-api NodePort number, or None if not found
+    """
+
+    try:
+        cmd = ['kubectl', 'describe', 'service', service_name, '-n', namespace]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"Error getting service description: {result.stderr}")
+            return None
+
+        nodeport = None    
+        port = None
+        print(f"port type:{port_type}")
+        lines = result.stdout.split('\n')
+        print(lines)
+        for i, line in enumerate(lines):
+            # Check if line starts with Port: and contains the exact port_type
+            if line.strip().startswith('Port:'):
+                parts = line.strip().split()
+                if parts[1] == port_type:  # Check exact match of port_type
+                    port = parts[2].split('/')[0]
+            
+            # Check if line starts with NodePort: and contains the exact port_type
+            if line.strip().startswith('NodePort:'):
+                parts = line.strip().split()
+                if parts[1] == port_type:  # Check exact match of port_type
+                    nodeport = parts[2].split('/')[0]
+
+        if port and nodeport:
+            return int(port), int(nodeport)
+        else:
+            # If we didn't find a tcp-api port, return None
+            return None
+        
+    except Exception as e:
+        print(f"Error getting TCP-api NodePort: {str(e)}")
+        return None
+    
+@app.route('/get_pod_names/<int:client_id>')
+@login_required
+def get_pod_names(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT name FROM clients WHERE id = %s', (client_id,))
+        client_data = cursor.fetchone()
+        cursor.close()
+        db.close()
+        
+        if not client_data:
+            return jsonify({'success': False, 'error': 'Client not found'})
+            
+        namespace = client_data['name']
+        
+        # Get pod names using kubectl
+        cmd = ['kubectl', 'get', 'pods', '-n', namespace, '-o', 'custom-columns=APP:metadata.labels.app', '--no-headers']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            return jsonify({'success': False, 'error': f'Failed to get pod names: {result.stderr}'})
+            
+        pod_names = [name.strip() for name in result.stdout.split('\n') if name.strip()]
+        return jsonify({'success': True, 'pod_names': pod_names})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+def create_service_connections_table():
+    """Create the service_connections table if it doesn't exist."""
+    db = get_db_connection()
+    cursor = db.cursor()
+    
+    try:
+        # Check if table exists
+        cursor.execute("SHOW TABLES LIKE 'service_connections'")
+        if not cursor.fetchone():
+            print("Creating service_connections table...")
+            
+            # Create the table
+            create_table_sql = """
+            CREATE TABLE IF NOT EXISTS `service_connections` (
+                `id` INT AUTO_INCREMENT PRIMARY KEY,
+                `client_id` INT NOT NULL,
+                `source_service` VARCHAR(255) NOT NULL,
+                `source_id` INT NOT NULL,
+                `target_service` VARCHAR(255) NOT NULL,
+                `target_id` INT NOT NULL,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (`client_id`) REFERENCES `clients`(`id`) ON DELETE CASCADE,
+                INDEX `idx_client_source` (`client_id`, `source_service`, `source_id`),
+                INDEX `idx_client_target` (`client_id`, `target_service`, `target_id`)
+            )"""
+            
+            cursor.execute(create_table_sql)
+            db.commit()
+            print("service_connections table created successfully")
+        else:
+            print("service_connections table already exists")
+            
+    except Exception as e:
+        print(f"Error creating service_connections table: {str(e)}")
+        raise
+    finally:
+        cursor.close()
+        db.close()
+
+@app.route('/get_pod_logs/<int:client_id>/<string:app_name>')
+@login_required
+def get_pod_logs(client_id, app_name):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT name FROM clients WHERE id = %s', (client_id,))
+        client_data = cursor.fetchone()
+        cursor.close()
+        db.close()
+        
+        if not client_data:
+            return jsonify({'success': False, 'error': 'Client not found'})
+            
+        namespace = client_data['name']
+        
+        # Get logs using kubectl
+        cmd = ['kubectl', 'logs', '-l', f'app={app_name}', '-n', namespace]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            return jsonify({'success': False, 'error': f'Failed to get logs: {result.stderr}'})
+            
+        return jsonify({'success': True, 'logs': result.stdout})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/check_namespace_status/<int:client_id>', methods=['GET'])
+@login_required
+def check_namespace_status(client_id):
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients WHERE id = %s', (client_id,))
+        client = cursor.fetchone()
+        cursor.close()
+        db.close()
+
+        if not client:
+            return jsonify({'error': 'Client not found'}), 404
+
+        namespace = client['name']
+        
+        # Load kubernetes configuration
+        config.load_kube_config()
+        v1 = k8s_client.CoreV1Api()
+        
+        services_stopped = True
+        pods_stopped = True
+        
+        try:
+            # Check for services
+            services = v1.list_namespaced_service(namespace)
+            if services.items:
+                services_stopped = False
+        except k8s_client.rest.ApiException as e:
+            if e.status != 404:  # 404 means namespace doesn't exist, which is what we want
+                return jsonify({'error': f'Error checking services: {str(e)}'}), 500
+        
+        try:
+            # Check for pods
+            pods = v1.list_namespaced_pod(namespace)
+            if pods.items:
+                pods_stopped = False
+        except k8s_client.rest.ApiException as e:
+            if e.status != 404:  # 404 means namespace doesn't exist, which is what we want
+                return jsonify({'error': f'Error checking pods: {str(e)}'}), 500
+        
+        return jsonify({
+            'services_stopped': services_stopped,
+            'pods_stopped': pods_stopped
+        }), 200
+        
+    except Exception as e:
+        print(f"Error checking namespace status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/trackers')
+@login_required
+def trackers():
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients')
+        clients = cursor.fetchall()
+        cursor.close()
+        db.close()
+
+        # Get all available services
+        try:
+            db = get_db_connection()
+            cursor = db.cursor(dictionary=True)
+            cursor.execute('SELECT * FROM clients')
+            clients = cursor.fetchall()
+            cursor.close()
+            db.close()
+            trackers = []
+            all_trackers = []
+            for client in clients:
+                cmd = ['kubectl', 'get', 'services', '--namespace', client["name"]]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                print("looking for services in namespace", client["name"])
+                if "No resources found" in result.stderr:
+                    print(f"No services found in namespace {client['name']}, skipping...")
+                    continue
+                else:
+                    print("result.stdout:", result.stdout)
+                    print("result.stderr:", result.stderr)
+                    nodeport, port = get_nodeport_and_tcp('listener-service', f'{client["name"]}','tcp-api')
+                    print(f"node:{nodeport}, port:{port}")
+                    if nodeport:  # Only process if we found a tcp-api nodeport
+                        trackerlist_url = "http://"+MINIKUBE_IP+":"+str(nodeport)+"/api/v1/trackerlist"
+                        print(f"Fetching from URL: {trackerlist_url}")
+                        try:
+                            response = requests.get(trackerlist_url, timeout=5)  # Add timeout
+                            print(f"Response status for {client['name']}: {response.status_code}")
+                            if response.ok:
+                                client_trackers = response.json()
+                                print(f"Got trackers for {client['name']}: {client_trackers}")
+                                for tracker in client_trackers:
+                                    all_trackers.append({
+                                        'client': client['name'],
+                                        'imei': tracker['imei'],
+                                        'protocol': tracker['protocol'],
+                                        'port': port
+                                    })
+                            else:
+                                print(f"Bad response for {client['name']}: {response.text}")
+                        except requests.exceptions.Timeout:
+                            print(f"Timeout fetching trackers for {client['name']}")
+                        except requests.exceptions.ConnectionError:
+                            print(f"Connection error fetching trackers for {client['name']}")
+                        except Exception as e:
+                            print(f"Error fetching trackers for {client['name']}: {str(e)}")
+                print("\nAll Trackers:",all_trackers)
+
+            return render_template('trackers.html', trackers=all_trackers)
+        except Exception as e:
+            print(f"Error getting nodeports: {str(e)}")
+            return render_template('trackers.html', trackers=[])
+
+    except Exception as e:
+        flash(f'Error: {str(e)}', 'error')
+        return render_template('index.html', clients=[], services={})
+
+@app.route('/api/sendcommand', methods=['POST'])
+@login_required
+def send_command():
+    try:
+        data = request.get_json()
+        client = data.get('client')
+        imei = data.get('imei')
+        payload = data.get('payload')
+        
+        if not all([client, imei, payload]):
+            return jsonify({'error': 'Missing required fields'}), 400
+
+        # Convert payload to hex
+        hex_payload = payload.encode().hex().upper()
+        
+        # Get nodeport for the client
+        port, nodeport = get_nodeport_and_tcp('listener-service', client,'tcp-api')
+        if not nodeport:
+            return jsonify({'error': f'Could not find nodeport for client {client}'}), 404
+
+        # Send command to the actual endpoint
+        url = f"http://{MINIKUBE_IP}:{nodeport}/api/v1/sendcommand"
+        command_data = {
+            "imei": imei,
+            "data": hex_payload
+        }
+        
+        response = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json=command_data
+        )
+        
+        # Return the response from the service
+        return jsonify(response.json()), response.status_code
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/trackers/data', methods=['POST'])
+@login_required
+def get_trackers_data():
+    try:
+        # Get DataTables parameters
+        draw = request.json.get('draw', 1)
+        start = request.json.get('start', 0)
+        length = request.json.get('length', 10)
+        search = request.json.get('search', {}).get('value', '')
+        order_column = request.json.get('order', [{}])[0].get('column', 0)
+        order_dir = request.json.get('order', [{}])[0].get('dir', 'asc')
+
+        # Get all trackers first
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM clients')
+        clients = cursor.fetchall()
+        cursor.close()
+        db.close()
+
+        all_trackers = []
+        for client in clients:
+            has_services, nodeport, port = get_namespace_services(client["name"])
+            if not has_services:
+                continue
+                
+            if nodeport:
+                client_trackers = fetch_client_trackers(client["name"], nodeport, port)
+                all_trackers.extend(client_trackers)
+                
+        print("\nAll Trackers:", all_trackers)
+        # Filter based on search term
+        if search:
+            search = search.lower()
+            filtered_data = [
+                t for t in all_trackers
+                if search in t['client'].lower() 
+                or search in t['imei'].lower() 
+                or search in t['protocol'].lower()
+                or (t['port'] is not None and search in str(t['port']))
+            ]
+        else:
+            filtered_data = all_trackers
+
+        # Sort data
+        column_names = ['client', 'imei', 'protocol']
+        if 0 <= order_column < len(column_names):
+            key = column_names[order_column]
+            filtered_data.sort(
+                key=lambda x: x[key],
+                reverse=(order_dir == 'desc')
+            )
+
+        # Paginate
+        total_records = len(all_trackers)
+        total_filtered = len(filtered_data)
+        paginated_data = filtered_data[start:start + length]
+
+        return jsonify({
+            'draw': draw,
+            'recordsTotal': total_records,
+            'recordsFiltered': total_filtered,
+            'data': paginated_data
+        })
+
+    except Exception as e:
+        print(f"Error in get_trackers_data: {str(e)}")
+        return jsonify({
+            'draw': 1,
+            'recordsTotal': 0,
+            'recordsFiltered': 0,
+            'data': [],
+            'error': str(e)
+        }), 500
+
+def get_namespace_services(namespace: str):
+    """
+    Get services for a given namespace.
+    Returns tuple of (success, nodeport, port) where success is a boolean indicating if services were found
+    """
+    try:
+        cmd = ['kubectl', 'get', 'services', '--namespace', namespace]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        print("looking for services in namespace", namespace)
+        
+        if result.returncode != 0 or "No resources found" in result.stderr:
+            print(f"No services found in namespace {namespace}, skipping...")
+            return False, None, None
+        
+        # Get nodeport and port information
+        result = get_nodeport_and_tcp('listener-service', namespace, 'tcp-api')
+        if result is None:
+            print(f"No nodeport/port found for {namespace}")
+            return False, None, None
+            
+        port, nodeport = result
+        print(f"nodeport:{nodeport} port:{port}")
+        return True, nodeport, port
+        
+    except Exception as e:
+        print(f"Error getting namespace services: {str(e)}")
+        return False, None, None
+
+def fetch_client_trackers(client_name: str, nodeport: int, port: int):
+    """
+    Fetch trackers for a specific client.
+    Returns list of tracker dictionaries.
+    """
+    try:
+        url = f"http://{MINIKUBE_IP}:{nodeport}/api/v1/trackerlist"
+        response = requests.get(url, timeout=5)
+        if response.ok:
+            client_trackers = response.json()
+            return [{
+                'client': client_name,
+                'imei': tracker['imei'],
+                'protocol': tracker['protocol'],
+                'port': port
+            } for tracker in client_trackers]
+    except Exception as e:
+        print(f"Error fetching trackers for {client_name}: {str(e)}")
+    return []
+
+@app.route('/admin')
+@login_required
+def admin():
+    return render_template('admin.html')
+
+# Database configuration
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'gpscontrol',
+    'password': 'qazwsxedc'
+}
+
+DB_NAME = 'automation_app'
+
+# Initialize ServiceFactory
+service_factory = ServiceFactory()
+available_services = service_factory.get_all_services()
+print("\nAvailable services in factory:", list(available_services.keys()))
+for name, service in available_services.items():
+    print(f"Service: {name}, Class: {service.__class__.__name__}")
+
+# svc=listener-service
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0')

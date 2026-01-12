@@ -1,0 +1,328 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+    .loading-overlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.7);
+        z-index: 9999;
+    }
+
+    .loading-content {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        text-align: center;
+        color: white;
+    }
+
+    .spinner-border {
+        width: 3rem;
+        height: 3rem;
+    }
+
+    .deployment-steps {
+        margin-top: 20px;
+        text-align: left;
+    }
+
+    .step {
+        margin: 10px 0;
+        padding: 10px;
+        border-radius: 5px;
+        background: rgba(255, 255, 255, 0.1);
+    }
+
+    .step i {
+        margin-right: 10px;
+    }
+
+    .step.pending {
+        color: #ffffff;
+    }
+
+    .step.in-progress {
+        color: #ffc107;
+    }
+
+    .step.completed {
+        color: #28a745;
+    }
+
+    .step.failed {
+        color: #dc3545;
+    }
+</style>
+
+<div class="container mt-4">
+    <div class="card">
+        <div class="card-header bg-primary text-white">
+            <div class="d-flex justify-content-between align-items-center">
+                <h2 class="mb-0">Deployment for Client: {{ client.name }}</h2>
+                <a href="{{ url_for('clients') }}" class="btn btn-outline-light">
+                    <i class="fas fa-arrow-left"></i> Back to Clients
+                </a>
+            </div>
+        </div>
+        <div class="card-body">
+            {% if manifests %}
+                {% set namespace = client.name.lower().replace(' ', '') %}
+
+                {% if manifests.get('namespace') %}
+                    <h3>Namespace</h3>
+                    <pre><code>{{ manifests['namespace'] | tojson(indent=2) }}</code></pre>
+                {% endif %}
+
+                {% for service_name in services %}
+                    <div class="card mb-3">
+                        <div class="card-header">
+                            <h3>{{ service_name | title }} Configuration</h3>
+                        </div>
+                        <div class="card-body">
+                            {% if manifests['services'][service_name].get('deployment') %}
+                                <h4>Deployment</h4>
+                                <pre><code>{{ manifests['services'][service_name]['deployment'] | tojson(indent=2) }}</code></pre>
+                            {% else %}
+                                <div class="alert alert-warning">{{ service_name }} deployment manifest is missing!</div>
+                            {% endif %}
+
+                            {% if manifests['services'][service_name].get('service') %}
+                                <h4>Service</h4>
+                                <pre><code>{{ manifests['services'][service_name]['service'] | tojson(indent=2) }}</code></pre>
+                            {% else %}
+                                <div class="alert alert-warning">{{ service_name }} service manifest is missing!</div>
+                            {% endif %}
+                        </div>
+                    </div>
+                {% endfor %}
+
+                {% if manifests.get('mosquitto') %}
+                    <div class="card mb-3">
+                        <div class="card-header">
+                            <h3>Mosquitto Configuration</h3>
+                        </div>
+                        <div class="card-body">
+                            <h4>ConfigMap</h4>
+                            <pre><code>{{ manifests['mosquitto']['config'] | tojson(indent=2) }}</code></pre>
+
+                            <h4>Deployment</h4>
+                            <pre><code>{{ manifests['mosquitto']['deployment'] | tojson(indent=2) }}</code></pre>
+
+                            <h4>Service</h4>
+                            <pre><code>{{ manifests['mosquitto']['service'] | tojson(indent=2) }}</code></pre>
+                        </div>
+                    </div>
+                {% endif %}
+
+                <h3>Files to be Created:</h3>
+                <div class="alert alert-info">
+                    <pre>
+{{ namespace }}-namespace.yaml
+{% for service_name in services %}
+{{ namespace }}-{{ service_name }}-deployment.yaml
+{{ namespace }}-{{ service_name }}-service.yaml
+{% endfor %}
+{{ namespace }}-mosquitto-config.yaml
+{{ namespace }}-mosquitto-deployment.yaml
+{{ namespace }}-mosquitto-service.yaml
+                    </pre>
+                </div>
+
+                <h3>Deployment Commands:</h3>
+                <pre>
+kubectl apply -f yaml/{{ namespace }}-namespace.yaml
+{% for service_name in services %}
+kubectl apply -f yaml/{{ namespace }}-{{ service_name }}-deployment.yaml
+kubectl apply -f yaml/{{ namespace }}-{{ service_name }}-service.yaml
+{% endfor %}
+kubectl apply -f yaml/{{ namespace }}-mosquitto-config.yaml
+kubectl apply -f yaml/{{ namespace }}-mosquitto-deployment.yaml
+kubectl apply -f yaml/{{ namespace }}-mosquitto-service.yaml
+                </pre>
+
+                <form id="deploymentForm" action="{{ url_for('deploy_services', client_id=client.id) }}" method="POST">
+                    <button type="submit" class="btn btn-primary btn-lg">
+                        <i class="fas fa-rocket"></i> Execute Deployment
+                    </button>
+                </form>
+            {% else %}
+                <div class="alert alert-warning">No deployment configuration available for this client.</div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- Loading Overlay -->
+<div class="loading-overlay" id="loadingOverlay">
+    <div class="loading-content">
+        <div class="spinner-border text-light" role="status">
+            <span class="visually-hidden">Loading...</span>
+        </div>
+        <h3 class="mt-3">Deploying Services</h3>
+        <p>Please wait while we deploy your services...</p>
+        
+        <div class="deployment-steps">
+            <div class="step pending" id="step-namespace">
+                <i class="fas fa-circle"></i> Creating namespace
+            </div>
+            <div class="step pending" id="step-mosquitto">
+                <i class="fas fa-circle"></i> Deploying Mosquitto broker
+            </div>
+            <div class="step pending" id="step-services">
+                <i class="fas fa-circle"></i> Deploying services
+            </div>
+            <div class="step pending" id="step-verification">
+                <i class="fas fa-circle"></i> Verifying deployment
+            </div>
+            <div class="step pending" id="step-nginx">
+                <i class="fas fa-circle"></i> Configuring Nginx ports
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Success Modal -->
+<div class="modal fade" id="successModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header bg-success text-white">
+                <h5 class="modal-title">
+                    <i class="fas fa-check-circle me-2"></i>Deployment Successful
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-success mb-0">
+                    All services have been successfully deployed!
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-success" data-bs-dismiss="modal">OK</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Error Modal -->
+<div class="modal fade" id="errorModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header bg-danger text-white">
+                <h5 class="modal-title">
+                    <i class="fas fa-exclamation-circle me-2"></i>Deployment Failed
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-danger mb-0" id="errorMessage">
+                    An error occurred during deployment.
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    $(document).ready(function() {
+        $('#deploymentForm').on('submit', function(e) {
+            e.preventDefault();
+            
+            // Show loading overlay
+            $('#loadingOverlay').fadeIn();
+            
+            // Update step status
+            updateStep('namespace', 'in-progress');
+
+            $.ajax({
+                url: this.action,
+                method: 'POST',
+                success: function(response) {
+                    // Update steps based on deployment progress
+                    updateStep('namespace', 'completed');
+                    updateStep('mosquitto', 'in-progress');
+                    
+                    setTimeout(() => {
+                        updateStep('mosquitto', 'completed');
+                        updateStep('services', 'in-progress');
+                        
+                        setTimeout(() => {
+                            updateStep('services', 'completed');
+                            updateStep('verification', 'in-progress');
+                            
+                            setTimeout(() => {
+                                updateStep('verification', 'completed');
+                                updateStep('nginx', 'in-progress');
+
+                                setTimeout(() => {
+                                    updateStep('nginx', 'completed');
+                                    
+                                    // Hide loading overlay
+                                    $('#loadingOverlay').fadeOut();
+                                    
+                                    // Show success modal
+                                    const successModal = new bootstrap.Modal(document.getElementById('successModal'));
+                                    successModal.show();
+                                    
+                                    // Redirect after a delay
+                                    setTimeout(() => {
+                                        window.location.href = '/clients';
+                                    }, 2000);
+                                }, 1000);
+                            }, 1000);
+                        }, 1000);
+                    }, 1000);
+                },
+                error: function(xhr) {
+                    // Mark current step as failed
+                    $('.step.in-progress').addClass('failed').removeClass('in-progress');
+                    
+                    // Hide loading overlay
+                    $('#loadingOverlay').fadeOut();
+                    
+                    // Show error modal
+                    const errorModal = new bootstrap.Modal(document.getElementById('errorModal'));
+                    try {
+                        const errorResponse = JSON.parse(xhr.responseText);
+                        $('#errorMessage').text(errorResponse.message || 'An error occurred during deployment.');
+                    } catch (e) {
+                        $('#errorMessage').text('An error occurred during deployment.');
+                    }
+                    errorModal.show();
+                }
+            });
+        });
+    });
+
+    function updateStep(stepId, status) {
+        const step = $(`#step-${stepId}`);
+        step.removeClass('pending in-progress completed failed').addClass(status);
+        
+        // Update icon based on status
+        const icon = step.find('i');
+        icon.removeClass('fa-circle fa-spinner fa-spin fa-check-circle fa-times-circle');
+        
+        switch(status) {
+            case 'pending':
+                icon.addClass('fa-circle');
+                break;
+            case 'in-progress':
+                icon.addClass('fa-spinner fa-spin');
+                break;
+            case 'completed':
+                icon.addClass('fa-check-circle');
+                break;
+            case 'failed':
+                icon.addClass('fa-times-circle');
+                break;
+        }
+    }
+</script>
+{% endblock %}

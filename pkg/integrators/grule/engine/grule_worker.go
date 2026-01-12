@@ -1,0 +1,692 @@
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/MaddSystems/jonobridge/common/models"
+	"github.com/hyperjumptech/grule-rule-engine/ast"
+	"github.com/hyperjumptech/grule-rule-engine/engine"
+	"github.com/jonobridge/grule-engine/actions"
+	"github.com/jonobridge/grule-engine/engine/audit"
+)
+
+// getGoroutineID retorna el ID de la goroutine actual para debugging
+func getGoroutineID() string {
+	b := make([]byte, 64)
+	runtime.Stack(b, false)
+	var id string
+	fmt.Sscanf(string(b), "goroutine %s", &id)
+	return id
+}
+
+var knowledgeBases atomic.Value // []*ast.KnowledgeBase
+var noRulesLogged bool = false
+var noRulesMutex sync.Mutex
+
+// WorkerPool gestiona un worker goroutine por IMEI
+type WorkerPool struct {
+	workers map[string]chan *models.JonoModel // IMEI -> channel
+	mu      sync.RWMutex
+	kbs     []*ast.KnowledgeBase
+}
+
+var workerPool *WorkerPool
+
+// InitializeWorkerPool inicializa el pool de workers
+func InitializeWorkerPool(kbs []*ast.KnowledgeBase) {
+	workerPool = &WorkerPool{
+		workers: make(map[string]chan *models.JonoModel),
+		kbs:     kbs,
+	}
+	log.Println("✅ WorkerPool inicializado")
+}
+
+// getOrCreateWorker obtiene o crea un worker para un IMEI específico
+func (wp *WorkerPool) getOrCreateWorker(imei string) chan *models.JonoModel {
+	wp.mu.Lock()
+	defer wp.mu.Unlock()
+
+	if ch, exists := wp.workers[imei]; exists {
+		return ch
+	}
+
+	// Crear nuevo channel y worker goroutine para este IMEI
+	ch := make(chan *models.JonoModel, 10) // Buffer de 10 mensajes
+	wp.workers[imei] = ch
+
+	// Lanzar worker goroutine que procesa secuencialmente los paquetes de este IMEI
+	go wp.workerRoutine(imei, ch)
+
+	log.Printf("🆕 Nuevo worker creado para IMEI: %s", imei)
+	return ch
+}
+
+// workerRoutine procesa secuencialmente todos los mensajes para un IMEI
+func (wp *WorkerPool) workerRoutine(imei string, ch chan *models.JonoModel) {
+	gID := getGoroutineID()
+	for packet := range ch {
+		log.Printf("[GID:%s] 🔄 Worker procesando %d paquetes para IMEI: %s", gID, len(packet.ListPackets), imei)
+
+		// Procesar cada paquete secuencialmente (dentro del mismo IMEI)
+		for packetKey, p := range packet.ListPackets {
+			// COPIAR EL PACKET COMPLETO POR VALOR PARA EVITAR RACE CONDITIONS
+			// Esto garantiza que todos los valores sean independientes de futuras mutaciones
+			localPacket := p // Copia por valor del DataPacket completo
+			localPacketKey := packetKey
+			localIMEI := imei
+
+			log.Printf("[GID:%s] 🔍 [PACKET KEY CRUDO] IMEI=%s, Key=%s - Datetime directo: %v (IsZero=%v)",
+				gID, localIMEI, localPacketKey, localPacket.Datetime, localPacket.Datetime.IsZero())
+
+			// Convertir velocidad de m/s a km/h
+			speedKmH := int(float64(localPacket.Speed) * 3.6)
+
+			log.Printf("[GID:%s] 📦 Procesando IMEI %s - Paquete: %s (Velocidad: %d m/s = %d km/h, Lat: %.6f, Lon: %.6f)",
+				gID, localIMEI, localPacketKey, localPacket.Speed, speedKmH, localPacket.Latitude, localPacket.Longitude)
+			log.Printf("[GID:%s] 🕐 [JSON PARSE] packet.Datetime = %v (IsZero=%v)", gID, localPacket.Datetime, localPacket.Datetime.IsZero())
+
+			// VALIDACIÓN TEMPRANA: Verificar si la trama es inválida antes de procesarla
+			// Nos saltamos tramas inválidas (cuando datetime no viene del tracker o está corrupto)
+			// Esto evita procesamiento innecesario y contaminación de datos en las reglas
+			if localPacket.Datetime.IsZero() {
+				log.Printf("[GID:%s] ⚠️  [TRAMA INVÁLIDA] Datetime=0001-01-01 para IMEI: %s - OMITIENDO REGLAS Y GUARDADO", gID, localIMEI)
+				LogInvalidPacket(localIMEI)
+				continue // Skip esta trama completamente: no ejecutar reglas ni guardar como procesada
+			}
+
+			log.Printf("[GID:%s] ✅ [TRAMA VÁLIDA] Datetime=%v para IMEI: %s - PROCESANDO REGLAS", gID, localPacket.Datetime, localIMEI)
+
+			// Desreferenciar GSMSignalStrength de forma segura
+			var gsmSignalStrength int
+			if localPacket.GSMSignalStrength != nil {
+				gsmSignalStrength = *localPacket.GSMSignalStrength
+			}
+
+			// Calcular CurrentlyInvalid (réplica isValid GPSgate línea 82)
+			currentlyInvalid := (localPacket.PositioningStatus != "true" && localPacket.PositioningStatus != "A")
+
+			// Calcular fecha de último contacto válido
+			bufferEntries := GetBufferEntries(localIMEI)
+			var lastValidDatetime time.Time
+
+			// 1. Buscar la última fecha válida en el buffer
+			for _, entry := range bufferEntries {
+				if entry.IsValid {
+					if entry.Datetime.After(lastValidDatetime) {
+						lastValidDatetime = entry.Datetime
+					}
+				}
+			}
+
+			// 2. Si no encontramos nada en el buffer, pero el paquete actual es válido, usarlo como fallback
+			// (Esto es útil en el arranque en frío o si el buffer solo tiene basura)
+			if lastValidDatetime.IsZero() && !currentlyInvalid {
+				lastValidDatetime = localPacket.Datetime
+			}
+
+			// Crear wrapper con VALORES LOCALES CAPTURADOS (data read-only)
+			wrapper := &PacketWrapper{
+				CurrentPacket:      localPacket,
+				PacketKey:          localPacketKey,
+				IMEI:               localIMEI,
+				Speed:              int64(speedKmH),
+				Latitude:           localPacket.Latitude,
+				Longitude:          localPacket.Longitude,
+				Altitude:           int64(localPacket.Altitude),
+				EventCode:          localPacket.EventCode,
+				Datetime:           localPacket.Datetime,
+				Direction:          int64(localPacket.Direction),
+				Mileage:            int64(localPacket.Mileage),
+				GSMSignalStrength:  int64(gsmSignalStrength),
+				PositioningStatus:  localPacket.PositioningStatus,
+				HDOP:               localPacket.HDOP,
+				NumberOfSatellites: int64(localPacket.NumberOfSatellites),
+				LastValidDatetime:  lastValidDatetime,
+				// Initialize execution flags to false
+				DebugProcessed:                       true,
+				ResetProcessed:                       false,
+				PositionInvalidDetectedProcessed:     false,
+				MovingWithWeakSignalProcessed:        false,
+				OutsideAllSafeZonesProcessed:         false,
+				JammerPatternFullyConfirmedProcessed: false,
+				// Initialize results to false
+				PositionInvalidDetected:           false,
+				PositionInvalidDetectedFailed:     false,
+				MovingWithWeakSignal:              false,
+				MovingWithWeakSignalFailed:        false,
+				OutsideAllSafeZones:               false,
+				OutsideAllSafeZonesFailed:         false,
+				JammerPatternFullyConfirmed:       false,
+				JammerPatternFullyConfirmedFailed: false,
+				HistoryUpdated:                    false,
+				IsOfflineFor5Min:                  false,
+				// Nuevos flags para memory buffer
+				CurrentlyInvalid:  currentlyInvalid,
+				BufferUpdated:     false,
+				BufferHas10:       false,
+				MetricsReady:      false,
+				EvaluationSkipped: false,
+				AlertFired:        false,
+			}
+			log.Printf("[GID:%s] 🕐 [WRAPPER] wrapper.Datetime = %v (IsZero=%v)", gID, wrapper.Datetime, wrapper.Datetime.IsZero())
+
+			// Obtener reglas desde atomic.Value global si wp.kbs está vacío
+			kbs := wp.kbs
+			if len(kbs) == 0 {
+				globalKbs := knowledgeBases.Load()
+				if globalKbs != nil {
+					if kbsSlice, ok := globalKbs.([]*ast.KnowledgeBase); ok {
+						kbs = kbsSlice
+						log.Printf("[GID:%s] ✅ Reglas obtenidas desde atomic.Value: %d knowledge bases", gID, len(kbs))
+					}
+				}
+
+				if len(kbs) == 0 {
+					log.Printf("[GID:%s] ❌ No hay reglas cargadas - abortando ejecución para IMEI %s", gID, localIMEI)
+					continue
+				}
+			}
+
+			// Ejecutar reglas (sincrónico dentro del worker)
+			executeRulesForPacket(*wrapper, localPacketKey, kbs, gID)
+
+			// Guardar como procesada (ya sabemos que la trama es válida por validación temprana)
+			log.Printf("[GID:%s] 💾 [SAVE PROCESSED] Guardando trama válida: IMEI=%s, Key=%s, Datetime=%v", gID, localIMEI, localPacketKey, localPacket.Datetime)
+			SaveProcessedFactWithContext(localIMEI, localPacketKey, localPacket.Datetime, packet)
+		}
+
+		log.Printf("[GID:%s] ✅ Worker finalizó todos los paquetes para IMEI: %s", gID, imei)
+	}
+}
+
+// SendToWorker envía un mensaje JonoModel al worker del IMEI correspondiente
+func SendToWorker(jono *models.JonoModel) {
+	if workerPool == nil {
+		log.Println("❌ WorkerPool no inicializado")
+		return
+	}
+
+	ch := workerPool.getOrCreateWorker(jono.IMEI)
+	select {
+	case ch <- jono:
+		log.Printf("📤 Mensaje enviado al worker para IMEI: %s", jono.IMEI)
+	case <-time.After(5 * time.Second):
+		log.Printf("⚠️  Timeout enviando mensaje al worker para IMEI: %s", jono.IMEI)
+	}
+}
+
+// ProcessedFact almacena hechos ya procesados para evitar duplicados
+type ProcessedFact struct {
+	IMEI      string
+	PacketKey string
+	RuleHash  string
+	Timestamp time.Time
+}
+
+// PacketWrapper envuelve los datos del packet actual de forma READ-ONLY
+// Contiene SOLO datos de entrada del paquete, sin estado mutable
+type PacketWrapper struct {
+	// INPUT DATA (read-only)
+	CurrentPacket      models.DataPacket
+	PacketKey          string
+	IMEI               string
+	Speed              int64
+	Latitude           float64
+	Longitude          float64
+	Altitude           int64
+	EventCode          models.EventCode
+	Datetime           time.Time
+	Direction          int64
+	Mileage            int64
+	GSMSignalStrength  int64
+	PositioningStatus  string
+	HDOP               float64
+	NumberOfSatellites int64
+	LastValidDatetime  time.Time // Fecha del último paquete válido en el buffer
+
+	// EXECUTION FLAGS (accessible from rules for control flow)
+	// These mirror Property state for rule engine access
+	DebugProcessed                       bool
+	ResetProcessed                       bool
+	PositionInvalidDetectedProcessed     bool
+	MovingWithWeakSignalProcessed        bool
+	OutsideAllSafeZonesProcessed         bool
+	JammerPatternFullyConfirmedProcessed bool
+
+	// EXECUTION RESULTS (from old working rules)
+	PositionInvalidDetected           bool
+	PositionInvalidDetectedFailed     bool
+	MovingWithWeakSignal              bool
+	MovingWithWeakSignalFailed        bool
+	OutsideAllSafeZones               bool
+	OutsideAllSafeZonesFailed         bool
+	JammerPatternFullyConfirmed       bool
+	JammerPatternFullyConfirmedFailed bool
+	HistoryUpdated                    bool
+	IsOfflineFor5Min                  bool
+
+	// NUEVOS FLAGS para sistema de memory buffer (GPSgate)
+	BufferUpdated     bool `json:"bufferUpdated"`     // Buffer actualizado SIEMPRE
+	BufferHas10       bool `json:"bufferHas10"`       // Buffer tiene 10 (doit)
+	MetricsReady      bool `json:"metricsReady"`      // Métricas calculadas
+	CurrentlyInvalid  bool `json:"currentlyInvalid"`  // Posición actual inválida
+	EvaluationSkipped bool `json:"evaluationSkipped"` // Evaluación omitida
+	AlertFired        bool `json:"alertFired"`        // Alerta disparada
+
+	// Funciones helper para acceso desde las reglas
+	GetSpeed     func() int64
+	GetLatitude  func() float64
+	GetLongitude func() float64
+	GetAltitude  func() int64
+	GetEventCode func() models.EventCode
+}
+
+// ActionsHelper expone las funciones de acciones para que Grule pueda llamarlas
+type ActionsHelper struct{}
+
+// SendTelegram es un método que Grule puede llamar como actions.SendTelegram()
+func (a *ActionsHelper) SendTelegram(message string) {
+	actions.SendTelegram(message)
+}
+
+// SendEmail es un método que Grule puede llamar como actions.SendEmail()
+func (a *ActionsHelper) SendEmail(subject, body string) {
+	actions.SendEmail(subject, body)
+}
+
+// CutEngine es un método que Grule puede llamar como actions.CutEngine()
+func (a *ActionsHelper) CutEngine(imei string) {
+	actions.CutEngine(imei)
+}
+
+// Log es un método que Grule puede llamar como actions.Log()
+func (a *ActionsHelper) Log(msg string, args ...interface{}) {
+	log.Printf(msg, args...)
+}
+
+// ProcessPacketMessage desempaqueta JSON y envía al worker del IMEI correspondiente
+func ProcessPacketMessage(payload string) {
+	// MySQL 8.0.44 Fix: Pre-validar campos datetime antes del parsing JSON
+
+	var jono models.JonoModel
+	if err := json.Unmarshal([]byte(payload), &jono); err != nil {
+		// Intentar extraer IMEI del payload JSON crudo para debugging
+		var rawData map[string]interface{}
+		imeiStr := "UNKNOWN"
+		hasListPackets := false
+		datetimeValue := ""
+
+		if json.Unmarshal([]byte(payload), &rawData) == nil {
+			if imei, ok := rawData["IMEI"].(string); ok {
+				imeiStr = imei
+			}
+
+			// Verificar si ListPackets existe y está poblado
+			if listPackets, ok := rawData["ListPackets"].(map[string]interface{}); ok && len(listPackets) > 0 {
+				hasListPackets = true
+
+				// Intentar extraer el Datetime del primer paquete para debugging
+				for key, packet := range listPackets {
+					if packetMap, ok := packet.(map[string]interface{}); ok {
+						if dt, exists := packetMap["Datetime"]; exists {
+							datetimeValue = fmt.Sprintf("%v", dt)
+							log.Printf("🔍 IMEI %s - Packet %s: Datetime='%s' (empty=%v)", imeiStr, key, datetimeValue, datetimeValue == "")
+						}
+						break // Solo revisar el primer paquete
+					}
+				}
+			}
+		}
+
+		if hasListPackets {
+			log.Printf("❌ IMEI %s: Error parsing JSON - ListPackets existe pero tiene campos inválidos (ej: Datetime vacío o formato incorrecto). Error: %v", imeiStr, err)
+		} else {
+			log.Printf("❌ IMEI %s: Error parsing JSON - ListPackets no existe o está vacío. El intérprete NO procesó esta trama. Error: %v", imeiStr, err)
+		}
+		return
+	}
+
+	if len(jono.ListPackets) == 0 {
+		log.Printf("⚠️  IMEI %s sin paquetes de datos", jono.IMEI)
+		return
+	}
+
+	// Validar que haya reglas cargadas
+	kbs := knowledgeBases.Load().([]*ast.KnowledgeBase)
+	if len(kbs) == 0 {
+		// Log una sola vez que no hay reglas cargadas
+		noRulesMutex.Lock()
+		if !noRulesLogged {
+			log.Printf("⚠️  No hay reglas cargadas en el motor Grule")
+			noRulesLogged = true
+		}
+		noRulesMutex.Unlock()
+		return
+	}
+
+	// Enviar al worker del IMEI (no ejecutar directamente)
+	SendToWorker(&jono)
+} // executeRulesForPacket ejecuta las reglas para un paquete específico
+func executeRulesForPacket(wrapper PacketWrapper, packetKey string, kbs []*ast.KnowledgeBase, gID string) {
+	log.Printf("[GID:%s] 🚀 Iniciando ejecución de reglas para paquete %s (IMEI: %s)", gID, packetKey, wrapper.IMEI)
+
+	// 🆕 NUEVO SISTEMA: Iniciar captura de auditoría ANTES de ejecutar reglas
+	audit.StartCapture(wrapper.IMEI)
+	defer audit.FinishCapture(wrapper.IMEI) // Guardar al finalizar
+
+	dataCtx := ast.NewDataContext()
+	dataCtx.Add("IncomingPacket", &wrapper)
+
+	// Crear Property con sincronización via channels
+	property := NewProperty(gID, context.Background())
+	defer property.Close()
+
+	log.Printf("[GID:%s] 📋 Property creado para sincronización de eventos", gID)
+
+	state := NewPersistentState(wrapper.IMEI)
+	dataCtx.Add("state", state)
+	dataCtx.Add("property", property)
+
+	// Agregar función global CastString para uso en reglas
+	dataCtx.Add("CastString", func(v interface{}) string {
+		return fmt.Sprintf("%v", v)
+	})
+
+	// 🆕 NUEVO SISTEMA: ActionsHelper con snapshot completo del contexto para Audit()
+	actionsObj := &actions.ActionsHelper{
+		IMEI:              wrapper.IMEI,
+		Speed:             wrapper.Speed,
+		Latitude:          wrapper.Latitude,
+		Longitude:         wrapper.Longitude,
+		Altitude:          wrapper.Altitude,
+		GSMSignalStrength: wrapper.GSMSignalStrength,
+		Satellites:        wrapper.NumberOfSatellites,
+		PositioningStatus: wrapper.PositioningStatus,
+		EventCode:         wrapper.EventCode.Name,
+		Datetime:          wrapper.Datetime,
+	}
+	dataCtx.Add("actions", actionsObj)
+
+	eng := engine.NewGruleEngine()
+	eng.MaxCycle = 100 // Reducir ciclos máximos para detectar ciclos infinitos rápidamente
+
+	// 🎯 CAPTURAR TODAS las reglas del knowledge base (sin evaluar condiciones)
+	// Las condiciones no se cumplen antes de Execute(), así que capturamos TODAS
+	allRulesMap := make(map[string]int) // ruleName -> salience
+	for _, kb := range kbs {
+		for ruleName, ruleEntry := range kb.RuleEntries {
+			allRulesMap[ruleName] = ruleEntry.Salience
+			log.Printf("[GID:%s] 🎯 Regla registrada para auditoría: %s (salience=%d)", gID, ruleName, ruleEntry.Salience)
+		}
+	}
+
+	for i, kb := range kbs {
+		log.Printf("[GID:%s] 📋 Ejecutando knowledge base %d/%d con %d reglas", gID, i+1, len(kbs), len(kb.RuleEntries))
+
+		err := eng.Execute(dataCtx, kb)
+		if err != nil {
+			log.Printf("[GID:%s] ⚠️  ERROR en paquete %s: %v", gID, packetKey, err)
+			log.Printf("[GID:%s]    Estado del contexto cuando falló:", gID)
+			log.Printf("[GID:%s]    - IncomingPacket.PositioningStatus: %s", gID, wrapper.PositioningStatus)
+			log.Printf("[GID:%s]    - state.JammerPositions: %d", gID, state.GetCounter("jammer_positions"))
+			log.Printf("[GID:%s]    - state.JammerAvgSpeed90min: %d", gID, state.GetCounter("jammer_avg_speed_90min"))
+			log.Printf("[GID:%s]    - state.JammerAvgGsm5: %d", gID, state.GetCounter("jammer_avg_gsm_last5"))
+			log.Printf("[GID:%s]    - state.JammerAlertSent: %v", gID, state.IsAlertSent("jammer_real_mercury_2025"))
+		} else {
+			log.Printf("[GID:%s] ✅ Knowledge base %d ejecutada sin errores", gID, i+1)
+
+			// 🔄 SYNC: Actualizar wrapper flags desde Property state
+			wrapper.DebugProcessed = property.GetDebugProcessed()
+			wrapper.ResetProcessed = property.GetResetProcessed()
+			wrapper.PositionInvalidDetectedProcessed = property.GetPositionInvalidDetectedProcessed()
+			wrapper.MovingWithWeakSignalProcessed = property.GetMovingWithWeakSignalProcessed()
+			wrapper.OutsideAllSafeZonesProcessed = property.GetOutsideAllSafeZonesProcessed()
+			wrapper.JammerPatternFullyConfirmedProcessed = property.GetJammerPatternFullyConfirmedProcessed()
+			
+			// wrapper.BufferUpdated = property.GetBufferUpdated()  // Set by rule on IncomingPacket
+			// wrapper.BufferHas10 = property.GetBufferHas10()      // Set by rule on IncomingPacket
+			// wrapper.MetricsReady = property.GetMetricsReady()
+			wrapper.CurrentlyInvalid = property.GetCurrentlyInvalid()
+			wrapper.EvaluationSkipped = property.GetEvaluationSkipped()
+			wrapper.AlertFired = property.GetAlertFired()
+
+			log.Printf("[GID:%s]    Estado final del contexto:", gID)
+			log.Printf("[GID:%s]    - state.JammerPositions: %d", gID, state.GetCounter("jammer_positions"))
+			log.Printf("[GID:%s]    - state.JammerAvgSpeed90min: %d", gID, state.GetCounter("jammer_avg_speed_90min"))
+			log.Printf("[GID:%s]    - state.JammerAvgGsm5: %d", gID, state.GetCounter("jammer_avg_gsm_last5"))
+			log.Printf("[GID:%s]    - state.JammerAlertSent: %v", gID, state.IsAlertSent("jammer_real_mercury_2025"))
+
+			// LOG DE FLAGS DESPUÉS DE EJECUTAR REGLAS - DESDE PROPERTY
+			log.Printf("[GID:%s] 🚨 FLAGS DESPUÉS DE EJECUTAR REGLAS (desde Property):", gID)
+			log.Printf("[GID:%s]    - property.PositionInvalidDetected: %v", gID, property.GetPositionInvalidDetected())
+			log.Printf("[GID:%s]    - property.MovingWithWeakSignal: %v", gID, property.GetMovingWithWeakSignal())
+			log.Printf("[GID:%s]    - property.OutsideAllSafeZones: %v", gID, property.GetOutsideAllSafeZones())
+			log.Printf("[GID:%s]    - property.JammerPatternFullyConfirmed: %v", gID, property.GetJammerPatternFullyConfirmed())
+			
+			// También loggeamos desde IncomingPacket por compatibilidad (ahora usando property)
+			log.Printf("[GID:%s]    - IncomingPacket.PositionInvalidDetected: %v (via property)", gID, property.GetPositionInvalidDetected())
+			log.Printf("[GID:%s]    - IncomingPacket.MovingWithWeakSignal: %v (via property)", gID, property.GetMovingWithWeakSignal())
+			log.Printf("[GID:%s]    - IncomingPacket.OutsideAllSafeZones: %v (via property)", gID, property.GetOutsideAllSafeZones())
+			log.Printf("[GID:%s]    - IncomingPacket.JammerPatternFullyConfirmed: %v (via property)", gID, property.GetJammerPatternFullyConfirmed())
+		}
+	}
+
+	// Persist wrapper flags to state for next packet
+	if wrapper.BufferUpdated {
+		state.SetCounter("last_buffer_updated", 1)
+	} else {
+		state.SetCounter("last_buffer_updated", 0)
+	}
+	if wrapper.BufferHas10 {
+		state.SetCounter("last_buffer_has10", 1)
+	} else {
+		state.SetCounter("last_buffer_has10", 0)
+	}
+	if wrapper.MetricsReady {
+		state.SetCounter("last_metrics_ready", 1)
+	} else {
+		state.SetCounter("last_metrics_ready", 0)
+	}
+	if wrapper.AlertFired {
+		state.SetCounter("last_alert_fired", 1)
+	} else {
+		state.SetCounter("last_alert_fired", 0)
+	}
+	if wrapper.IsOfflineFor5Min {
+		state.SetCounter("last_is_offline_for_5min", 1)
+	} else {
+		state.SetCounter("last_is_offline_for_5min", 0)
+	}
+
+	// 🆕 NUEVO SISTEMA: La auditoría se guarda automáticamente en defer audit.FinishCapture()
+
+	// 🎬 CAPTURAR "FRAMES DE PELÍCULA" con buffer circular y contexto completo
+	captureMovieFrames(wrapper.IMEI, wrapper, state, gID, allRulesMap)
+
+	log.Printf("[GID:%s] 🏁 Finalizada ejecución de reglas para paquete %s", gID, packetKey)
+}
+
+// captureMovieFrames captura el estado completo como "frames de película"
+// Muestra la evolución: buffer circular, métricas, geofences, flags
+// AHORA: 1 frame por ejecución de KB, con componentes ejecutados
+func captureMovieFrames(imei string, wrapper PacketWrapper, state *PersistentState, gID string, allRules map[string]int) {
+	// Si no hay reglas ejecutadas, no guardar frame
+	if len(allRules) == 0 {
+		log.Printf("[GID:%s] 🎬 No hay reglas ejecutadas - no se guarda frame", gID)
+		return
+	}
+
+	// Obtener buffer circular completo
+	bufferEntries := GetBufferEntries(imei)
+
+	// Usar LastValidDatetime del wrapper (calculado previamente)
+	var lastValidDatetimeStr interface{} = nil
+	if !wrapper.LastValidDatetime.IsZero() {
+		lastValidDatetimeStr = wrapper.LastValidDatetime.Format(time.RFC3339)
+	}
+
+	// Construir snapshot del contexto completo
+	contextSnapshot := map[string]interface{}{
+		"buffer_circular": bufferEntries, // "Cuadritos de la película" - historial de posiciones
+		"jammer_metrics": map[string]interface{}{
+			"avg_speed_90min":  state.GetCounter("jammer_avg_speed_90min"),
+			"avg_gsm_last5":    state.GetCounter("jammer_avg_gsm_last5"),
+			"jammer_positions": state.GetCounter("jammer_positions"),
+		},
+		"geofence_checks": map[string]bool{
+			"inside_taller":    state.IsInsideGroup("Taller", wrapper.Latitude, wrapper.Longitude),
+			"inside_clientes":  state.IsInsideGroup("CLIENTES", wrapper.Latitude, wrapper.Longitude),
+			"inside_resguardo": state.IsInsideGroup("Resguardo/Cedis/Puerto", wrapper.Latitude, wrapper.Longitude),
+			"offline_5min":     state.IsOfflineFor(5),
+		},
+		"wrapper_flags": map[string]interface{}{
+			"BufferUpdated":       wrapper.BufferUpdated,
+			"BufferHas10":         wrapper.BufferHas10,
+			"MetricsReady":        wrapper.MetricsReady,
+			"CurrentlyInvalid":    wrapper.CurrentlyInvalid,
+			"EvaluationSkipped":   wrapper.EvaluationSkipped,
+			"AlertFired":          wrapper.AlertFired,
+			"IsOfflineFor5Min":    wrapper.IsOfflineFor5Min,
+			"last_valid_datetime": lastValidDatetimeStr,
+		},
+		"packet_current": map[string]interface{}{
+			"Speed":             wrapper.Speed,
+			"Latitude":          wrapper.Latitude,
+			"Longitude":         wrapper.Longitude,
+			"Altitude":          wrapper.Altitude,
+			"GSMSignalStrength": wrapper.GSMSignalStrength,
+			"Satellites":        wrapper.NumberOfSatellites,
+			"PositioningStatus": wrapper.PositioningStatus,
+			"Datetime":          wrapper.Datetime,
+			"EventCode":         wrapper.EventCode,
+		},
+	}
+
+	// Detectar componentes ejecutados basándose en flags del wrapper
+	componentsExecuted := detectExecutedComponents(wrapper)
+	componentDetails := map[string]interface{}{
+		"buffer_updated":     wrapper.BufferUpdated,
+		"buffer_size":        len(bufferEntries),
+		"metrics_calculated": wrapper.MetricsReady,
+		"evaluation_skipped": wrapper.EvaluationSkipped,
+		"alert_triggered":    wrapper.AlertFired,
+	}
+
+	// Inferir en qué "escena de la película" estamos
+	step := 0
+	stage := "unknown"
+	reason := "unknown"
+
+	if wrapper.AlertFired {
+		step = 4
+		stage = "defcon4_alert"
+		reason = "jammer_detected"
+	} else if wrapper.OutsideAllSafeZones {
+		step = 3
+		stage = "defcon3_safe_zones"
+		reason = "outside_safe_zones"
+	} else if wrapper.MovingWithWeakSignal {
+		step = 2
+		stage = "defcon2_inhibition"
+		reason = "inhibition_confirmed"
+	} else if wrapper.MetricsReady {
+		step = 2
+		stage = "defcon2_metrics"
+		reason = "metrics_calculated"
+	} else if wrapper.PositionInvalidDetected {
+		step = 1
+		stage = "defcon1_contact_lost"
+		reason = "position_lost"
+	} else if wrapper.PositionInvalidDetectedProcessed {
+		step = 1
+		stage = "defcon1_valid"
+		reason = "position_valid"
+	} else if wrapper.BufferUpdated {
+		step = 0
+		stage = "defcon0_surveillance"
+		if wrapper.BufferHas10 {
+			reason = "buffer_full"
+		} else {
+			reason = fmt.Sprintf("buffer_updating (%d/10)", len(bufferEntries))
+		}
+	} else {
+		step = 0
+		stage = "defcon0_initial"
+		reason = "waiting_for_packet"
+	}
+
+	// Determinar evaluación de geofence
+	geofenceEval := "not_evaluated"
+	if step >= 3 {
+		if state.IsInsideGroup("Taller", wrapper.Latitude, wrapper.Longitude) {
+			geofenceEval = "inside_taller"
+		} else if state.IsInsideGroup("CLIENTES", wrapper.Latitude, wrapper.Longitude) {
+			geofenceEval = "inside_clientes"
+		} else if state.IsInsideGroup("Resguardo/Cedis/Puerto", wrapper.Latitude, wrapper.Longitude) {
+			geofenceEval = "inside_resguardo"
+		} else {
+			geofenceEval = "outside_all"
+		}
+	}
+
+	// CONSOLIDACIÓN: 1 frame por ejecución de KB
+	// Si hay múltiples reglas, tomar el nombre principal de la regla
+	var ruleName string
+	var ruleID int64
+	ruleName = "Jammer-Wargames-DEFCON" // Nombre principal de la regla
+	ruleID = getRuleIDByName(ruleName)
+
+	log.Printf("[GID:%s] 🎬 Frame consolidado: Rule='%s' (ID=%d), Components=%v, Step=%d, Stage=%s, Reason=%s, Buffer=%d/10",
+		gID, ruleName, ruleID, componentsExecuted, step, stage, reason, len(bufferEntries))
+
+	// Guardar UN SOLO frame consolidado
+	err := audit.SaveProgressFrame(imei, ruleID, ruleName, componentsExecuted, componentDetails,
+		step, stage, reason, len(bufferEntries), wrapper.MetricsReady, geofenceEval, contextSnapshot)
+
+	if err != nil {
+		log.Printf("[GID:%s] ⚠️ Error guardando frame consolidado: %v", gID, err)
+	} else {
+		log.Printf("[GID:%s]    ✅ Frame consolidado guardado en DB", gID)
+	}
+}
+
+// detectExecutedComponents determina qué componentes de la regla jammer_real se ejecutaron
+func detectExecutedComponents(wrapper PacketWrapper) []string {
+	var components []string
+
+	// Componente 1: BufferUpdate - se ejecuta si BufferUpdated
+	if wrapper.BufferUpdated {
+		components = append(components, "BufferUpdate")
+	}
+
+	// Componente 2: CalculateMetrics - se ejecuta si MetricsReady (porque se calculan métricas)
+	if wrapper.MetricsReady {
+		components = append(components, "CalculateMetrics")
+	}
+
+	// Componente 3: Detection - se ejecuta si AlertFired
+	if wrapper.AlertFired {
+		components = append(components, "Detection")
+	}
+
+	// Componente 4: SkipIfValid - se ejecuta si EvaluationSkipped
+	if wrapper.EvaluationSkipped {
+		components = append(components, "SkipIfValid")
+	}
+
+	return components
+}
+
+// getRuleIDByName obtiene el ID de una regla desde fleet_rules por nombre
+func getRuleIDByName(ruleName string) int64 {
+	return GetRuleIDByName(ruleName)
+}
+
+// Convierte strings vacíos "" a null en campos datetime para evitar parsing errors

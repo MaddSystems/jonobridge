@@ -1,0 +1,14 @@
+🚀 Starting Phase 3 & 5 Integration Test
+📝 Creating test rule and manifest...
+   Response: 500 - {"error":"Error 1062 (23000): Duplicate entry 'AuditIntegrationTest' for key 'fleet_rules.unique_name'"}
+
+✅ Audit enabled
+📤 Sent MQTT packet for TEST_AUDIT_999 (Status=A, Speed=75)
+🔍 Verifying audit for IMEI TEST_AUDIT_999...
+❌ No audit frames found in DB
+
+🧪 Testing Dynamic Frontend Data...
+📤 Sent MQTT packet for TEST_AUDIT_999 (Status=A, Speed=88)
+   ❌ No frames for dynamic test
+
+❌ SOME INTEGRATION TESTS FAILED ❌

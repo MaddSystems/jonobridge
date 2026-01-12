@@ -1,0 +1,371 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card mt-4">
+    <div class="card-header">
+        <h4 class="mb-0">Monitor Parameters</h4>
+    </div>
+    <div class="card-body">
+        {% if message %}
+                                <!-- Modal -->
+                                <div class="modal fade" id="successModal" tabindex="-1" aria-labelledby="successModalLabel" aria-hidden="true">
+                                    <div class="modal-dialog">
+                                        <div class="modal-content">
+                                            <div class="modal-header">
+                                                <h5 class="modal-title" id="successModalLabel">Success</h5>
+                                                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                                            </div>
+                                            <div class="modal-body">
+                                                {{ message }}
+                                            </div>
+                                            <div class="modal-footer">
+                                                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <script>
+                                    document.addEventListener('DOMContentLoaded', function() {
+                                        var successModal = new bootstrap.Modal(document.getElementById('successModal'));
+                                        successModal.show();
+                                    });
+                                </script>
+        {% endif %}
+        <form method="post">
+            <h5>Monitor Config (Global)</h5>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <label>Check Interval (min)
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpCheckInterval">?</button>
+                    </label>
+                    <input type="number" name="check_interval_minutes" value="{{ monitor_config.check_interval_minutes }}" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>Data Threshold (min)
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpDataThreshold">?</button>
+                    </label>
+                    <input type="number" name="data_threshold_minutes" value="{{ monitor_config.data_threshold_minutes }}" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label>Restart Enabled
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpRestartEnabled">?</button>
+                    </label>
+                    <input type="checkbox" name="restart_enabled" value="1" {% if monitor_config.restart_enabled %}checked{% endif %}>
+                </div>
+                <div class="col-md-3">
+                    <label>Alert Enabled
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpAlertEnabled">?</button>
+                    </label>
+                    <input type="checkbox" name="alert_enabled" value="1" {% if monitor_config.alert_enabled %}checked{% endif %}>
+                </div>
+                <div class="col-md-3 mt-2">
+                    <label>Request Timeout (s)
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpRequestTimeout">?</button>
+                    </label>
+                    <input type="number" name="request_timeout_seconds" value="{{ monitor_config.request_timeout_seconds }}" class="form-control">
+                </div>
+                <div class="col-md-3 mt-2">
+                    <label>Retry Attempts
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpRetryAttempts">?</button>
+                    </label>
+                    <input type="number" name="retry_attempts" value="{{ monitor_config.retry_attempts }}" class="form-control">
+                </div>
+                <div class="col-md-3 mt-2">
+                    <label>Retry Delay (s)
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpRetryDelay">?</button>
+                    </label>
+                    <input type="number" name="retry_delay_seconds" value="{{ monitor_config.retry_delay_seconds }}" class="form-control">
+                </div>
+            </div>
+            <h5>WhatsApp Config (Global)</h5>
+            <div class="row mb-3">
+                <div class="col-md-2">
+                    <label>Enabled
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpWAEnabled">?</button>
+                    </label>
+                    <input type="checkbox" name="enabled" value="1" {% if whatsapp_config.enabled %}checked{% endif %}>
+                </div>
+                <div class="col-md-2">
+                    <label>API Key
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpWAApiKey">?</button>
+                    </label>
+                    <input type="text" name="api_key" value="{{ whatsapp_config.api_key }}" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label>Channel ID
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpWAChannelId">?</button>
+                    </label>
+                    <input type="text" name="channel_id" value="{{ whatsapp_config.channel_id }}" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label>Namespace
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpWANamespace">?</button>
+                    </label>
+                    <input type="text" name="namespace" value="{{ whatsapp_config.namespace }}" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label>Template Name
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpWATemplateName">?</button>
+                    </label>
+                    <input type="text" name="template_name" value="{{ whatsapp_config.template_name }}" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label>Language Code
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpWALanguageCode">?</button>
+                    </label>
+                    <input type="text" name="language_code" value="{{ whatsapp_config.language_code }}" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label>Alert Interval (min)
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpWAAlertInterval">?</button>
+                    </label>
+                    <input type="number" name="alert_interval_minutes" value="{{ whatsapp_config.alert_interval_minutes }}" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label>Min Failure Count
+                        <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#helpWAMinFailureCount">?</button>
+                    </label>
+                    <input type="number" name="min_failure_count" value="{{ whatsapp_config.min_failure_count }}" class="form-control">
+                </div>
+            </div>
+            <h5>WhatsApp Phones (Global)</h5>
+            <div class="table-responsive mb-3">
+                <table class="table table-bordered">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Phone Number</th>
+                            <th>Contact Name</th>
+                            <th>Enabled</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for phone in whatsapp_phones %}
+                        <tr>
+                            <td>{{ phone.id }}</td>
+                            <td><input type="text" name="phone_number" value="{{ phone.phone_number }}" class="form-control"></td>
+                            <td><input type="text" name="contact_name" value="{{ phone.contact_name }}" class="form-control"></td>
+                            <td><input type="checkbox" name="phone_enabled" value="1" {% if phone.enabled %}checked{% endif %}></td>
+                            <td>
+                                <form method="post" style="display:inline;">
+                                    <input type="hidden" name="delete_phone_id" value="{{ phone.id }}">
+                                    <button type="submit" name="delete_phone" value="1" class="btn btn-danger btn-sm">Delete</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            <div class="row mb-3">
+                <div class="col-md-4">
+                    <h6>Add New Phone</h6>
+                    <input type="text" name="new_phone_number" placeholder="Phone Number" class="form-control mb-1">
+                    <input type="text" name="new_contact_name" placeholder="Contact Name" class="form-control mb-1">
+                    <label><input type="checkbox" name="new_phone_enabled" checked> Enabled</label>
+                    <button type="submit" name="add_phone" value="1" class="btn btn-success btn-sm mt-2">Add Phone</button>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary">Update Monitor Params</button>
+        </form>
+        </div>
+        <!-- Help Modals for Monitor Config -->
+        <div class="modal fade" id="helpCheckInterval" tabindex="-1" aria-labelledby="helpCheckIntervalLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpCheckIntervalLabel">Check Interval (min)</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        How often (in minutes) the monitor checks each service for new data.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpDataThreshold" tabindex="-1" aria-labelledby="helpDataThresholdLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpDataThresholdLabel">Data Threshold (min)</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        The time window (in minutes) to look for recent data in Elasticsearch. If no data is found in this period, the service is considered failing.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpRestartEnabled" tabindex="-1" aria-labelledby="helpRestartEnabledLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpRestartEnabledLabel">Restart Enabled</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        If checked, the monitor will attempt to restart the service in Kubernetes when a failure is detected.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpAlertEnabled" tabindex="-1" aria-labelledby="helpAlertEnabledLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpAlertEnabledLabel">Alert Enabled</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        If checked, enables alerting for the service (currently only WhatsApp alerts are supported).
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpRequestTimeout" tabindex="-1" aria-labelledby="helpRequestTimeoutLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpRequestTimeoutLabel">Request Timeout (s)</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        Maximum time (in seconds) to wait for a response from Elasticsearch before considering the request failed.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpRetryAttempts" tabindex="-1" aria-labelledby="helpRetryAttemptsLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpRetryAttemptsLabel">Retry Attempts</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        Number of times to retry a failed request to Elasticsearch before giving up.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpRetryDelay" tabindex="-1" aria-labelledby="helpRetryDelayLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpRetryDelayLabel">Retry Delay (s)</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        Time (in seconds) to wait between retry attempts for failed Elasticsearch requests.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- Help Modals for WhatsApp Config -->
+        <div class="modal fade" id="helpWAEnabled" tabindex="-1" aria-labelledby="helpWAEnabledLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpWAEnabledLabel">WhatsApp Enabled</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        If checked, enables WhatsApp alerts for detected problems.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpWAApiKey" tabindex="-1" aria-labelledby="helpWAApiKeyLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpWAApiKeyLabel">API Key</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        The MessageBird API key used to send WhatsApp alerts.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpWAChannelId" tabindex="-1" aria-labelledby="helpWAChannelIdLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpWAChannelIdLabel">Channel ID</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        The MessageBird channel ID for WhatsApp communication.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpWANamespace" tabindex="-1" aria-labelledby="helpWANamespaceLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpWANamespaceLabel">Namespace</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        The MessageBird namespace for WhatsApp templates.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpWATemplateName" tabindex="-1" aria-labelledby="helpWATemplateNameLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpWATemplateNameLabel">Template Name</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        The name of the WhatsApp template used for alerts.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpWALanguageCode" tabindex="-1" aria-labelledby="helpWALanguageCodeLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpWALanguageCodeLabel">Language Code</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        The language code for WhatsApp template messages (e.g., es_MX for Spanish/Mexico).
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpWAAlertInterval" tabindex="-1" aria-labelledby="helpWAAlertIntervalLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpWAAlertIntervalLabel">Alert Interval (min)</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        Minimum time (in minutes) between WhatsApp alerts for the same problem.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal fade" id="helpWAMinFailureCount" tabindex="-1" aria-labelledby="helpWAMinFailureCountLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="helpWAMinFailureCountLabel">Min Failure Count</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        Minimum number of failures before a WhatsApp alert is sent for a service.
+                    </div>
+                </div>
+            </div>
+        </div>
+</div>
+{% endblock %}

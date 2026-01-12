@@ -1,0 +1,380 @@
+{% extends "base.html" %}
+
+{% block content %}
+<style>
+    .spinner-overlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 9999;
+    }
+    .spinner-content {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        text-align: center;
+        background: white;
+        padding: 2rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    }
+</style>
+
+<div class="spinner-overlay" id="stopSpinner">
+    <div class="spinner-content">
+        <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading...</span>
+        </div>
+        <h5 class="mt-3">Stopping services...</h5>
+        <p class="text-muted">Please wait while services are being stopped</p>
+    </div>
+</div>
+
+<div class="spinner-overlay" id="deleteSpinner">
+    <div class="spinner-content">
+        <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading...</span>
+        </div>
+        <h5 class="mt-3">Deleting client...</h5>
+        <p class="text-muted">Please wait while the client is being deleted</p>
+    </div>
+</div>
+
+<div class="container mt-4">
+    <div class="card">
+        <div class="card-header bg-primary text-white">
+            <h2 class="mb-0">Clients</h2>
+        </div>
+        <div class="card-body">
+            <div id="alertArea"></div>
+            
+            <!-- Add Client Form -->
+            <form action="/add_client" method="post" class="form-inline justify-content-center mb-4" id="addClientForm" onsubmit="return validateForm()">
+                <div class="input-group" style="max-width: 500px;">
+                    <input type="text" 
+                           name="client_name" 
+                           class="form-control" 
+                           placeholder="New Client Name" 
+                           pattern="^[a-zA-Z0-9]+$"
+                           title="Only letters and numbers are allowed"
+                           required>
+                    <button type="submit" class="btn btn-success">Add Client</button>
+                </div>
+            </form>
+
+            <!-- Client List -->
+            <div class="container-fluid">
+                <div class="row">
+                    <div class="col">
+                        <div class="card">
+                            <div class="card-body">
+                                <table id="clientsTable" class="table table-striped table-bordered dt-responsive nowrap" style="width:100%">
+                                    <thead>
+                                        <tr>
+                                            <th>Port</th>
+                                            <th>API Port</th>
+                                            <th>Mini Kube Web Port</th>
+                                            <th>Client Name</th>
+                                            <th>Created At</th>
+                                            <th>Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {% for client in clients %}
+                                        <tr>
+                                            <td>{{ client.port }}</td>
+                                            <td>{{ client.api_port }}</td>
+                                            <td>{{ client.web_port }}</td>
+                                            <td>{{ client.name }}</td>
+                                            <td>{{ client.created_at }}</td>
+                                            <td>
+                                                <div class="btn-group" role="group">
+                                                    <button type="button" class="btn btn-dark btn-sm" onclick="window.location.href='/setup/{{ client.id }}'">
+                                                        Setup
+                                                    </button>
+                                                    <button type="button" class="btn btn-success btn-sm" onclick="window.location.href='/deploy/{{ client.id }}'">
+                                                        Deploy
+                                                    </button>
+                                                    <button type="button" class="btn btn-warning btn-sm stop-button" data-client-id="{{ client.id }}" data-bs-toggle="modal" data-bs-target="#stopModal{{ client.id }}">
+                                                        Stop
+                                                    </button>
+                                                    <button type="button" class="btn btn-info btn-sm" onclick="window.location.href='/status/{{ client.id }}'">
+                                                        Status
+                                                    </button>
+                                                    <button type="button" class="btn btn-danger btn-sm delete-button" data-client-id="{{ client.id }}" data-bs-toggle="modal" data-bs-target="#deleteModal{{ client.id }}">
+                                                        Delete
+                                                    </button>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stop Modal for each client -->
+            {% for client in clients %}
+            <div class="modal fade" id="stopModal{{ client.id }}" tabindex="-1" aria-labelledby="stopModalLabel{{ client.id }}" aria-hidden="true">
+                <div class="modal-dialog">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title" id="stopModalLabel{{ client.id }}">Confirm Stop</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="alert alert-info">
+                                <i class="fas fa-info-circle"></i>
+                                <strong>Important:</strong> Before stopping services, we recommend downloading the logs for debugging purposes.
+                            </div>
+                            <p>Are you sure you want to stop all services for client <strong>"{{ client.name }}"</strong>?</p>
+                            
+                            <!-- Download logs section -->
+                            <div class="mt-3 p-3 border rounded">
+                                <h6><i class="fas fa-download"></i> Download Logs</h6>
+                                <p class="text-muted small">Download all pod logs before stopping services. File will be saved as: <code>{{ client.name }}-YYYY-MM-DD:HH:MM.zip</code></p>
+                                <button type="button" class="btn btn-info btn-sm download-logs-btn" data-client-id="{{ client.id }}" data-client-name="{{ client.name }}">
+                                    <i class="fas fa-download"></i> Download Logs
+                                </button>
+                                <span class="download-status ms-2" id="downloadStatus{{ client.id }}" style="display: none;"></span>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                            <button type="button" class="btn btn-warning confirm-stop-btn" data-client-id="{{ client.id }}" data-client-name="{{ client.name }}">
+                                <i class="fas fa-stop"></i> Stop Services
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+
+            <!-- Delete Modal for each client -->
+            {% for client in clients %}
+            <div class="modal fade" id="deleteModal{{ client.id }}" tabindex="-1" aria-labelledby="deleteModalLabel{{ client.id }}" aria-hidden="true">
+                <div class="modal-dialog">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title" id="deleteModalLabel{{ client.id }}">Confirm Delete</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                        </div>
+                        <div class="modal-body">
+                            Are you sure you want to delete client "{{ client.name }}"? This action cannot be undone.
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                            <button type="button" class="btn btn-danger confirm-delete-btn" data-client-id="{{ client.id }}">Delete</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+
+            <!-- Flash Messages -->
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }} alert-dismissible fade show mt-4" role="alert">
+                            {{ message }}
+                            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                        </div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            <script>
+            function validateForm() {
+                const input = document.querySelector('input[name="client_name"]');
+                const value = input.value;
+                const alphanumericRegex = /^[a-zA-Z0-9]+$/;
+                
+                if (!alphanumericRegex.test(value)) {
+                    alert('Client name can only contain letters and numbers');
+                    return false;
+                }
+                return true;
+            }
+
+            // Add real-time validation as user types
+            document.querySelector('input[name="client_name"]').addEventListener('input', function(e) {
+                const value = e.target.value;
+                const alphanumericRegex = /^[a-zA-Z0-9]*$/;
+                
+                if (!alphanumericRegex.test(value)) {
+                    e.target.value = value.replace(/[^a-zA-Z0-9]/g, '');
+                }
+            });
+
+            // Handle Download Logs button clicks
+            document.querySelectorAll('.download-logs-btn').forEach(button => {
+                button.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const clientId = this.getAttribute('data-client-id');
+                    const clientName = this.getAttribute('data-client-name');
+                    const statusElement = document.getElementById('downloadStatus' + clientId);
+                    
+                    // Show downloading status
+                    this.disabled = true;
+                    this.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Downloading...';
+                    statusElement.style.display = 'inline';
+                    statusElement.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin"></i> Preparing logs...</span>';
+                    
+                    // Create a temporary link for download
+                    const downloadLink = document.createElement('a');
+                    downloadLink.href = `/download_logs/${clientId}`;
+                    downloadLink.download = `${clientName}-logs.zip`;
+                    downloadLink.style.display = 'none';
+                    document.body.appendChild(downloadLink);
+                    
+                    // Trigger download
+                    downloadLink.click();
+                    
+                    // Reset button after a short delay
+                    setTimeout(() => {
+                        this.disabled = false;
+                        this.innerHTML = '<i class="fas fa-download"></i> Download Logs';
+                        statusElement.innerHTML = '<span class="text-success"><i class="fas fa-check"></i> Download started</span>';
+                        
+                        // Hide status after 3 seconds
+                        setTimeout(() => {
+                            statusElement.style.display = 'none';
+                        }, 3000);
+                    }, 1000);
+                    
+                    // Clean up the link
+                    setTimeout(() => {
+                        document.body.removeChild(downloadLink);
+                    }, 5000);
+                });
+            });
+
+            // Handle Stop button clicks
+            document.querySelectorAll('.confirm-stop-btn').forEach(button => {
+                button.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const clientId = this.getAttribute('data-client-id');
+                    const clientName = this.getAttribute('data-client-name');
+                    const spinner = document.getElementById('stopSpinner');
+                    const modal = document.getElementById('stopModal' + clientId);
+                    
+                    // Hide modal and show spinner
+                    bootstrap.Modal.getInstance(modal).hide();
+                    spinner.style.display = 'block';
+
+                    // Function to check if services and pods are stopped
+                    function checkServicesStatus() {
+                        fetch(`/check_namespace_status/${clientId}`, {
+                            method: 'GET'
+                        })
+                        .then(response => response.json())
+                        .then(statusResponse => {
+                            if (statusResponse.services_stopped && statusResponse.pods_stopped) {
+                                // Add 10 more seconds after confirming everything is stopped
+                                setTimeout(function() {
+                                    spinner.style.display = 'none';
+                                    window.location.reload();
+                                }, 10000);
+                            } else {
+                                // Check again after 2 seconds
+                                setTimeout(checkServicesStatus, 2000);
+                            }
+                        })
+                        .catch(error => {
+                            spinner.style.display = 'none';
+                            alert('Error checking services status. Please verify manually.');
+                        });
+                    }
+
+                    // Send stop request
+                    fetch(`/stop_services/${clientId}`, {
+                        method: 'GET'
+                    })
+                    .then(response => {
+                        if (response.ok) {
+                            // Start checking status
+                            checkServicesStatus();
+                        } else {
+                            throw new Error('Failed to stop services');
+                        }
+                    })
+                    .catch(error => {
+                        spinner.style.display = 'none';
+                        alert('Error stopping services. Please try again.');
+                    });
+                });
+            });
+
+            // Handle Delete button clicks
+            $(document).ready(function() {
+                $('.confirm-delete-btn').click(function() {
+                    const clientId = $(this).data('client-id');
+                    const modal = $(`#deleteModal${clientId}`);
+                    
+                    // Show spinner
+                    $('#deleteSpinner').css('display', 'flex');
+                    
+                    // Hide the modal
+                    modal.modal('hide');
+                    
+                    // Send delete request
+                    $.ajax({
+                        url: `/delete_client/${clientId}`,
+                        method: 'POST',
+                        success: function(response) {
+                            $('#deleteSpinner').hide();
+                            window.location.reload();
+                        },
+                        error: function(xhr, status, error) {
+                            $('#deleteSpinner').hide();
+                            window.location.reload();
+                        }
+                    });
+                });
+            });
+
+            $(document).ready(function() {
+                $('#clientsTable').DataTable({
+                    "scrollX": true,
+                    "scrollY": "900px",
+                    "scrollCollapse": true,
+                    "paging": true,
+                    "lengthChange": true,
+                    "searching": true,
+                    "ordering": true,
+                    "info": true,
+                    "autoWidth": false,
+                    "responsive": true,
+                });
+            });
+            </script>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block styles %}
+<!-- DataTables CSS -->
+<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.11.5/css/dataTables.bootstrap5.min.css"/>
+<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/buttons/2.2.2/css/buttons.bootstrap5.min.css"/>
+<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/responsive/2.2.9/css/responsive.bootstrap5.min.css"/>
+{% endblock %}
+
+{% block scripts %}
+<!-- DataTables JS -->
+<script type="text/javascript" src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/1.11.5/js/jquery.dataTables.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/1.11.5/js/dataTables.bootstrap5.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.2.2/js/dataTables.buttons.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.2.2/js/buttons.bootstrap5.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.2.2/js/buttons.html5.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/responsive/2.2.9/js/dataTables.responsive.min.js"></script>
+<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.1.3/jszip.min.js"></script>
+{% endblock %}

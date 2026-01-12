@@ -1,0 +1,510 @@
+{% extends "base.html" %}
+
+{% block title %}Auditoría - Grule Engine{% endblock %}
+
+{% block content %}
+<div class="audit-container">
+    <!-- Header -->
+    <div class="header-section">
+        <h1><i class="fas fa-history"></i> Audit Trail Dashboard</h1>
+        <p>Resumen de IMEIs con alertas disparadas (1 fila por IMEI, sin duplicados)</p>
+    </div>
+
+    <!-- Grid Section -->
+    <div class="grid-section">
+        <div class="grid-toolbar">
+            <input type="text" id="searchText" class="form-control form-control-sm" placeholder="Buscar por IMEI o regla..." value="" style="max-width: 300px;">
+            <button class="btn btn-primary btn-sm" onclick="loadGrid()"><i class="fas fa-search"></i> Buscar</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearSearch()">Limpiar</button>
+            <button class="btn btn-success btn-sm" onclick="exportCSV()"><i class="fas fa-download"></i> Exportar CSV</button>
+        </div>
+
+        <table id="auditGrid"></table>
+        <div id="auditGridPager"></div>
+    </div>
+</div>
+
+<!-- Modal para detalles de alertas por IMEI -->
+<div class="modal fade" id="detailsModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title">
+                    <i class="fas fa-list-alt"></i> Historial de Alertas - <span id="modalImei" class="badge bg-light text-primary"></span>
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" style="max-height: 70vh; overflow-y: auto;">
+                <div class="alert alert-info">
+                    <strong>Total de alertas:</strong> <span id="modalTotalAlerts"></span> en las últimas 24 horas
+                </div>
+                <table id="detailsGrid"></table>
+                <div id="detailsGridPager"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .audit-container {
+        padding-top: 20px;
+    }
+
+    .header-section {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 25px;
+        border-radius: 10px;
+        margin-bottom: 30px;
+        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+    }
+
+    .header-section h1 {
+        margin: 0;
+        font-weight: 600;
+        font-size: 2em;
+    }
+
+    .header-section p {
+        margin: 5px 0 0 0;
+        opacity: 0.9;
+        font-size: 0.95em;
+    }
+
+    .grid-section {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        margin-bottom: 30px;
+    }
+
+    .grid-toolbar {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 15px;
+        flex-wrap: wrap;
+        align-items: center;
+    }
+
+    /* jqGrid customizations */
+    .ui-jqgrid {
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+
+    .ui-jqgrid .ui-jqgrid-htable {
+        background: #f8f9fa;
+    }
+
+    .ui-jqgrid .ui-jqgrid-htable th {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        font-weight: 600;
+        padding: 12px 8px;
+        border: none;
+    }
+
+    .ui-jqgrid .ui-jqgrid-btable td {
+        padding: 10px 8px;
+    }
+
+    .ui-jqgrid .ui-jqgrid-btable tr:hover {
+        background: #e7f3ff;
+        cursor: pointer;
+    }
+
+    .badge-imei {
+        background: #e7e7ff;
+        color: #667eea;
+        padding: 6px 14px;
+        border-radius: 20px;
+        font-size: 0.9em;
+        font-weight: 600;
+        font-family: 'Courier New', monospace;
+        display: inline-block;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+
+    .badge-imei:hover {
+        background: #667eea;
+        color: white;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(102, 126, 234, 0.3);
+    }
+
+    .badge-alerts {
+        background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+        color: white;
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 0.85em;
+        font-weight: 600;
+        display: inline-block;
+        box-shadow: 0 2px 4px rgba(220, 53, 69, 0.3);
+    }
+
+    .badge-rule {
+        background: #f8f9fa;
+        color: #495057;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 0.85em;
+        border: 1px solid #dee2e6;
+    }
+
+    .location-link {
+        color: #0d6efd;
+        text-decoration: none;
+        font-family: 'Courier New', monospace;
+        font-size: 0.9em;
+    }
+
+    .location-link:hover {
+        text-decoration: underline;
+        color: #0a58ca;
+    }
+
+    .alert-types-list {
+        font-size: 0.85em;
+        line-height: 1.6;
+    }
+
+    .alert-type-item {
+        background: #f8f9fa;
+        padding: 3px 8px;
+        border-radius: 8px;
+        margin: 2px;
+        display: inline-block;
+    }
+
+    @media (max-width: 768px) {
+        .grid-toolbar {
+            flex-direction: column;
+        }
+
+        .grid-toolbar > * {
+            width: 100%;
+        }
+
+        .header-section h1 {
+            font-size: 1.5em;
+        }
+
+        .modal-xl {
+            max-width: 95vw;
+        }
+
+        .badge-imei {
+            font-size: 0.8em;
+            padding: 4px 10px;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<!-- jqGrid CSS and JS -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jqueryui/1.12.1/jquery-ui.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/css/ui.jqgrid.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/jquery.jqgrid.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/free-jqgrid/4.15.4/js/i18n/grid.locale-es.min.js"></script>
+
+<script>
+    // Bootstrap Modal instance
+    let detailsModal;
+
+    // jqGrid initialization
+    $(document).ready(function() {
+        // Inicializar modal de Bootstrap
+        detailsModal = new bootstrap.Modal(document.getElementById('detailsModal'));
+
+        // Grid principal - Resumen de IMEIs
+        $('#auditGrid').jqGrid({
+            url: '/api/audit/grid',
+            datatype: 'json',
+            mtype: 'GET',
+            colNames: ['IMEI', 'Última Alerta', 'Alertas 24h', 'Tipos de Alertas', 'Última Regla', 'Ubicación'],
+            colModel: [
+                { 
+                    name: 'imei', 
+                    index: 'imei', 
+                    width: 180, 
+                    formatter: imeiFormatter,
+                    align: 'center'
+                },
+                { 
+                    name: 'last_alert_date', 
+                    index: 'last_alert_date', 
+                    width: 200,
+                    formatter: dateTimeFormatter,
+                    sorttype: 'date'
+                },
+                { 
+                    name: 'total_alerts_24h', 
+                    index: 'total_alerts_24h', 
+                    width: 100,
+                    formatter: alertCountFormatter,
+                    align: 'center'
+                },
+                { 
+                    name: 'alert_types', 
+                    index: 'alert_types', 
+                    width: 200,
+                    formatter: alertTypesFormatter,
+                    sortable: false
+                },
+                { 
+                    name: 'last_rule_executed', 
+                    index: 'last_rule_executed', 
+                    width: 180,
+                    formatter: ruleFormatter
+                },
+                { 
+                    name: 'last_alert_location', 
+                    index: 'last_alert_location', 
+                    width: 160,
+                    formatter: locationFormatter,
+                    sortable: false
+                }
+            ],
+            pager: '#auditGridPager',
+            rowNum: 25,
+            rowList: [10, 25, 50, 100],
+            sortname: 'last_alert_date',
+            sortorder: 'DESC',
+            viewrecords: true,
+            height: 'auto',
+            autowidth: true,
+            shrinkToFit: true,
+            loadonce: false,
+            jsonReader: {
+                root: 'rows',
+                page: 'page',
+                total: 'total',
+                records: 'records',
+                repeatitems: false,
+                id: 'imei'
+            },
+            onSelectRow: function(rowid) {
+                const rowData = $('#auditGrid').jqGrid('getRowData', rowid);
+                showDetails(rowData.imei, rowData.total_alerts_24h);
+            },
+            loadComplete: function() {
+                console.log('Grid loaded successfully');
+            },
+            loadError: function(xhr, status, error) {
+                console.error('Error loading grid:', error);
+                alert('Error cargando datos: ' + error);
+            }
+        });
+
+        $('#auditGrid').jqGrid('navGrid', '#auditGridPager', {
+            edit: false,
+            add: false,
+            del: false,
+            search: false,
+            refresh: true
+        });
+
+        // Cargar datos iniciales
+        loadGrid();
+    });
+
+    // Formatters for jqGrid
+    function imeiFormatter(cellvalue, options, rowObject) {
+        return '<span class="badge-imei" onclick="event.stopPropagation(); showDetails(\'' + cellvalue + '\', ' + rowObject.total_alerts_24h + ')">' + 
+               cellvalue + '</span>';
+    }
+
+    function dateTimeFormatter(cellvalue, options, rowObject) {
+        if (!cellvalue) return '';
+        
+        try {
+            const date = new Date(cellvalue);
+            
+            // Format: dd/mm/yyyy HH:MM:SS.mmm
+            const day = String(date.getDate()).padStart(2, '0');
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const year = date.getFullYear();
+            const hours = String(date.getHours()).padStart(2, '0');
+            const minutes = String(date.getMinutes()).padStart(2, '0');
+            const seconds = String(date.getSeconds()).padStart(2, '0');
+            const milliseconds = String(date.getMilliseconds()).padStart(3, '0');
+            
+            return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}.${milliseconds}`;
+        } catch (e) {
+            return cellvalue;
+        }
+    }
+
+    function alertCountFormatter(cellvalue, options, rowObject) {
+        if (cellvalue > 10) {
+            return '<span class="badge-alerts">⚠️ ' + cellvalue + '</span>';
+        }
+        return '<span class="badge bg-warning text-dark">' + cellvalue + '</span>';
+    }
+
+    function alertTypesFormatter(cellvalue, options, rowObject) {
+        if (!cellvalue || typeof cellvalue !== 'object') {
+            return '<span class="text-muted">-</span>';
+        }
+
+        let html = '<div class="alert-types-list">';
+        for (const [rule, count] of Object.entries(cellvalue)) {
+            html += '<span class="alert-type-item"><strong>' + rule + ':</strong> ' + count + '</span> ';
+        }
+        html += '</div>';
+        return html;
+    }
+
+    function ruleFormatter(cellvalue, options, rowObject) {
+        return '<span class="badge-rule">' + cellvalue + '</span>';
+    }
+
+    function locationFormatter(cellvalue, options, rowObject) {
+        if (!cellvalue || cellvalue === ',') {
+            return '<span class="text-muted">-</span>';
+        }
+        const coords = cellvalue.split(',');
+        if (coords.length === 2) {
+            const mapsUrl = 'https://www.google.com/maps?q=' + coords[0] + ',' + coords[1];
+            return '<a href="' + mapsUrl + '" target="_blank" class="location-link" onclick="event.stopPropagation()">📍 ' + 
+                   parseFloat(coords[0]).toFixed(4) + ', ' + parseFloat(coords[1]).toFixed(4) + '</a>';
+        }
+        return cellvalue;
+    }
+
+    // Search functions
+    function loadGrid() {
+        const searchText = document.getElementById('searchText').value;
+        
+        $('#auditGrid').jqGrid('setGridParam', {
+            postData: {
+                searchText: searchText
+            },
+            page: 1
+        }).trigger('reloadGrid');
+    }
+
+    function clearSearch() {
+        document.getElementById('searchText').value = '';
+        loadGrid();
+    }
+
+    function exportCSV() {
+        const searchText = document.getElementById('searchText').value;
+        let downloadUrl = '/api/audit/summary?format=csv';
+        if (searchText) {
+            downloadUrl += '&searchText=' + encodeURIComponent(searchText);
+        }
+        
+        window.location.href = downloadUrl;
+    }
+
+    // Show details modal
+    function showDetails(imei, totalAlerts) {
+        document.getElementById('modalImei').textContent = imei;
+        document.getElementById('modalTotalAlerts').textContent = totalAlerts;
+
+        // Destruir grid anterior si existe
+        if (jQuery('#detailsGrid').length > 0) {
+            jQuery('#detailsGrid').jqGrid('GridUnload');
+        }
+
+        // Crear grid de detalles
+        $('#detailsGrid').jqGrid({
+            url: '/api/audit/details?imei=' + encodeURIComponent(imei),
+            datatype: 'json',
+            mtype: 'GET',
+            colNames: ['Fecha', 'Regla', 'Descripción', 'Ubicación', 'Velocidad', 'Telegram'],
+            colModel: [
+                { 
+                    name: 'alert_date', 
+                    index: 'alert_date', 
+                    width: 150,
+                    formatter: 'date',
+                    formatoptions: { newformat: 'd/m/Y H:i:s' }
+                },
+                { 
+                    name: 'rule_name', 
+                    index: 'rule_name', 
+                    width: 150
+                },
+                { 
+                    name: 'rule_description', 
+                    index: 'rule_description', 
+                    width: 250
+                },
+                { 
+                    name: 'latitude', 
+                    index: 'latitude', 
+                    width: 120,
+                    formatter: detailLocationFormatter
+                },
+                { 
+                    name: 'speed', 
+                    index: 'speed', 
+                    width: 80,
+                    align: 'center'
+                },
+                { 
+                    name: 'telegram_sent', 
+                    index: 'telegram_sent', 
+                    width: 80,
+                    formatter: telegramFormatter,
+                    align: 'center'
+                }
+            ],
+            rowNum: 25,
+            rowList: [10, 25, 50, 100],
+            sortname: 'alert_date',
+            sortorder: 'DESC',
+            viewrecords: true,
+            height: 'auto',
+            autowidth: true,
+            pager: '#detailsGridPager',
+            jsonReader: {
+                root: 'data',
+                page: function() { return 1; },
+                total: function() { return 1; },
+                records: 'count',
+                repeatitems: false,
+                id: 'id'
+            },
+            onSelectRow: function(rowid) {
+                const rowData = $('#detailsGrid').jqGrid('getRowData', rowid);
+                console.log('Alert detail:', rowData);
+            }
+        });
+
+        $('#detailsGrid').jqGrid('navGrid', '#detailsGridPager', {
+            edit: false,
+            add: false,
+            del: false,
+            search: false,
+            refresh: false
+        });
+
+        // Mostrar modal
+        detailsModal.show();
+    }
+
+    function detailLocationFormatter(cellvalue, options, rowObject) {
+        if (rowObject.latitude && rowObject.longitude) {
+            const mapsUrl = 'https://www.google.com/maps?q=' + rowObject.latitude + ',' + rowObject.longitude;
+            return '<a href="' + mapsUrl + '" target="_blank" class="location-link">📍 Ver mapa</a>';
+        }
+        return '<span class="text-muted">-</span>';
+    }
+
+    function telegramFormatter(cellvalue, options, rowObject) {
+        if (cellvalue === true || cellvalue === 1) {
+            return '<span class="badge bg-success">✓ Enviado</span>';
+        }
+        return '<span class="badge bg-secondary">No</span>';
+    }
+</script>
+{% endblock %}

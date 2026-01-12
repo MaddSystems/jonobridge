@@ -1,0 +1,269 @@
+package engine
+
+import (
+	"log"
+	"sync"
+	"time"
+)
+
+type BufferEntry struct {
+	IMEI              string    `json:"imei"`
+	Datetime          time.Time `json:"datetime"`
+	Speed             int64     `json:"speed"`              // YA EN KM/H
+	GSMSignalStrength int64     `json:"gsm_signal"`         // 0-31
+	PositioningStatus string    `json:"positioning_status"` // "true"/"A"/"false"/"V"
+	IsValid           bool      `json:"is_valid"`           // Computed
+	Latitude          float64   `json:"latitude"`
+	Longitude         float64   `json:"longitude"`
+}
+
+type FixedCircularBuffer struct {
+	entries    [10]BufferEntry
+	size       int
+	mutex      sync.RWMutex
+	lastUpdate time.Time
+}
+
+type BufferManager struct {
+	buffers   map[string]*FixedCircularBuffer
+	mutex     sync.RWMutex
+	retention time.Duration
+}
+
+var GlobalBufferManager *BufferManager
+
+// AddEntry - REPLICA EXACTA líneas 60-69 GPSgate
+func (b *FixedCircularBuffer) AddEntry(entry BufferEntry) bool {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	log.Printf("MEMORY_DEBUG: Adding entry for IMEI %s. Buffer address: %p, current size: %d", entry.IMEI, b, b.size)
+
+	// SIEMPRE calcular isValid (réplica línea 82)
+	entry.IsValid = (entry.PositioningStatus == "true" || entry.PositioningStatus == "A")
+
+	if b.size < 10 {
+		// CASO 1: Buffer no lleno - solo push (líneas 61-62 GPSgate)
+		b.entries[b.size] = entry
+		b.size++
+		log.Printf("MEMORY_DEBUG: IMEI %s. New size: %d", entry.IMEI, b.size)
+		return false // doit = false (no tiene 10 aún)
+	} else {
+		// CASO 2: Buffer lleno - shift + push (líneas 63-65 GPSgate)
+		for i := 0; i < 9; i++ {
+			b.entries[i] = b.entries[i+1] // Shift left
+		}
+		b.entries[9] = entry // Push al final
+		log.Printf("MEMORY_DEBUG: IMEI %s. Buffer full, shifted. New size: %d", entry.IMEI, b.size)
+		return true          // doit = true (tiene exactamente 10)
+	}
+}
+
+// GetEntriesInTimeWindow90Min - Filtra buffer por ventana 90min (réplica forEach línea 88)
+func (b *FixedCircularBuffer) GetEntriesInTimeWindow90Min() []BufferEntry {
+	if b.size != 10 {
+		return []BufferEntry{} // Solo si doit=true
+	}
+
+	now := time.Now()
+	var filtered []BufferEntry
+
+	// Réplica forEach de GPSgate (línea 88) - PASO 1: Filtrar por tiempo
+	for i := 0; i < 10; i++ {
+		entry := b.entries[i]
+		diferencia := now.Sub(entry.Datetime).Minutes() // líneas 90-92
+
+		if diferencia < 90 { // réplica línea 94: if(diferencia < maximumtime)
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+// CalculateAverageSpeed90Min - Calcula promedio del filtrado (réplica línea 96+105)
+func (b *FixedCircularBuffer) CalculateAverageSpeed90Min() float64 {
+	filtered := b.GetEntriesInTimeWindow90Min() // PASO 1: Obtener filtrado
+	if len(filtered) == 0 {
+		return 0
+	}
+
+	totalSpeed := 0.0
+	// PASO 2: Promediar las velocidades filtradas
+	for _, entry := range filtered {
+		totalSpeed += float64(entry.Speed) // réplica: averageKm += data["km"]
+	}
+
+	return totalSpeed / float64(len(filtered)) // réplica línea 105
+}
+
+// CalculateAverageGSMLast5 - Calcula GSM promedio últimos 5 del filtrado (réplica líneas 97-98 + 106)
+func (b *FixedCircularBuffer) CalculateAverageGSMLast5() float64 {
+	filtered := b.GetEntriesInTimeWindow90Min() // PASO 1: Obtener filtrado por tiempo
+	if len(filtered) == 0 {
+		return 0
+	}
+
+	// CRÍTICO: GPSgate usa count>5 DE LA ITERACIÓN, no últimos 5
+	totalGSM := 0.0
+	count := 0
+
+	// PASO 2: Calcular promedio GSM desde posición 6 en adelante (count>5)
+	for i, entry := range filtered {
+		iterationCount := i + 1 // count++ en GPSgate línea 87
+		if iterationCount > 5 { // réplica if(count>5) línea 97
+			totalGSM += float64(entry.GSMSignalStrength)
+			count++ // totalSignalLevel += 1 línea 98
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return totalGSM / float64(count) // réplica línea 106
+}
+
+// InitializeFixedBuffers - Inicializar sistema completo
+func InitializeFixedBuffers(retention time.Duration) {
+	GlobalBufferManager = &BufferManager{
+		buffers:   make(map[string]*FixedCircularBuffer),
+		retention: retention,
+	}
+	log.Println("🧠 Memory Buffer inicializado: 10 posiciones fijas por IMEI")
+
+	// CRÍTICO: Lanzar goroutine de limpieza para evitar memory leak en producción
+	// Sin esto → proceso muere en 3-12 meses con millones de IMEIs
+	go GlobalBufferManager.startCleanupRoutine()
+}
+
+// GetOrCreateBuffer - Thread-safe buffer access
+func (bm *BufferManager) GetOrCreateBuffer(imei string) *FixedCircularBuffer {
+	bm.mutex.Lock()
+	defer bm.mutex.Unlock()
+
+	if buffer, exists := bm.buffers[imei]; exists {
+		// Actualizar lastUpdate para que no sea eliminado por cleanup
+		buffer.lastUpdate = time.Now()
+		return buffer
+	}
+
+	newBuffer := &FixedCircularBuffer{
+		size:       0,
+		lastUpdate: time.Now(),
+	}
+	bm.buffers[imei] = newBuffer
+	return newBuffer
+}
+
+// startCleanupRoutine - CRÍTICO: Limpia buffers inactivos cada 24 horas
+// Previene memory leak con millones de IMEIs históricos
+func (bm *BufferManager) startCleanupRoutine() {
+	ticker := time.NewTicker(24 * time.Hour) // Cleanup cada 24 horas
+	defer ticker.Stop()
+
+	log.Println("🧹 Cleanup routine iniciado: cada 24 horas")
+
+	for {
+		select {
+		case <-ticker.C:
+			bm.cleanupInactiveBuffers()
+		}
+	}
+}
+
+// cleanupInactiveBuffers - Elimina buffers que no han sido usados por retention time
+func (bm *BufferManager) cleanupInactiveBuffers() {
+	bm.mutex.Lock()
+	defer bm.mutex.Unlock()
+
+	now := time.Now()
+	deletedCount := 0
+	initialCount := len(bm.buffers)
+
+	for imei, buffer := range bm.buffers {
+		// Si no ha sido usado por más tiempo que retention, eliminarlo
+		if now.Sub(buffer.lastUpdate) > bm.retention {
+			delete(bm.buffers, imei)
+			deletedCount++
+		}
+	}
+
+	finalCount := len(bm.buffers)
+	log.Printf("🧹 Cleanup completado: %d buffers eliminados, %d → %d activos",
+		deletedCount, initialCount, finalCount)
+}
+
+// FUNCIONES PÚBLICAS para usar en persistent_state.go:
+
+func AddToBuffer(imei string, speed int64, gsmSignal int64, datetime time.Time,
+	posStatus string, lat, lon float64) bool {
+	if GlobalBufferManager == nil {
+		log.Printf("⚠️ BufferManager no inicializado")
+		return false
+	}
+
+	buffer := GlobalBufferManager.GetOrCreateBuffer(imei)
+	entry := BufferEntry{
+		IMEI:              imei,
+		Datetime:          datetime,
+		Speed:             speed, // YA EN KM/H
+		GSMSignalStrength: gsmSignal,
+		PositioningStatus: posStatus,
+		Latitude:          lat,
+		Longitude:         lon,
+	}
+
+	hasExactly10 := buffer.AddEntry(entry) // Réplica doit de GPSgate
+	return hasExactly10
+}
+
+func GetAverageSpeed90Min(imei string) float64 {
+	if GlobalBufferManager == nil {
+		return 0
+	}
+	buffer := GlobalBufferManager.GetOrCreateBuffer(imei)
+	return buffer.CalculateAverageSpeed90Min()
+}
+
+func GetAverageGSMLast5(imei string) float64 {
+	if GlobalBufferManager == nil {
+		return 0
+	}
+	buffer := GlobalBufferManager.GetOrCreateBuffer(imei)
+	return buffer.CalculateAverageGSMLast5()
+}
+
+func HasExactly10Positions(imei string) bool {
+	if GlobalBufferManager == nil {
+		return false
+	}
+	buffer := GlobalBufferManager.GetOrCreateBuffer(imei)
+	buffer.mutex.RLock()
+	defer buffer.mutex.RUnlock()
+	return buffer.size == 10
+}
+
+func GetBufferSize(imei string) int {
+	if GlobalBufferManager == nil {
+		return 0
+	}
+	buffer := GlobalBufferManager.GetOrCreateBuffer(imei)
+	buffer.mutex.RLock()
+	defer buffer.mutex.RUnlock()
+	return buffer.size
+}
+
+// GetBufferEntries retorna una copia del buffer circular para auditoría (thread-safe)
+func GetBufferEntries(imei string) []BufferEntry {
+	if GlobalBufferManager == nil {
+		return []BufferEntry{}
+	}
+
+	buffer := GlobalBufferManager.GetOrCreateBuffer(imei)
+	buffer.mutex.RLock()
+	defer buffer.mutex.RUnlock()
+
+	// Copiar solo las entradas válidas (0 hasta buffer.size)
+	result := make([]BufferEntry, buffer.size)
+	copy(result, buffer.entries[0:buffer.size])
+	return result
+}

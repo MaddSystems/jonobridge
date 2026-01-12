@@ -1,0 +1,1857 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="card">
+        <div class="card-header bg-primary text-white">
+            <div class="d-flex justify-content-between align-items-center">
+                <h2 class="mb-0">Setup for Client: {{ client.name }}</h2>
+                <a href="{{ url_for('clients') }}" class="btn btn-outline-light">
+                    <i class="fas fa-arrow-left"></i> Back to Clients
+                </a>
+            </div>
+        </div>
+        <div class="card-body p-0" style="height: 80vh; position: relative;">
+            <div class="workflow-controls p-3">
+                <button onclick="addListener()" class="btn btn-primary btn-sm">Add Input</button>
+                <button onclick="addProtocol()" id="addProtocolBtn" class="btn btn-primary btn-sm" disabled>Add Interpreter</button>
+                <button onclick="addService()" id="addServiceBtn" class="btn btn-primary btn-sm" disabled>Add Integration</button>
+                <button onclick="deleteSelectedNode()" id="deleteBtn" class="btn btn-danger btn-sm" disabled>Delete Node</button>
+                <button onclick="saveWorkflow()" id="saveBtn" class="btn btn-success btn-sm">Save</button>
+            </div>
+            <div id="workflow-container" class="workflow-area position-relative">
+                <div class="table-responsive">
+                    <table class="workflow-grid">
+                        <colgroup>
+                            <col class="service-column">
+                            <col class="interpreter-column">
+                            <col class="integration-column">
+                        </colgroup>
+                        <thead>
+                            <tr>
+                                <th>Inputs</th>
+                                <th>Interpreters</th>
+                                <th>Integrations</th>
+                            </tr>
+                        </thead>
+                        <tbody id="workflow-grid-body">
+                            <tr>
+                                <td style="height: 100px; min-height: 100px;"></td>
+                                <td style="height: 100px; min-height: 100px;"></td>
+                                <td style="height: 100px; min-height: 100px;"></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="parameterModal" tabindex="-1" aria-labelledby="parameterModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="parameterModalLabel">Configure Parameters</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="parameterModalBody">
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-primary save-parameters">Save changes</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="serviceSelectionModal" tabindex="-1" aria-labelledby="serviceSelectionModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="serviceSelectionModalLabel">Select Service</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="list-group" id="serviceSelectionList">
+                    <!-- Service options will be populated dynamically -->
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .workflow-controls {
+        background-color: #f8f9fa;
+        border-bottom: 1px solid #dee2e6;
+    }
+    .workflow-area {
+        position: relative;
+        width: 100%;
+        min-height: 800px;
+        border: 1px solid #ccc;
+        overflow: auto;
+        background: #f8f9fa;
+        padding: 20px;
+    }
+    .workflow-grid {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 20px;
+        margin-bottom: 20px;
+        table-layout: fixed;
+    }
+    .workflow-grid th {
+        text-align: center;
+        padding: 10px;
+        background-color: #f8f9fa;
+        border-bottom: 2px solid #dee2e6;
+        font-weight: bold;
+    }
+    .workflow-grid td {
+        vertical-align: top;
+        min-width: 250px;
+        padding: 15px;
+        position: relative;
+        border: 1px dashed #ddd;
+        background-color: rgba(255, 255, 255, 0.8);
+        height: 100px;
+    }
+    .workflow-grid .service-column {
+        width: 33%;
+    }
+    .workflow-grid .interpreter-column {
+        width: 33%;
+    }
+    .workflow-grid .integration-column {
+        width: 33%;
+    }
+    .node {
+        position: relative;
+        margin: 10px 0;
+        transition: all 0.3s ease;
+    }
+    .node {
+        position: absolute;
+        min-width: 200px;
+        background: white;
+        border: 2px solid #ddd;
+        border-radius: 4px;
+        padding: 20px;
+        cursor: pointer;
+        z-index: 2;
+        transition: all 0.2s ease;
+        width: 250px;
+        margin-bottom: 40px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .node.selected {
+        border: 2px solid #007bff;
+        box-shadow: 0 0 8px rgba(0, 123, 255, 0.9);
+        transform: scale(1.02);
+    }
+    .node-content {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+    .node-header {
+        font-weight: bold;
+        margin-bottom: 5px;
+    }
+    .connector {
+        width: 12px;
+        height: 12px;
+        background: #007bff;
+        border-radius: 50%;
+        position: absolute;
+        cursor: pointer;
+    }
+    .input { left: -6px; top: 50%; transform: translateY(-50%); }
+    .output { right: -6px; top: 50%; transform: translateY(-50%); }
+    .connection {
+        position: absolute;
+        height: 2px;
+        background-color: #007bff;
+        transform-origin: left center;
+        pointer-events: none;
+        z-index: 1;
+    }
+    .node-property {
+        display: flex;
+        gap: 5px;
+        align-items: center;
+    }
+    .node-property label {
+        min-width: 40px;
+    }
+    .node-property input {
+        width: 80px;
+        padding: 2px 4px;
+        font-size: 14px;
+    }
+    .protocol-select, .service-select {
+        width: 100%;
+        padding: 4px;
+        margin-top: 5px;
+    }
+    .workflow-controls button {
+        margin-right: 10px;
+    }
+    .parameter-values {
+        font-size: 12px;
+        color: #666;
+        text-align: center;
+    }
+    .parameter-suggestions {
+        position: absolute;
+        background: white;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        max-height: 200px;
+        overflow-y: auto;
+        width: 100%;
+        z-index: 1000;
+        display: none;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .parameter-suggestion-item {
+        padding: 8px 12px;
+        cursor: pointer;
+    }
+    .parameter-suggestion-item:hover {
+        background-color: #f8f9fa;
+    }
+    .parameter-input-container {
+        position: relative;
+        width: 100%;
+    }
+    .helper-button {
+        position: absolute;
+        right: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        background: none;
+        border: none;
+        color: #6c757d;
+        cursor: pointer;
+        padding: 4px 8px;
+    }
+    .helper-button:hover {
+        color: #0d6efd;
+    }
+</style>
+
+<script>
+    const container = document.getElementById('workflow-container');
+    let nodeCounter = 0;
+    let draggedNode = null;
+    let selectedConnector = null;
+    let connections = [];
+    let tempConnection = null;
+    let selectedNode = null;
+
+    // Track removed services globally
+    let removedServicesList = [];
+
+    const parameterModal = new bootstrap.Modal(document.getElementById('parameterModal'));
+
+    function openParameterModal(node, nodeType, serviceName) {
+        
+    console.log('Opening parameter modal with:', {
+        nodeType: nodeType,
+        providedServiceName: serviceName,
+        nodeDataServiceName: node.getAttribute('data-service-name')
+    });
+
+    const modal = document.getElementById('parameterModal');
+    const modalBody = modal.querySelector('.modal-body');
+    modalBody.innerHTML = '';
+
+    // If serviceName is not provided, get it from the dropdown
+    if (!serviceName) {
+        const select = node.querySelector('select');
+        if (select) {
+            serviceName = select.value;
+        }
+    }
+
+    // Get stored parameters from the node
+    const storedParams = node.getAttribute('data-parameters');
+    const parameters = storedParams ? JSON.parse(storedParams) : {};
+
+    let service = null;
+    if (nodeType === 'service') {
+        service = SERVICES.find(s => s.service_name === serviceName);
+    } else if (nodeType === 'interpreter') {
+        service = INTERPRETERS.find(s => s.service_name === serviceName);
+    } else if (nodeType === 'integration') {
+        service = INTEGRATIONS.find(s => s.service_name === serviceName);
+    }
+
+    if (!service || !service.parameters) {
+        modalBody.innerHTML = '<p>No parameters available for this service.</p>';
+        return;
+    }
+
+    // Debug log to check service parameters structure
+    console.log('Service parameters structure:', {
+        service_name: serviceName,
+        parameters: service.parameters,
+        parameters_order: service.parameters_order,
+        isArray: Array.isArray(service.parameters)
+    });
+
+    // Get ordered parameter names for this service
+    let parameterNames = [];
+    
+    if (service.parameters_order) {
+        // Use explicit order if defined
+        parameterNames = service.parameters_order;
+    } else if (Array.isArray(service.parameters)) {
+        // If parameters is an array, maintain array order
+        parameterNames = service.parameters.map(p => p.name);
+    } else {
+        // If it's an object, try to use display_order or maintain insertion order
+        const entries = Object.entries(service.parameters);
+        parameterNames = entries
+            .map(([key, value]) => ({
+                key,
+                order: value.display_order || value.order || 999,
+                group: value.group || ''
+            }))
+            .sort((a, b) => {
+                // First sort by group
+                if (a.group !== b.group) {
+                    return a.group.localeCompare(b.group);
+                }
+                // Then by order
+                return a.order - b.order;
+            })
+            .map(entry => entry.key);
+    }
+
+    console.log('Parameters order:', {
+        original: Object.keys(service.parameters),
+        ordered: parameterNames,
+        serviceParams: service.parameters
+    });
+
+    // Create form elements for each parameter in order
+    let currentGroup = '';
+    parameterNames.forEach(key => {
+        if (!service.parameters.hasOwnProperty(key)) return;
+        
+        const paramConfig = service.parameters[key];
+        
+        // Handle group headers
+        if (paramConfig.group && paramConfig.group !== currentGroup) {
+            currentGroup = paramConfig.group;
+            const groupHeader = document.createElement('h6');
+            groupHeader.className = 'mt-3 mb-2 text-muted';
+            groupHeader.textContent = currentGroup;
+            modalBody.appendChild(groupHeader);
+        }
+
+        const formGroup = document.createElement('div');
+        formGroup.className = 'form-group mb-3';
+
+        const label = document.createElement('label');
+        label.textContent = paramConfig.display_name || key;
+        label.className = 'form-label';
+        
+        if (paramConfig.description) {
+            const description = document.createElement('small');
+            description.className = 'form-text text-muted d-block';
+            description.textContent = paramConfig.description;
+            label.appendChild(description);
+        }
+
+        const input = document.createElement('input');
+        input.type = paramConfig.type || (paramConfig.toLowerCase().includes('int') ? 'number' : 'text');
+        input.className = 'form-control';
+        input.name = key;
+        input.value = parameters[key] || paramConfig.default || '';
+        if (paramConfig.placeholder) {
+            input.placeholder = paramConfig.placeholder;
+        }
+
+        // Add helper button if there are suggested values
+        if (service.parameters_helpers && service.parameters_helpers[key]) {
+            const inputGroup = document.createElement('div');
+            inputGroup.className = 'input-group';
+
+            const helperButton = document.createElement('button');
+            helperButton.type = 'button';
+            helperButton.className = 'btn btn-outline-secondary helper-button';
+            helperButton.innerHTML = '💡';
+
+            helperButton.onclick = () => {
+                const existingDropdown = inputGroup.querySelector('.dropdown-menu');
+                if (existingDropdown) {
+                    existingDropdown.remove();
+                    return;
+                }
+
+                const suggestions = service.parameters_helpers[key];
+                const dropdown = document.createElement('div');
+                dropdown.className = 'dropdown-menu show';
+                dropdown.style.position = 'absolute';
+                dropdown.style.left = '0';
+                dropdown.style.top = '100%';
+
+                suggestions.forEach(suggestion => {
+                    const item = document.createElement('a');
+                    item.className = 'dropdown-item';
+                    item.href = '#';
+                    item.textContent = suggestion;
+                    item.onclick = (e) => {
+                        e.preventDefault();
+                        input.value = suggestion;
+                        dropdown.remove();
+                    };
+                    dropdown.appendChild(item);
+                });
+
+                formGroup.querySelectorAll('.dropdown-menu').forEach(el => el.remove());
+                inputGroup.appendChild(dropdown);
+            };
+
+            inputGroup.appendChild(input);
+            inputGroup.appendChild(helperButton);
+            formGroup.appendChild(label);
+            formGroup.appendChild(inputGroup);
+        } else {
+            formGroup.appendChild(label);
+            formGroup.appendChild(input);
+        }
+
+        modalBody.appendChild(formGroup);
+    });
+
+    // Update save handler
+    const saveButton = modal.querySelector('.save-parameters');
+    saveButton.onclick = () => {
+        const parameters = {};
+        
+        parameterNames.forEach(key => {
+            const input = modalBody.querySelector(`input[name="${key}"]`);
+            if (input) {
+                parameters[key] = input.value;
+            }
+        });
+        
+        node.setAttribute('data-parameters', JSON.stringify(parameters));
+        
+        // Update the parameter status label
+        const paramStatus = node.querySelector('.param-status');
+        if (paramStatus) {
+            const paramCount = Object.keys(parameters).length;
+            paramStatus.textContent = paramCount > 0 ? `${paramCount} parameter${paramCount !== 1 ? 's' : ''} configured` : 'No parameters configured';
+        }
+        
+        parameterModal.hide();
+    };
+
+    parameterModal.show();
+}
+
+    // Service type mapping
+    const SERVICE_TYPES = {
+        'service': 'Input',
+        'interpreter': 'Interpreter',
+        'integration': 'Integration'
+    };
+
+    function getServiceListByType(type) {
+        switch(type) {
+            case 'service':
+                return SERVICES || [];
+            case 'interpreter':
+                return INTERPRETERS || [];
+            case 'integration':
+                return INTEGRATIONS || [];
+            default:
+                console.error('Unknown service type:', type);
+                return [];
+        }
+    }
+
+    function getServiceConfig(serviceName) {
+        // Try to find the service in each list
+        let service = SERVICES.find(s => s.service_name === serviceName);
+        if (service) return service;
+
+        service = INTERPRETERS.find(s => s.service_name === serviceName);
+        if (service) return service;
+
+        service = INTEGRATIONS.find(s => s.service_name === serviceName);
+        if (service) return service;
+
+        return null;
+    }
+
+    function createNodeElement(type, properties = {}) {
+        const node = document.createElement('div');
+        node.className = 'node';
+        node.setAttribute('data-type', type);
+        node.id = properties.id || `node-${++nodeCounter}`;
+        
+        // Create node content
+        const nodeContent = document.createElement('div');
+        nodeContent.className = 'node-content';
+        
+        // Add type label
+        const typeLabel = document.createElement('div');
+        typeLabel.className = 'node-type';
+        typeLabel.innerHTML = `<strong><em>${SERVICE_TYPES[type]}</em></strong>`;
+        typeLabel.addEventListener('click', function(e) {
+           // alert("node clicked - type label");
+            console.log('=== Node Clicked (type label) ===');
+            if (!window.isDragging) {
+                e.preventDefault();
+                e.stopPropagation();
+                selectNode(node);
+            }
+        }, true); // Use capturing phase
+
+        nodeContent.appendChild(typeLabel);
+        
+        // Add service name label
+        const serviceLabel = document.createElement('div');
+        serviceLabel.className = 'service-label';
+        serviceLabel.textContent = properties.serviceName || 'Select service...';
+        serviceLabel.addEventListener('click', function(e) {
+            console.log("NODE_CLICKED - Service Label");
+            selectNode(node);
+            e.stopPropagation();
+        });
+        nodeContent.appendChild(serviceLabel);
+        
+        // Add parameter status and configure button
+        const paramStatus = document.createElement('div');
+        paramStatus.className = 'param-status text-muted';
+        
+        // Check if we have parameters
+        const params = properties.parameters || {};
+        const paramCount = Object.keys(params).length;
+        if (paramCount > 0) {
+            paramStatus.textContent = `${paramCount} parameter${paramCount !== 1 ? 's' : ''} configured`;
+            console.log('Parameters found:', params);
+        } else {
+            paramStatus.textContent = 'No parameters configured';
+        }
+        
+        nodeContent.appendChild(paramStatus);
+        
+        const configBtn = document.createElement('button');
+        configBtn.className = 'btn btn-sm btn-outline-primary mt-2';
+        configBtn.textContent = 'Configure';
+        configBtn.addEventListener('click', function(e) {
+            console.log('Configure button clicked');
+            e.preventDefault();
+            e.stopPropagation();
+            openParameterModal(node, node.getAttribute('data-type'), node.getAttribute('data-service-name'));
+        }, true);
+        nodeContent.appendChild(configBtn);
+        
+        // Add connectors
+        const inputConnector = document.createElement('div');
+        inputConnector.className = 'connector input';
+        inputConnector.onclick = handleConnectorClick;
+        
+        const outputConnector = document.createElement('div');
+        outputConnector.className = 'connector output';
+        outputConnector.onclick = handleConnectorClick;
+        
+        // Only append input connector if not a service node
+        if (type !== 'service') {
+            node.appendChild(inputConnector);
+        }
+        node.appendChild(nodeContent);
+        node.appendChild(outputConnector);
+        
+        // Set up drag handling
+        node.addEventListener('mousedown', handleDragStart);
+        
+        // Simple node selection without DOM checks
+        node.addEventListener('click', function(e) {
+            // Check if click originated from configure button
+            const clickedButton = e.target.closest('.btn');
+            if (clickedButton) {
+                console.log('Click came from configure button, skipping node selection');
+                return;
+            }
+            
+            // Only stop propagation
+            e.stopPropagation();
+            selectNode(node);
+        });
+
+        // Set service name if provided
+        if (properties.serviceName) {
+            node.setAttribute('data-service-name', properties.serviceName);
+        }
+        
+        // Set parameters if provided
+        if (properties.parameters) {
+            node.setAttribute('data-parameters', JSON.stringify(properties.parameters));
+        } else {
+            node.setAttribute('data-parameters', '{}');
+        }
+        
+        return node;
+    }
+    
+    function showServiceSelectionModal(type, callback) {
+        const modal = new bootstrap.Modal(document.getElementById('serviceSelectionModal'));
+        const modalTitle = document.getElementById('serviceSelectionModalLabel');
+        const serviceList = document.getElementById('serviceSelectionList');
+        
+        // Clear previous options
+        serviceList.innerHTML = '';
+        
+        // Set modal title based on type
+        modalTitle.textContent = `Select ${type.charAt(0).toUpperCase() + type.slice(1)}`;
+        
+        // Get available services based on type and parent node
+        let availableServices = [];
+        
+        if (type === 'service') {
+            // Check existing services to enforce listener/proxy rules
+            const existingNodes = Array.from(container.querySelectorAll('.node[data-type="service"]'));
+            const hasListener = existingNodes.some(node => 
+                node.getAttribute('data-service-name') === 'listener'
+            );
+            const hasProxy = existingNodes.some(node => 
+                node.getAttribute('data-service-name') === 'proxy'
+            );
+
+            // Filter available services based on existing nodes
+            availableServices = SERVICES.filter(service => {
+                if (service.service_name === 'listener') {
+                    return !hasListener && !hasProxy;
+                } else if (service.service_name === 'proxy') {
+                    return !hasProxy && !hasListener;
+                }
+                return true;
+            });
+
+            // Add warning message if listener/proxy are disabled
+            if (hasListener || hasProxy) {
+                const warningDiv = document.createElement('div');
+                warningDiv.className = 'alert alert-warning mb-3';
+                warningDiv.textContent = hasListener ? 
+                    'A listener service is already configured. You cannot add another listener or proxy service.' :
+                    'A proxy service is already configured. You cannot add another proxy or listener service.';
+                serviceList.appendChild(warningDiv);
+            }
+        } 
+        else if (type === 'interpreter' && selectedNode) {
+            // For interpreters, filter based on parent input service
+            const parentService = selectedNode.getAttribute('data-service-name');
+            console.log('Parent service:', parentService);
+            
+            // Find the input service in the hierarchy
+            const inputService = SERVICE_HIERARCHY.Input.find(input => input.name === parentService);
+            console.log('Found input service in hierarchy:', inputService);
+            
+            if (inputService && inputService.Interpreter) {
+                // Get list of valid interpreter names
+                const validInterpreters = inputService.Interpreter.map(int => int.name);
+                console.log('Valid interpreters for this input:', validInterpreters);
+                
+                // Filter INTERPRETERS to only include valid ones
+                availableServices = INTERPRETERS.filter(interpreter => 
+                    validInterpreters.includes(interpreter.service_name)
+                );
+                console.log('Filtered interpreters:', availableServices);
+            }
+        } 
+        else if (type === 'integration' && selectedNode) {
+            // For integrations, filter based on parent interpreter and its parent input
+            const interpreterName = selectedNode.getAttribute('data-service-name');
+            
+            // Find the parent input service by traversing connections
+            const parentConnection = Array.from(container.querySelectorAll('.connection'))
+                .find(conn => conn.getAttribute('data-to') === selectedNode.id);
+            
+            if (parentConnection) {
+                const inputNode = document.getElementById(parentConnection.getAttribute('data-from'));
+                const inputName = inputNode.getAttribute('data-service-name');
+                console.log('Parent input service:', inputName);
+                console.log('Current interpreter:', interpreterName);
+                
+                // Find in hierarchy
+                const inputService = SERVICE_HIERARCHY.Input.find(input => input.name === inputName);
+                if (inputService) {
+                    const interpreterConfig = inputService.Interpreter.find(int => int.name === interpreterName);
+                    if (interpreterConfig) {
+                        // Get valid integration names
+                        const validIntegrations = interpreterConfig.integration;
+                        console.log('Valid integrations for this interpreter:', validIntegrations);
+                        
+                        // Filter INTEGRATIONS to only include valid ones
+                        availableServices = INTEGRATIONS.filter(integration =>
+                            validIntegrations.includes(integration.service_name)
+                        );
+                        console.log('Filtered integrations:', availableServices);
+                    }
+                }
+            }
+        }
+        
+        // Sort available services alphabetically by service_name
+        availableServices.sort((a, b) => a.service_name.localeCompare(b.service_name));
+        
+        // Create service options
+        if (availableServices.length === 0) {
+            const message = document.createElement('div');
+            message.className = 'alert alert-info';
+            message.textContent = 'No compatible services available for the selected parent node.';
+            serviceList.appendChild(message);
+        } else {
+            availableServices.forEach(service => {
+                const option = document.createElement('button');
+                option.className = 'list-group-item list-group-item-action';
+                option.textContent = service.service_name;
+                option.onclick = () => {
+                    callback(service);
+                    modal.hide();
+                };
+                serviceList.appendChild(option);
+            });
+        }
+        
+        modal.show();
+    }
+
+    function addListener() {
+        showServiceSelectionModal('service', (service) => {
+            const node = createNodeElement('service', { serviceName: service.service_name });
+            document.getElementById('workflow-container').appendChild(node);
+            organizeNodesInTable();
+            updateToolbarButtons();
+        });
+    }
+    
+    function addProtocol() {
+        if (!selectedNode || selectedNode.getAttribute('data-type') !== 'service') {
+            return;
+        }
+        showServiceSelectionModal('interpreter', (service) => {
+            const node = createNodeElement('interpreter', { serviceName: service.service_name });
+            document.getElementById('workflow-container').appendChild(node);
+            
+            const sourceConnector = selectedNode.querySelector('.connector.output');
+            const targetConnector = node.querySelector('.connector.input');
+            createConnection(sourceConnector, targetConnector);
+            
+            organizeNodesInTable();
+            updateToolbarButtons();
+        });
+    }
+    
+    function addService() {
+        if (!selectedNode || selectedNode.getAttribute('data-type') !== 'interpreter') {
+            return;
+        }
+        showServiceSelectionModal('integration', (service) => {
+            const node = createNodeElement('integration', { serviceName: service.service_name });
+            document.getElementById('workflow-container').appendChild(node);
+            
+            const sourceConnector = selectedNode.querySelector('.connector.output');
+            const targetConnector = node.querySelector('.connector.input');
+            createConnection(sourceConnector, targetConnector);
+            
+            organizeNodesInTable();
+            updateToolbarButtons();
+        });
+    }
+
+    function initializeWorkflowTable() {
+        const container = document.querySelector('.table-responsive');
+        if (!container) return;
+
+        // Check if table already exists
+        let table = container.querySelector('.workflow-grid');
+        if (!table) {
+            // Create table structure
+            table = document.createElement('table');
+            table.className = 'workflow-grid';
+            
+            // Create colgroup
+            const colgroup = document.createElement('colgroup');
+            ['service-column', 'interpreter-column', 'integration-column'].forEach(className => {
+                const col = document.createElement('col');
+                col.className = className;
+                colgroup.appendChild(col);
+            });
+            table.appendChild(colgroup);
+            
+            // Create header
+            const thead = document.createElement('thead');
+            const headerRow = document.createElement('tr');
+            ['Services', 'Interpreters', 'Integrations'].forEach(text => {
+                const th = document.createElement('th');
+                th.textContent = text;
+                headerRow.appendChild(th);
+            });
+            thead.appendChild(headerRow);
+            table.appendChild(thead);
+            
+            // Create tbody with initial row
+            const tbody = document.createElement('tbody');
+            tbody.id = 'workflow-grid-body';
+            const row = document.createElement('tr');
+            ['service', 'interpreter', 'integration'].forEach(() => {
+                const td = document.createElement('td');
+                td.style.height = '100px';
+                td.style.minHeight = '100px';
+                row.appendChild(td);
+            });
+            tbody.appendChild(row);
+            table.appendChild(tbody);
+            
+            container.appendChild(table);
+        }
+
+        // Ensure tbody exists and has at least one row
+        let tbody = table.querySelector('#workflow-grid-body');
+        if (!tbody) {
+            tbody = document.createElement('tbody');
+            tbody.id = 'workflow-grid-body';
+            table.appendChild(tbody);
+        }
+
+        if (!tbody.firstElementChild) {
+            const row = document.createElement('tr');
+            ['service', 'interpreter', 'integration'].forEach(() => {
+                const td = document.createElement('td');
+                td.style.height = '100px';
+                td.style.minHeight = '100px';
+                row.appendChild(td);
+            });
+            tbody.appendChild(row);
+        }
+    }
+
+    function organizeNodesInTable() {
+        // Initialize table if needed
+        initializeWorkflowTable();
+        
+        const tbody = document.getElementById('workflow-grid-body');
+        if (!tbody || !tbody.firstElementChild) {
+            console.error('Workflow grid body not found or empty');
+            return;
+        }
+
+        const nodes = Array.from(document.querySelectorAll('.node'));
+        
+        // Get the cells from the first row
+        const cells = tbody.firstElementChild.children;
+        const [serviceTd, interpreterTd, integrationTd] = cells;
+        
+        if (!serviceTd || !interpreterTd || !integrationTd) {
+            console.error('Table cells not found');
+            return;
+        }
+
+        // Clear existing content
+        serviceTd.innerHTML = '';
+        interpreterTd.innerHTML = '';
+        integrationTd.innerHTML = '';
+
+        const services = nodes.filter(n => n.getAttribute('data-type') === 'service');
+        const interpreters = nodes.filter(n => n.getAttribute('data-type') === 'interpreter');
+        const integrations = nodes.filter(n => n.getAttribute('data-type') === 'integration');
+
+        // Add nodes to their respective columns
+        const appendNode = (node, cell) => {
+            console.log('Starting appendNode:', {
+                type: node.getAttribute('data-type'),
+                service: node.getAttribute('data-service-name')
+            });
+
+            // Create new node
+            const newNode = document.createElement('div');
+            newNode.className = 'node';
+            
+            // Copy attributes
+            for (const attr of node.attributes) {
+                newNode.setAttribute(attr.name, attr.value);
+            }
+            
+            // Copy inner HTML
+            newNode.innerHTML = node.innerHTML;
+            
+            // Add styles directly
+            newNode.style.cssText = `
+                position: relative;
+                left: 0;
+                top: 0;
+                margin-bottom: 10px;
+                width: 100%;
+                cursor: pointer;
+                border: 1px solid #ddd;
+                padding: 10px;
+                background: white;
+                transition: all 0.2s ease;
+            `;
+
+            // Debug click handlers - multiple event types
+            newNode.addEventListener('click', function(e) {
+               // alert("node clicked - click event");
+                console.log('=== Node Clicked (click) ===');
+                // Check if click originated from configure button
+                const clickedButton = e.target.closest('.btn');
+                if (clickedButton) {
+                    console.log('Click came from configure button, skipping node selection');
+                    return;
+                }
+                
+                if (!window.isDragging) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    selectNode(this);
+                }
+            }, true); // Use capturing phase
+
+            newNode.addEventListener('mousedown', function(e) {
+                // alert("node clicked - mousedown event");
+                console.log('=== Node Clicked (mousedown) ===');
+                if (!window.isDragging) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    selectNode(this);
+                }
+            }, true); // Use capturing phase
+
+            // Make the entire node content clickable
+            const nodeContent = newNode.querySelector('.node-content');
+            if (nodeContent) {
+                nodeContent.addEventListener('click', function(e) {
+                    // Check if click came from configure button
+                    const clickedButton = e.target.closest('.btn');
+                    if (clickedButton) {
+                        console.log('Content click came from configure button, skipping');
+                        return;
+                    }
+                    
+                    alert("content clicked");
+                    console.log('=== Content Clicked ===');
+                    if (!window.isDragging) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        selectNode(newNode);
+                    }
+                }, true);
+            }
+
+            // Add connector handlers
+            ['input', 'output'].forEach(type => {
+                const connector = newNode.querySelector(`.connector.${type}`);
+                if (connector) {
+                    connector.onclick = (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        handleConnectorClick(e);
+                    };
+                }
+            });
+
+            // Add configure button handler
+            const configBtn = newNode.querySelector('.btn');
+            if (configBtn) {
+                configBtn.addEventListener('click', function(e) {
+                    console.log('Configure button clicked - opening modal');
+                    e.preventDefault();
+                    e.stopPropagation();
+                    openParameterModal(newNode, newNode.getAttribute('data-type'), newNode.getAttribute('data-service-name'));
+                }, true);
+            }
+
+            // Add to DOM
+            console.log('Appending node to cell:', {
+                cellChildren: cell.children.length,
+                cellId: cell.id,
+                cellClass: cell.className
+            });
+            
+            cell.appendChild(newNode);
+            
+            // Verify node is in DOM
+            const addedNode = cell.querySelector(`[data-service-name="${newNode.getAttribute('data-service-name')}"]`);
+            console.log('Node in DOM after append:', {
+                found: !!addedNode,
+                classes: addedNode?.className,
+                parent: addedNode?.parentElement?.className
+            });
+
+            // Remove old node
+            if (node.parentNode) {
+                node.parentNode.removeChild(node);
+            }
+
+            return newNode;
+        };
+
+        services.forEach(node => appendNode(node, serviceTd));
+        interpreters.forEach(node => appendNode(node, interpreterTd));
+        integrations.forEach(node => appendNode(node, integrationTd));
+
+        // Update connections after a short delay to ensure nodes are positioned
+        setTimeout(() => {
+            updateConnections();
+        }, 100);
+    }
+
+    // Update loadSavedNodes to use table
+    function loadSavedNodes() {
+        console.log('Starting to load saved nodes...');
+        
+        // Initialize the table first
+        initializeWorkflowTable();
+        
+        // Instead of clearing the whole container, just remove existing nodes
+        const existingNodes = document.querySelectorAll('.node');
+        existingNodes.forEach(node => node.remove());
+        
+        if (!CLIENT_NODES) {
+            console.log('CLIENT_NODES is undefined or null');
+            return;
+        }
+
+        const nodesMap = new Map();
+        const nodesArray = Array.isArray(CLIENT_NODES) ? CLIENT_NODES : 
+            Object.entries(CLIENT_NODES).map(([service_name, data]) => ({
+                service_name,
+                ...data
+            }));
+
+        // Calculate weights based on saved connections
+        const nodeWeights = new Map();
+        const getTreeWeight = (nodeName, visited = new Set()) => {
+            if (visited.has(nodeName)) return 0;
+            visited.add(nodeName);
+            
+            let weight = 0;
+            if (SAVED_CONNECTIONS) {
+                SAVED_CONNECTIONS.forEach(conn => {
+                    if (conn.source?.service === nodeName) {
+                        weight += 2;
+                        weight += getTreeWeight(conn.target?.service, visited);
+                    }
+                    if (conn.target?.service === nodeName) {
+                        weight += 1;
+                        weight += getTreeWeight(conn.source?.service, visited);
+                    }
+                });
+            }
+            return weight;
+        };
+
+        nodesArray.forEach(node => {
+            const treeWeight = getTreeWeight(node.service_name);
+            nodeWeights.set(node.service_name, treeWeight);
+        });
+
+        // Sort nodes by tree weight
+        nodesArray.sort((a, b) => {
+            return (nodeWeights.get(b.service_name) || 0) - (nodeWeights.get(a.service_name) || 0);
+        });
+
+        const tbody = document.getElementById('workflow-grid-body');
+        if (!tbody || !tbody.firstElementChild) {
+            console.error('Table structure not found');
+            return;
+        }
+
+        nodesArray.forEach(nodeData => {
+            let nodeType = 'service';
+            if (INTERPRETERS.some(s => s.service_name === nodeData.service_name)) {
+                nodeType = 'interpreter';
+            } else if (INTEGRATIONS.some(s => s.service_name === nodeData.service_name)) {
+                nodeType = 'integration';
+            }
+
+            const node = createNodeElement(nodeType, {
+                serviceName: nodeData.service_name,
+                parameters: nodeData.parameters || {}
+            });
+            
+            // Instead of appending to container, we'll let organizeNodesInTable handle placement
+            document.body.appendChild(node); // Temporarily append to body
+            nodesMap.set(nodeData.service_name, {
+                node,
+                connectors: {
+                    output: node.querySelector('.output'),
+                    input: node.querySelector('.input')
+                }
+            });
+        });
+
+        if (SAVED_CONNECTIONS?.length > 0) {
+            SAVED_CONNECTIONS.forEach(conn => {
+                const sourceService = conn.source?.service;
+                const targetService = conn.target?.service;
+                
+                if (!sourceService || !targetService) return;
+
+                const sourceInfo = nodesMap.get(sourceService);
+                const targetInfo = nodesMap.get(targetService);
+
+                if (sourceInfo?.connectors.output && targetInfo?.connectors.input) {
+                    createConnection(sourceInfo.connectors.output, targetInfo.connectors.input);
+                }
+            });
+        }
+
+        // Now organize all nodes into the table
+        organizeNodesInTable();
+        updateToolbarButtons();
+    }
+
+    // Get the dynamic data from Flask
+    const SERVICES = {{ setup_services|tojson|safe }};
+    const INTERPRETERS = {{ setup_interpreters|tojson|safe }};
+    const INTEGRATIONS = {{ setup_integrations|tojson|safe }};
+    const CLIENT_NODES = {{ client_nodes|tojson|safe }};
+    const SAVED_CONNECTIONS = {{ connections|tojson|safe }};
+    const SERVICE_HIERARCHY = {{ service_hierarchy|tojson|safe }};
+    const CLIENT_ID = {{ client.id }};
+
+    // Debug log the data received from Flask
+    console.log('Initial data from server:', {
+        SERVICES,
+        INTERPRETERS,
+        INTEGRATIONS,
+        CLIENT_NODES,
+        SAVED_CONNECTIONS,
+        SERVICE_HIERARCHY
+    });
+
+    // Initialize saved nodes
+    document.addEventListener('DOMContentLoaded', function() {
+        initializeWorkflowTable(); // Initialize table first
+        loadSavedNodes();
+        updateToolbarButtons();
+    });
+
+    function selectNode(node) {
+        if (!node) return;
+        
+        console.log('Selecting node:', {
+            type: node.getAttribute('data-type'),
+            service: node.getAttribute('data-service-name')
+        });
+
+        // Clear previous selection
+        document.querySelectorAll('.node').forEach(n => {
+            n.classList.remove('selected');
+        });
+        
+        // Add selection to current node
+        node.classList.add('selected');
+        selectedNode = node;
+        
+        // Update toolbar state
+        updateToolbarButtons();
+        
+        console.log('Selection complete:', {
+            selectedNode: selectedNode.getAttribute('data-service-name'),
+            hasSelectedClass: selectedNode.classList.contains('selected')
+        });
+    }
+
+    function updateToolbarButtons() {
+        const addProtocolBtn = document.getElementById('addProtocolBtn');
+        const addServiceBtn = document.getElementById('addServiceBtn');
+        const deleteBtn = document.getElementById('deleteBtn');
+        
+        // Enable Add Protocol button when a service node is selected
+        addProtocolBtn.disabled = !selectedNode || selectedNode.getAttribute('data-type') !== 'service';
+        
+        // Enable Add Service button when an interpreter node is selected
+        addServiceBtn.disabled = !selectedNode || selectedNode.getAttribute('data-type') !== 'interpreter';
+        
+        // Enable Delete button when any node is selected
+        deleteBtn.disabled = !selectedNode;
+    }
+
+    function deleteSelectedNode() {
+        if (!selectedNode) return;
+        
+        // Check if this is the only listener node
+        if (selectedNode.getAttribute('data-type') === 'listener') {
+            const listenerNodes = Array.from(container.querySelectorAll('.node[data-type="listener"]'));
+            if (listenerNodes.length === 1) {
+                alert('Cannot delete the only service node. At least one service is required.');
+                return;
+            }
+        }
+
+        // Get service name before removing the node
+        const serviceName = getNodeServiceName(selectedNode);
+        if (serviceName) {
+            removedServicesList.push(serviceName);
+            console.log("Added to removed services:", serviceName);
+            console.log("Current removed services list:", removedServicesList);
+        }
+
+        // Remove all connections to/from this node
+        removeNodeConnections(selectedNode);
+
+        // Remove the node itself
+        selectedNode.remove();
+        selectedNode = null;
+        updateToolbarButtons();
+
+        // Reorganize remaining nodes
+        organizeNodesInTable();
+    }
+
+    function removeNodeConnections(node) {
+        if (!node) return;
+        
+        const nodeId = node.id;
+        const connections = container.querySelectorAll('.connection');
+        
+        connections.forEach(connection => {
+            const fromId = connection.getAttribute('data-from');
+            const toId = connection.getAttribute('data-to');
+            
+            // Remove connection if it's connected to the node being deleted
+            if (fromId === nodeId || toId === nodeId) {
+                connection.remove();
+            }
+        });
+    }
+
+    // Helper function to get service name from node
+    function getNodeServiceName(node) {
+        return node.getAttribute('data-service-name');
+    }
+
+    // Drag handling variables
+    let isDragging = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let nodeStartX = 0;
+    let nodeStartY = 0;
+    
+    function handleDragStart(e) {
+        if (e.target.classList.contains('connector') || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON') {
+            return;
+        }
+        
+        isDragging = true;
+        draggedNode = e.currentTarget;
+        
+        // Get initial positions
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+        
+        // Get the current node position
+        const nodeStyle = window.getComputedStyle(draggedNode);
+        nodeStartX = parseInt(nodeStyle.left);
+        nodeStartY = parseInt(nodeStyle.top);
+        
+        // Add event listeners for drag movement and end
+        document.addEventListener('mousemove', handleDragMove);
+        document.addEventListener('mouseup', handleDragEnd);
+        
+        // Prevent text selection during drag
+        e.preventDefault();
+    }
+    
+    function handleDragMove(e) {
+        if (!isDragging || !draggedNode) return;
+        
+        // Calculate the distance moved
+        const dx = e.clientX - dragStartX;
+        const dy = e.clientY - dragStartY;
+        
+        // Update node position
+        draggedNode.style.left = `${nodeStartX + dx}px`;
+        draggedNode.style.top = `${nodeStartY + dy}px`;
+        
+        // Update connections
+        updateConnections();
+        
+        e.preventDefault();
+    }
+    
+    function handleDragEnd(e) {
+        if (!isDragging) return;
+        
+        isDragging = false;
+        draggedNode = null;
+        
+        // Remove event listeners
+        document.removeEventListener('mousemove', handleDragMove);
+        document.removeEventListener('mouseup', handleDragEnd);
+        
+        // Reorganize tree after drag
+        organizeNodesInTable();
+        
+        e.preventDefault();
+    }
+    
+    function updateConnections() {
+        requestAnimationFrame(() => {
+            const connections = container.querySelectorAll('.connection');
+            const containerRect = container.getBoundingClientRect();
+            
+            connections.forEach(connection => {
+                const sourceNode = document.getElementById(connection.getAttribute('data-from'));
+                const targetNode = document.getElementById(connection.getAttribute('data-to'));
+                
+                if (sourceNode && targetNode) {
+                    const output = sourceNode.querySelector('.connector.output');
+                    const input = targetNode.querySelector('.connector.input');
+                    
+                    if (output && input) {
+                        const outputRect = output.getBoundingClientRect();
+                        const inputRect = input.getBoundingClientRect();
+                        
+                        const x1 = outputRect.left + outputRect.width/2 - containerRect.left;
+                        const y1 = outputRect.top + outputRect.height/2 - containerRect.top;
+                        const x2 = inputRect.left + inputRect.width/2 - containerRect.left;
+                        const y2 = inputRect.top + inputRect.height/2 - containerRect.top;
+                        
+                        updateConnectionPosition(connection, x1, y1, x2, y2);
+                    }
+                }
+            });
+        });
+    }
+
+    function createConnection(output, input) {
+        if (!output || !input) return null;
+        
+        const connection = document.createElement('div');
+        connection.className = 'connection';
+        
+        // Get source and target nodes
+        const sourceNode = output.closest('.node');
+        const targetNode = input.closest('.node');
+        
+        if (!sourceNode || !targetNode) return null;
+        
+        // Store both node IDs and service names
+        connection.setAttribute('data-from', sourceNode.id);
+        connection.setAttribute('data-to', targetNode.id);
+        connection.setAttribute('data-source', sourceNode.getAttribute('data-service-name'));
+        connection.setAttribute('data-target', targetNode.getAttribute('data-service-name'));
+        
+        // Add connection to container
+        container.appendChild(connection);
+        
+        // Force immediate position update
+        requestAnimationFrame(() => {
+            const containerRect = container.getBoundingClientRect();
+            const outputRect = output.getBoundingClientRect();
+            const inputRect = input.getBoundingClientRect();
+            
+            const x1 = outputRect.left + outputRect.width/2 - containerRect.left;
+            const y1 = outputRect.top + outputRect.height/2 - containerRect.top;
+            const x2 = inputRect.left + inputRect.width/2 - containerRect.left;
+            const y2 = inputRect.top + inputRect.height/2 - containerRect.top;
+            
+            updateConnectionPosition(connection, x1, y1, x2, y2);
+        });
+        
+        return connection;
+    }
+
+    function updateConnectionPosition(connection, x1, y1, x2, y2) {
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const length = Math.sqrt(dx * dx + dy * dy);
+        const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+        
+        connection.style.width = `${length}px`;
+        connection.style.left = `${x1}px`;
+        connection.style.top = `${y1}px`;
+        connection.style.transform = `rotate(${angle}deg)`;
+    }
+
+    function handleConnectorClick(e) {
+        const connector = e.target;
+        const connectorType = connector.getAttribute('data-type');
+        const node = connector.closest('.node');
+        
+        if (connectorType === 'output') {
+            selectedConnector = connector;
+            document.addEventListener('mousemove', handleMouseMove);
+            document.addEventListener('mouseup', handleMouseUp);
+            createTempConnection(e);
+        } else if (connectorType === 'input' && selectedConnector) {
+            const sourceNode = selectedConnector.closest('.node');
+            const targetNode = node;
+            
+            if (isValidConnection(sourceNode, targetNode)) {
+                createConnection(selectedConnector, connector);
+            }
+        }
+        e.stopPropagation();
+    }
+
+    function createTempConnection(e) {
+        tempConnection = document.createElement('div');
+        tempConnection.className = 'connection';
+        container.appendChild(tempConnection);
+        updateTempConnection(e);
+    }
+
+    function handleMouseMove(e) {
+        if (tempConnection) {
+            updateTempConnection(e);
+        }
+    }
+
+    function handleMouseUp(e) {
+        if (tempConnection) {
+            tempConnection.remove();
+            tempConnection = null;
+        }
+        selectedConnector = null;
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.removeEventListener('mouseup', handleMouseUp);
+    }
+
+    function updateTempConnection(e) {
+        const start = selectedConnector.getBoundingClientRect();
+        const startX = start.left + start.width/2 - container.getBoundingClientRect().left;
+        const startY = start.top + start.height/2 - container.getBoundingClientRect().top;
+        const endX = e.clientX - container.getBoundingClientRect().left;
+        const endY = e.clientY - container.getBoundingClientRect().top;
+        
+        const dx = endX - startX;
+        const dy = endY - startY;
+        const length = Math.sqrt(dx * dx + dy * dy);
+        const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+        
+        // Position the connection line
+        tempConnection.style.width = `${length}px`;
+        tempConnection.style.left = `${startX}px`;
+        tempConnection.style.top = `${startY}px`;
+        tempConnection.style.transform = `rotate(${angle}deg)`;
+    }
+
+    function collectWorkflowData() {
+        console.log("Client ID:", CLIENT_ID);  
+        console.log("Collecting workflow data from nodes:", container.children.length);  
+
+        const nodes = Array.from(container.querySelectorAll('.node'));
+        const services = [];
+        const workflow_connections = [];
+        const connectionTracker = new Map(); // Track connections for debugging
+
+        nodes.forEach(node => {
+            const type = node.getAttribute('data-type');
+            const parameters = node.getAttribute('data-parameters');
+            const serviceName = getNodeServiceName(node);
+            
+            console.log("Processing node:", { type, serviceName, parameters });  
+
+            if (serviceName && parameters) {
+                try {
+                    const parsedParams = JSON.parse(parameters);
+                    // Convert all parameter values to strings
+                    const stringParams = {};
+                    for (const [key, value] of Object.entries(parsedParams)) {
+                        stringParams[key] = String(value);
+                    }
+                    services.push({
+                        name: serviceName,
+                        ...stringParams
+                    });
+                    console.log("Added service:", serviceName, stringParams);  
+                } catch (e) {
+                    console.error("Error parsing parameters for service", serviceName, e);
+                }
+            }
+        });
+
+        // Debug: Print all nodes before collecting connections
+        console.log("All nodes before collecting connections:", nodes.map(node => ({
+            id: node.id,
+            type: node.getAttribute('data-type'),
+            serviceName: getNodeServiceName(node)
+        })));
+
+        // Collect connections with duplicate checking
+        const connectionElements = container.querySelectorAll('.connection');
+        console.log("Found connection elements:", connectionElements.length);
+
+        connectionElements.forEach((conn, index) => {
+            const sourceNode = document.getElementById(conn.getAttribute('data-from'));
+            const targetNode = document.getElementById(conn.getAttribute('data-to'));
+            
+            const sourceName = sourceNode ? getNodeServiceName(sourceNode) : null;
+            const targetName = targetNode ? getNodeServiceName(targetNode) : null;
+            
+            console.log(`Connection ${index + 1}:`, {
+                sourceId: conn.getAttribute('data-from'),
+                targetId: conn.getAttribute('data-to'),
+                sourceName,
+                targetName,
+                sourceType: sourceNode?.getAttribute('data-type'),
+                targetType: targetNode?.getAttribute('data-type')
+            });
+
+            if (sourceName && targetName) {
+                const connectionKey = `${sourceName}->${targetName}`;
+                
+                // Only consider it a duplicate if both service names and node IDs are different
+                const existingConn = connectionTracker.get(connectionKey);
+                if (existingConn && 
+                    (existingConn.sourceId !== conn.getAttribute('data-from') || 
+                     existingConn.targetId !== conn.getAttribute('data-to'))) {
+                    console.warn('Duplicate connection detected:', {
+                        key: connectionKey,
+                        existing: existingConn,
+                        current: { sourceId: conn.getAttribute('data-from'), targetId: conn.getAttribute('data-to') }
+                    });
+                } else {
+                    connectionTracker.set(connectionKey, {
+                        sourceId: conn.getAttribute('data-from'),
+                        targetId: conn.getAttribute('data-to')
+                    });
+                }
+
+                workflow_connections.push({
+                    source: { 
+                        service: sourceName,
+                        id: conn.getAttribute('data-from')
+                    },
+                    target: { 
+                        service: targetName,
+                        id: conn.getAttribute('data-to')
+                    }
+                });
+            }
+        });
+
+        // Debug: Print connection tracking results
+        console.log("Connection tracking results:", {
+            uniqueConnections: Array.from(connectionTracker.entries()),
+            totalConnections: workflow_connections.length
+        });
+
+        const workflowData = {
+            client_id: CLIENT_ID,
+            services: services,
+            connections: workflow_connections,
+            removed_services: removedServicesList
+        };
+        
+        console.log("Final workflow data:", {
+            ...workflowData,
+            connectionDetails: {
+                total: workflow_connections.length,
+                unique: connectionTracker.size,
+                duplicatesFound: workflow_connections.length - connectionTracker.size
+            }
+        });
+        
+        return workflowData;
+    }
+
+    function saveWorkflow() {
+        console.log("Starting saveWorkflow");  
+        const saveBtn = document.getElementById('saveBtn');
+        const originalText = saveBtn.innerHTML;
+
+        // Check for unconfigured nodes first
+        const nodes = container.querySelectorAll('.node');
+        const unconfiguredNodes = [];
+        
+        nodes.forEach(node => {
+            const nodeId = node.id;
+            const nodeType = node.getAttribute('data-type');
+            const serviceName = getNodeServiceName(node);
+            
+            // Check for unconfigured parameters text
+            const configText = Array.from(node.querySelectorAll('div'))
+                .map(div => div.textContent.trim())
+                .find(text => text === 'No parameters configured');
+            
+            const hasUnconfiguredNotice = configText === 'No parameters configured';
+            const inputs = node.querySelectorAll('input[required], select[required]');
+            const hasEmptyRequired = Array.from(inputs).some(input => !input.value.trim());
+            
+            if (hasEmptyRequired || hasUnconfiguredNotice) {
+                unconfiguredNodes.push(serviceName || `${nodeType} (${nodeId})`);
+            }
+        });
+
+        if (unconfiguredNodes.length > 0) {
+            const toast = document.createElement('div');
+            toast.className = 'position-fixed top-50 start-50 translate-middle';
+            toast.style.zIndex = '5000';
+            toast.innerHTML = `
+                <div class="toast show" role="alert" aria-live="assertive" aria-atomic="true">
+                    <div class="toast-header bg-warning text-white">
+                        <strong class="me-auto">Warning: Unconfigured Nodes</strong>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="toast" aria-label="Close"></button>
+                    </div>
+                    <div class="toast-body">
+                        <div class="text-center">
+                            Cannot save workflow. The following nodes are not fully configured:<br>
+                            <strong>${unconfiguredNodes.join('<br>')}</strong><br>
+                            Please configure all required fields before saving.
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(toast);
+            
+            // Auto-remove toast after 3 seconds
+            setTimeout(() => {
+                toast.classList.add('fade');
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+
+            // Reset save button
+            saveBtn.innerHTML = originalText;
+            saveBtn.disabled = false;
+            return;
+        }
+
+        // First, clean up any duplicate DOM elements
+        const duplicateElements = document.querySelectorAll('.node .node');
+        duplicateElements.forEach(el => el.remove());
+
+        // Validate service configurations
+        const unconfiguredServices = validateServiceConfigurations();
+        if (unconfiguredServices.length > 0) {
+            const toast = document.createElement('div');
+            toast.className = 'position-fixed top-50 start-50 translate-middle';
+            toast.style.zIndex = '5000';
+            toast.innerHTML = `
+                <div class="toast show" role="alert" aria-live="assertive" aria-atomic="true">
+                    <div class="toast-header bg-warning text-white">
+                        <strong class="me-auto">Configuration Required</strong>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="toast" aria-label="Close"></button>
+                    </div>
+                    <div class="toast-body">
+                        <div class="text-center">
+                            The following services need to be configured:<br>
+                            <strong>${unconfiguredServices.join(', ')}</strong><br>
+                            Please configure all required parameters before saving.
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(toast);
+
+            setTimeout(() => {
+                toast.classList.add('fade');
+                setTimeout(() => toast.remove(), 300);
+            }, 4000);
+
+            return;
+        }
+
+        // Show loading state
+        saveBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span> Saving...';
+        saveBtn.disabled = true;
+
+        const workflowData = collectWorkflowData();
+        
+        console.log("Sending to /create_automation:", workflowData);  
+
+        // Send data to create_automation endpoint
+        fetch('/create_automation', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(workflowData)
+        })
+        .then(response => {
+            console.log("Response received:", response);  
+            return response.json();
+        })
+        .then(data => {
+            console.log("Parsed response data:", data);  
+
+            if (data.message && data.message.toLowerCase().includes('success')) {
+                // Show success message
+                const toast = document.createElement('div');
+                toast.className = 'position-fixed top-50 start-50 translate-middle';
+                toast.style.zIndex = '5000';
+                toast.innerHTML = `
+                    <div class="toast show" role="alert" aria-live="assertive" aria-atomic="true">
+                        <div class="toast-header bg-success text-white">
+                            <strong class="me-auto">Success</strong>
+                            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="toast" aria-label="Close"></button>
+                        </div>
+                        <div class="toast-body">
+                            <div class="text-center">Workflow saved successfully!</div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(toast);
+
+                // Auto remove after delay
+                setTimeout(() => {
+                    toast.classList.add('fade');
+                    setTimeout(() => toast.remove(), 300);
+                }, 2000);
+            } else {
+                // Show error message
+                const toast = document.createElement('div');
+                toast.className = 'position-fixed top-50 start-50 translate-middle';
+                toast.style.zIndex = '5000';
+                toast.innerHTML = `
+                    <div class="toast show" role="alert" aria-live="assertive" aria-atomic="true">
+                        <div class="toast-header bg-danger text-white">
+                            <strong class="me-auto">Error</strong>
+                            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="toast" aria-label="Close"></button>
+                        </div>
+                        <div class="toast-body">
+                            <div class="text-center">Error saving workflow: ${data.message || 'Unknown error'}</div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(toast);
+
+                // Auto remove after delay
+                setTimeout(() => {
+                    toast.classList.add('fade');
+                    setTimeout(() => toast.remove(), 300);
+                }, 3000);
+            }
+        })
+        .catch(error => {
+            console.error('Error in saveWorkflow:', error);  
+            // Show error message
+            const toast = document.createElement('div');
+            toast.className = 'position-fixed top-50 start-50 translate-middle';
+            toast.style.zIndex = '5000';
+            toast.innerHTML = `
+                <div class="toast show" role="alert" aria-live="assertive" aria-atomic="true">
+                    <div class="toast-header bg-danger text-white">
+                        <strong class="me-auto">Error</strong>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="toast" aria-label="Close"></button>
+                    </div>
+                    <div class="toast-body">
+                        <div class="text-center">Error saving workflow: ${error.message}</div>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(toast);
+
+            // Auto remove after delay
+            setTimeout(() => {
+                toast.classList.add('fade');
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        })
+        .finally(() => {
+            // Restore button state
+            saveBtn.innerHTML = originalText;
+            saveBtn.disabled = false;
+        });
+    }
+
+    // Function to validate connections based on service types
+    function isValidConnection(sourceNode, targetNode) {
+        if (!sourceNode || !targetNode) return false;
+
+        const sourceType = sourceNode.getAttribute('data-type');
+        const targetType = targetNode.getAttribute('data-type');
+        
+        if (!sourceType || !targetType) {
+            console.warn('Missing node types:', { sourceType, targetType });
+            return false;
+        }
+
+        // Define valid connection paths
+        const validConnections = {
+            'service': ['interpreter'],
+            'interpreter': ['integration'],
+            'integration': []
+        };
+
+        console.log('Validating connection:', {
+            sourceType,
+            targetType,
+            validTargets: validConnections[sourceType]
+        });
+        
+        return validConnections[sourceType]?.includes(targetType) || false;
+    }
+
+    // Helper function to find a matching service for connection
+    function findMatchingService(sourceService, targetService) {
+        if (!sourceService || !targetService) {
+            console.warn('Missing service names:', { sourceService, targetService });
+            return null;
+        }
+
+        const match = SAVED_CONNECTIONS.find(conn => 
+            conn.source_service === sourceService && 
+            conn.target_service === targetService
+        );
+
+        console.log('Finding matching service:', {
+            sourceService,
+            targetService,
+            found: !!match
+        });
+
+        return match;
+    }
+
+    function validateServiceConfigurations() {
+        const nodes = Array.from(container.querySelectorAll('.node'));
+        const unconfiguredServices = [];
+
+        console.log("Validating service configurations for nodes:", nodes.length);
+
+        for (const node of nodes) {
+            const serviceName = node.getAttribute('data-service-name');
+            const serviceConfig = getServiceConfig(serviceName);
+            const parameters = node.getAttribute('data-parameters');
+            const parsedParams = parameters ? JSON.parse(parameters) : {};
+
+            console.log("Checking service configuration:", {
+                serviceName,
+                hasConfig: !!serviceConfig,
+                parameters: parsedParams
+            });
+
+            if (serviceConfig && serviceConfig.parameters) {
+                for (const param of Object.values(serviceConfig.parameters)) {
+                    if (param.required && !parsedParams[param.name]) {
+                        console.warn(`Missing required parameter ${param.name} for service ${serviceName}`);
+                        unconfiguredServices.push(serviceName);
+                        break;
+                    }
+                }
+            }
+        }
+
+        console.log("Validation results:", {
+            totalNodes: nodes.length,
+            unconfiguredServices
+        });
+
+        return unconfiguredServices;
+    }
+
+    // Debug the data received from Flask
+    console.log('Services:', SERVICES);
+    console.log('Interpreters:', INTERPRETERS);
+    console.log('Integrations:', INTEGRATIONS);
+    console.log('Client Nodes:', CLIENT_NODES);
+    console.log('Saved Connections:', SAVED_CONNECTIONS);
+    console.log('Service Hierarchy:', SERVICE_HIERARCHY);
+</script>
+{% endblock %}

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <div class="card">
+        <div class="card-header bg-primary text-white">
+            <h2 class="mb-0">Deployment Results</h2>
+        </div>
+        <div class="card-body">
+            {% if status == 'success' %}
+                <div class="alert alert-success">
+                    <i class="fas fa-check-circle"></i> Deployment completed successfully!
+                </div>
+            {% else %}
+                <div class="alert alert-danger">
+                    <i class="fas fa-exclamation-circle"></i> Deployment failed!
+                </div>
+            {% endif %}
+
+            <div class="accordion" id="deploymentResults">
+                {% for result in results %}
+                    <div class="accordion-item">
+                        <h2 class="accordion-header" id="heading{{ loop.index }}">
+                            <button class="accordion-button {% if not loop.first %}collapsed{% endif %}" 
+                                    type="button" 
+                                    data-bs-toggle="collapse" 
+                                    data-bs-target="#collapse{{ loop.index }}">
+                                <div class="d-flex w-100 justify-content-between align-items-center">
+                                    <span class="command-text">{{ result.command }}</span>
+                                    {% if result.success %}
+                                        <span class="badge bg-success ms-2">Success</span>
+                                    {% else %}
+                                        <span class="badge bg-danger ms-2">Failed</span>
+                                    {% endif %}
+                                </div>
+                            </button>
+                        </h2>
+                        <div id="collapse{{ loop.index }}" 
+                             class="accordion-collapse collapse {% if loop.first %}show{% endif %}" 
+                             data-bs-parent="#deploymentResults">
+                            <div class="accordion-body">
+                                <pre class="bg-light p-3 rounded"><code>{{ result.output }}</code></pre>
+                            </div>
+                        </div>
+                    </div>
+                {% endfor %}
+            </div>
+
+            <div class="mt-4 text-center">
+                <a href="{{ url_for('status_page', client_id=client_id) }}" class="btn btn-primary">
+                    <i class="fas fa-chart-line"></i> View Deployment Status
+                </a>
+                <a href="{{ url_for('deploy', client_id=client_id) }}" class="btn btn-secondary">
+                    <i class="fas fa-arrow-left"></i> Back to Deployment
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.command-text {
+    font-family: monospace;
+    font-size: 0.9rem;
+}
+.accordion-button:not(.collapsed) {
+    background-color: #f8f9fa;
+}
+pre {
+    margin-bottom: 0;
+    white-space: pre-wrap;
+}
+</style>
+{% endblock %} 

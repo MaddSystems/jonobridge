@@ -1,0 +1,78 @@
+// ═══════════════════════════════════════════════════════════════════
+// name: Jammer-Wargames-DEFCON
+// ═══════════════════════════════════════════════════════════════════
+
+rule DEFCON0_Surveillance "DEFCON 0: Surveillance" salience 1000 {
+    when
+        !Jono.BufferUpdated
+    then
+        // 1. Actualizar Buffer y Offline status
+        // Nota: El reset de flags se recomienda hacer en Go antes de Execute()
+        Jono.BufferHas10 = state.UpdateMemoryBuffer(Jono.Speed, Jono.GSMSignalStrength, Jono.Datetime, Jono.PositioningStatus, Jono.Latitude, Jono.Longitude);
+        Jono.IsOfflineFor5Min = state.IsOfflineFor(5);
+        
+        // 2. Marcar como actualizado para activar las siguientes reglas
+        Jono.BufferUpdated = true;
+        actions.Log("[DEFCON 0] Surveillance Active. Buffer Updated.");
+}
+
+// --- DEFCON 1 ---
+
+rule DEFCON1_ContactLost_Pass "DEFCON 1: Contact Lost (V)" salience 900 {
+    when
+        Jono.BufferUpdated && Jono.PositioningStatus == "V" && !Jono.Cond1Passed
+    then
+        Jono.Cond1Passed = true;
+        actions.Log("[DEFCON 1] Positive: Status V detected.");
+        actions.Audit("DEFCON1_ContactLost_Pass", "Step 1: Contact Lost (V)", 900, false);
+}
+
+// --- DEFCON 2 ---
+
+rule DEFCON2_CalculateMetrics "DEFCON 2: Calculate Average Metrics" salience 850 {
+    when
+        Jono.Cond1Passed && Jono.BufferHas10 && !Jono.MetricsReady
+    then
+        // Extraer métricas del buffer de 90 min y últimas 5 posiciones
+        state.JammerAvgSpeed90min = state.GetAverageSpeed90Min(Jono.IMEI);
+        state.JammerAvgGsm5 = state.GetAverageGSMLast5(Jono.IMEI);
+        
+        Jono.MetricsReady = true;
+        actions.Log("[DEFCON 2] Metrics Ready: AvgSpeed=" + actions.CastString(state.JammerAvgSpeed90min) + " AvgGSM=" + actions.CastString(state.JammerAvgGsm5));
+}
+
+rule DEFCON2_Inhibition_Pass "DEFCON 2: Inhibition Confirmed" salience 800 {
+    when
+        Jono.MetricsReady && !Jono.Cond2Passed &&
+        state.JammerAvgSpeed90min >= 10 && 
+        state.JammerAvgGsm5 < 15
+    then
+        Jono.Cond2Passed = true;
+        actions.Log("[DEFCON 2] Positive: Inhibition Pattern Match (Moving & Low GSM).");
+        actions.Audit("DEFCON2_Inhibition_Pass", "Step 2: Inhibition Confirmed", 800, false);
+}
+
+// --- DEFCON 4 ---
+
+rule DEFCON4_JammerAlert_Fire "DEFCON 4: JAMMER ALERT" salience 600 {
+    when
+        Jono.Cond2Passed && Jono.IsOfflineFor5Min && 
+        !state.IsInsideGroup("Taller", Jono.Latitude, Jono.Longitude) && 
+        !state.IsInsideGroup("CLIENTES", Jono.Latitude, Jono.Longitude) &&
+        !state.JammerAlertSent
+    then
+        // Dejar constancia de que validamos geocercas (Paso 3 implícito)
+        actions.Audit("DEFCON3_SafeZones_Pass", "Step 3: Outside Safe Zones (Validated Final Check)", 700, false);
+
+        state.MarkAlertSent("jammer_real_mercury_2025");
+        actions.Log("[DEFCON 4] !!! JAMMER DETECTED !!!");
+        actions.Audit("DEFCON4_JammerAlert_Fire", "CRITICAL: JAMMER DETECTED", 600, true);
+        actions.SendTelegram(
+            "🚨 JAMMER REAL DETECTADO - IMEI: " + Jono.IMEI + "\n" +
+            "📋 DEFCON 4 ALCANZADO\n" +
+            "🚗 Vel Prom (90min): " + actions.CastString(state.JammerAvgSpeed90min) + " km/h\n" +
+            "📡 GSM Prom (últ 5): " + actions.CastString(state.JammerAvgGsm5) + "\n" +
+            "📍 Lat: " + actions.CastString(Jono.Latitude) + " | Lon: " + actions.CastString(Jono.Longitude) + "\n" +
+            "🕐 Hora: " + actions.CastString(Jono.Datetime)
+        );
+}

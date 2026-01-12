@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forwarder
+  namespace: client01
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: forwarder
+  template:
+    metadata:
+      labels:
+        app: forwarder
+    spec:
+      initContainers:
+        - name: wait-for-mosquitto
+          image: busybox
+          command: ['sh', '-c', 'until nc -z mosquitto-8500 1883; do echo waiting for mosquitto; sleep 2; done']
+      containers:
+        - name: forwarder
+          image: jordy33/forwarder:1.0.0
+          imagePullPolicy: Always # Force Kubernetes to pull the latest
+          ports:
+            - containerPort: 8081
+          env:
+            - name: MQTT_BROKER_HOST
+              value: "mosquitto-8500"
+            - name: FORWARDER_HOST
+              value: "server1.gpscontrol.com.mx:8500"

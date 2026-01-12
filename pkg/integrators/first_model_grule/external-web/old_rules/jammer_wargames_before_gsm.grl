@@ -1,0 +1,93 @@
+// ═══════════════════════════════════════════════════════════════════
+// name: Jammer-Wargames-DEFCON
+// ═══════════════════════════════════════════════════════════════════
+
+rule DEFCON0_Surveillance "DEFCON 0: Surveillance" salience 1000 {
+    when
+        true
+    then
+        // 1. Reset de Flags (Muy importante para cada nuevo paquete)
+        Jono.BufferUpdated = false;  // Force reset
+        Jono.MetricsReady = false;
+        Jono.AlertFired = false;
+        Jono.Cond1Passed = false;
+        Jono.Cond2Passed = false;
+        Jono.Cond3Passed = false;
+        Jono.Cond1Processed = false; 
+
+        // 2. Actualizar Buffer y Offline status
+        Jono.BufferHas10 = state.UpdateMemoryBuffer(Jono.Speed, Jono.GSMSignalStrength, Jono.Datetime, Jono.PositioningStatus, Jono.Latitude, Jono.Longitude);
+        Jono.IsOfflineFor5Min = state.IsOfflineFor(5);
+        
+        // 3. Marcar como actualizado para activar las siguientes reglas
+        Jono.BufferUpdated = true;
+        actions.Log("[DEFCON 0] Surveillance Active.");
+}
+
+// --- DEFCON 1 ---
+
+rule DEFCON1_ContactLost_Pass "DEFCON 1: Contact Lost (V)" salience 900 {
+    when
+        Jono.BufferUpdated && Jono.PositioningStatus == "V" && !Jono.Cond1Passed
+    then
+        Jono.Cond1Passed = true;
+        Jono.Cond1Processed = true;
+        actions.Log("[DEFCON 1] Positive: Position Lost.");
+        actions.Audit("DEFCON1_ContactLost_Pass", "Step 1: Contact Lost", 900, false);
+}
+
+rule DEFCON1_ContactLost_Fail_Valid "DEFCON 1: Position Valid (A)" salience 899 {
+    when
+        Jono.BufferUpdated && Jono.PositioningStatus == "A" && !Jono.Cond1Processed
+    then
+        Jono.Cond1Processed = true; // <-- ESTO DETIENE EL LOOP
+        actions.Log("[DEFCON 1] Negative: Position Valid.");
+        actions.Audit("DEFCON1_Fail_Valid", "Step 1 Fail: Valid Position", 899, false);
+}
+
+// --- DEFCON 2 ---
+
+rule DEFCON2_Calculate_Metrics "DEFCON 2: Metrics" salience 850 {
+    when
+        Jono.Cond1Passed && !Jono.MetricsReady
+    then
+        state.JammerPositions = state.GetCounter("jammer_positions_count");
+        state.JammerAvgSpeed90min = state.GetCounter("jammer_avg_speed_90min");
+        state.JammerAvgGsm5 = state.GetCounter("jammer_avg_gsm_last_5");
+        Jono.MetricsReady = true;
+        actions.Log("[DEFCON 2] Metrics Ready.");
+}
+
+rule DEFCON2_Inhibition_Pass "DEFCON 2: Inhibition Confirmed" salience 800 {
+    when
+        Jono.MetricsReady && !Jono.Cond2Passed &&
+        state.JammerAvgSpeed90min > 10 && state.JammerAvgGsm5 < 15
+    then
+        Jono.Cond2Passed = true;
+        actions.Log("[DEFCON 2] Positive: Inhibition Pattern.");
+        actions.Audit("DEFCON2_Inhibition_Pass", "Step 2: Inhibition Confirmed", 800, false);
+}
+
+// --- DEFCON 3 ---
+
+rule DEFCON3_SafeZones_Pass "DEFCON 3: Outside Safe Zones" salience 700 {
+    when
+        Jono.Cond2Passed && !Jono.Cond3Passed &&
+        !state.IsInsideGroup("Taller", Jono.Latitude, Jono.Longitude) && 
+        !state.IsInsideGroup("CLIENTES", Jono.Latitude, Jono.Longitude)
+    then
+        Jono.Cond3Passed = true;
+        actions.Log("[DEFCON 3] Positive: Outside Safe Zones.");
+        actions.Audit("DEFCON3_SafeZones_Pass", "Step 3: Outside Safe Zones", 700, false);
+}
+
+// --- DEFCON 4 ---
+
+rule DEFCON4_JammerDetected "DEFCON 4: Jammer Alert" salience 600 {
+    when
+        Jono.Cond3Passed && !Jono.AlertFired
+    then
+        Jono.AlertFired = true;
+        actions.SendTelegram("🚨 JAMMER DETECTED - IMEI: " + Jono.IMEI);
+        actions.Audit("DEFCON4_JammerDetected", "Alert Fired", 600, true);
+}

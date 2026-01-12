@@ -1,0 +1,842 @@
+package audit
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+)
+
+var db *sql.DB
+
+// InitDB inicializa la conexión a MySQL y crea las tablas optimizadas
+func InitDB(dbConn *sql.DB) {
+	db = dbConn
+	createOptimizedTables()
+}
+
+// createOptimizedTables crea las tablas optimizadas (resumen + detalle)
+func createOptimizedTables() {
+	if db == nil {
+		log.Println("⚠️  Audit database not initialized")
+		return
+	}
+
+	// TABLA 1: Resumen por IMEI (1 fila por IMEI, no duplicados)
+	schema1 := `
+	CREATE TABLE IF NOT EXISTS alert_summary (
+		imei VARCHAR(20) PRIMARY KEY,
+		last_alert_date DATETIME(6) NOT NULL,
+		total_alerts_24h INT DEFAULT 0,
+		alert_types JSON,
+		last_rule_executed VARCHAR(100),
+		last_alert_location VARCHAR(100),
+		updated_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+		INDEX idx_last_alert (last_alert_date),
+		INDEX idx_total_alerts (total_alerts_24h)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+
+	if _, err := db.Exec(schema1); err != nil {
+		log.Printf("⚠️  Error creating alert_summary: %v", err)
+	} else {
+		log.Println("✅ Tabla alert_summary verificada/creada")
+	}
+
+	// TABLA 2: Detalle de alertas (solo cuando alert_fired = true)
+	schema2 := `
+	CREATE TABLE IF NOT EXISTS alert_details (
+		id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		imei VARCHAR(20) NOT NULL,
+		alert_date DATETIME(6) NOT NULL,
+		rule_name VARCHAR(100) NOT NULL,
+		rule_description VARCHAR(255),
+		salience INT,
+		conditions_snapshot JSON,
+		actions_executed JSON,
+		telegram_sent BOOLEAN DEFAULT false,
+		latitude DECIMAL(10, 6),
+		longitude DECIMAL(10, 6),
+		speed INT,
+		created_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6),
+		INDEX idx_imei_date (imei, alert_date),
+		INDEX idx_rule_name (rule_name),
+		INDEX idx_alert_date (alert_date)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+
+	if _, err := db.Exec(schema2); err != nil {
+		log.Printf("⚠️  Error creating alert_details: %v", err)
+	} else {
+		log.Println("✅ Tabla alert_details verificada/creada")
+	}
+}
+
+// SaveExecutions guarda las ejecuciones capturadas
+func SaveExecutions(imei string, executions []RuleExecution) error {
+	if db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	// Filtrar solo las que tienen alerta
+	alertExecutions := []RuleExecution{}
+	for _, exec := range executions {
+		if exec.AlertFired {
+			alertExecutions = append(alertExecutions, exec)
+		}
+	}
+
+	if len(alertExecutions) == 0 {
+		return nil // No hay alertas para guardar
+	}
+
+	// Guardar cada alerta en alert_details
+	for _, exec := range alertExecutions {
+		conditionsJSON, _ := json.Marshal(exec.Conditions)
+		actionsJSON, _ := json.Marshal(exec.Actions)
+
+		telegramSent := false
+		for _, action := range exec.Actions {
+			if action == "SendTelegram" {
+				telegramSent = true
+				break
+			}
+		}
+
+		// Extraer coordenadas si existen en conditions
+		lat, _ := exec.Conditions["Latitude"].(float64)
+		lon, _ := exec.Conditions["Longitude"].(float64)
+		speed, _ := exec.Conditions["Speed"].(int)
+
+		query := `
+			INSERT INTO alert_details 
+			(imei, alert_date, rule_name, rule_description, salience, 
+			 conditions_snapshot, actions_executed, telegram_sent, 
+			 latitude, longitude, speed)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`
+
+		_, err := db.Exec(query,
+			imei,
+			exec.Timestamp,
+			exec.RuleName,
+			exec.Description,
+			exec.Salience,
+			string(conditionsJSON),
+			string(actionsJSON),
+			telegramSent,
+			lat,
+			lon,
+			speed,
+		)
+
+		if err != nil {
+			log.Printf("❌ Error insertando alert_detail: %v", err)
+			continue
+		}
+	}
+
+	// Actualizar resumen (alert_summary)
+	return updateSummary(imei, alertExecutions)
+}
+
+// updateSummary actualiza la tabla de resumen con la última alerta
+func updateSummary(imei string, alertExecutions []RuleExecution) error {
+	if len(alertExecutions) == 0 {
+		return nil
+	}
+
+	// Obtener la última alerta
+	lastAlert := alertExecutions[len(alertExecutions)-1]
+
+	// Contar alertas por tipo en las últimas 24 horas
+	alertTypes := make(map[string]int)
+	query := `
+		SELECT rule_name, COUNT(*) as count
+		FROM alert_details
+		WHERE imei = ? AND alert_date >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+		GROUP BY rule_name
+	`
+
+	rows, err := db.Query(query, imei)
+	if err != nil {
+		log.Printf("❌ Error contando alertas: %v", err)
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			var ruleName string
+			var count int
+			if err := rows.Scan(&ruleName, &count); err == nil {
+				alertTypes[ruleName] = count
+			}
+		}
+	}
+
+	alertTypesJSON, _ := json.Marshal(alertTypes)
+	totalAlerts := 0
+	for _, count := range alertTypes {
+		totalAlerts += count
+	}
+
+	// Obtener ubicación
+	lat, _ := lastAlert.Conditions["Latitude"].(float64)
+	lon, _ := lastAlert.Conditions["Longitude"].(float64)
+	location := fmt.Sprintf("%.6f,%.6f", lat, lon)
+
+	// INSERT ... ON DUPLICATE KEY UPDATE
+	upsertQuery := `
+		INSERT INTO alert_summary 
+		(imei, last_alert_date, total_alerts_24h, alert_types, last_rule_executed, last_alert_location)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			last_alert_date = VALUES(last_alert_date),
+			total_alerts_24h = VALUES(total_alerts_24h),
+			alert_types = VALUES(alert_types),
+			last_rule_executed = VALUES(last_rule_executed),
+			last_alert_location = VALUES(last_alert_location)
+	`
+
+	_, err = db.Exec(upsertQuery,
+		imei,
+		lastAlert.Timestamp,
+		totalAlerts,
+		string(alertTypesJSON),
+		lastAlert.RuleName,
+		location,
+	)
+
+	if err != nil {
+		log.Printf("❌ Error actualizando summary: %v", err)
+		return err
+	}
+
+	log.Printf("✅ Summary actualizado: IMEI=%s, Alerts=%d, LastRule=%s",
+		imei, totalAlerts, lastAlert.RuleName)
+
+	return nil
+}
+
+// GetIMEISummaries retorna el resumen de todos los IMEIs con alertas
+func GetIMEISummaries(limit int) ([]IMEISummary, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+
+	query := `
+		SELECT imei, last_alert_date, total_alerts_24h, alert_types, 
+		       last_rule_executed, last_alert_location
+		FROM alert_summary
+		ORDER BY last_alert_date DESC
+		LIMIT ?
+	`
+
+	rows, err := db.Query(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []IMEISummary
+	for rows.Next() {
+		var s IMEISummary
+		var alertTypesJSON string
+
+		err := rows.Scan(
+			&s.IMEI,
+			&s.LastAlertDate,
+			&s.TotalAlerts24h,
+			&alertTypesJSON,
+			&s.LastRuleExecuted,
+			&s.LastAlertLocation,
+		)
+
+		if err != nil {
+			log.Printf("❌ Error scanning summary: %v", err)
+			continue
+		}
+
+		json.Unmarshal([]byte(alertTypesJSON), &s.AlertTypes)
+		summaries = append(summaries, s)
+	}
+
+	return summaries, nil
+}
+
+// GetIMEISummariesPaginated retorna el resumen con paginación, búsqueda y ordenamiento
+func GetIMEISummariesPaginated(limit, offset int, sortBy, sortOrder, searchText string) ([]IMEISummary, int, error) {
+	if db == nil {
+		return nil, 0, fmt.Errorf("database not initialized")
+	}
+
+	// Validar columnas de ordenamiento permitidas
+	allowedSortColumns := map[string]bool{
+		"imei":               true,
+		"last_alert_date":    true,
+		"total_alerts_24h":   true,
+		"last_rule_executed": true,
+	}
+
+	if !allowedSortColumns[sortBy] {
+		sortBy = "last_alert_date"
+	}
+
+	if sortOrder != "ASC" && sortOrder != "DESC" {
+		sortOrder = "DESC"
+	}
+
+	// Construir WHERE clause
+	whereClause := ""
+	args := []interface{}{}
+
+	if searchText != "" {
+		whereClause = "WHERE imei LIKE ? OR last_rule_executed LIKE ?"
+		searchPattern := "%" + searchText + "%"
+		args = append(args, searchPattern, searchPattern)
+	}
+
+	// Obtener total de registros
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM alert_summary %s", whereClause)
+	var total int
+	err := db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Obtener registros paginados
+	query := fmt.Sprintf(`
+		SELECT imei, last_alert_date, total_alerts_24h, alert_types, 
+		       last_rule_executed, last_alert_location
+		FROM alert_summary
+		%s
+		ORDER BY %s %s
+		LIMIT ? OFFSET ?
+	`, whereClause, sortBy, sortOrder)
+
+	args = append(args, limit, offset)
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var summaries []IMEISummary
+	for rows.Next() {
+		var s IMEISummary
+		var alertTypesJSON string
+
+		err := rows.Scan(
+			&s.IMEI,
+			&s.LastAlertDate,
+			&s.TotalAlerts24h,
+			&alertTypesJSON,
+			&s.LastRuleExecuted,
+			&s.LastAlertLocation,
+		)
+
+		if err != nil {
+			log.Printf("❌ Error scanning summary: %v", err)
+			continue
+		}
+
+		json.Unmarshal([]byte(alertTypesJSON), &s.AlertTypes)
+		summaries = append(summaries, s)
+	}
+
+	return summaries, total, nil
+}
+
+// GetAlertDetails retorna los detalles de alertas de un IMEI
+func GetAlertDetails(imei string, limit int) ([]AlertDetail, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+
+	query := `
+		SELECT id, imei, alert_date, rule_name, rule_description, salience,
+		       conditions_snapshot, actions_executed, telegram_sent,
+		       latitude, longitude, speed
+		FROM alert_details
+		WHERE imei = ?
+		ORDER BY alert_date DESC
+		LIMIT ?
+	`
+
+	rows, err := db.Query(query, imei, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var details []AlertDetail
+	for rows.Next() {
+		var d AlertDetail
+		var conditionsJSON, actionsJSON string
+
+		err := rows.Scan(
+			&d.ID,
+			&d.IMEI,
+			&d.AlertDate,
+			&d.RuleName,
+			&d.RuleDescription,
+			&d.Salience,
+			&conditionsJSON,
+			&actionsJSON,
+			&d.TelegramSent,
+			&d.Latitude,
+			&d.Longitude,
+			&d.Speed,
+		)
+
+		if err != nil {
+			log.Printf("❌ Error scanning detail: %v", err)
+			continue
+		}
+
+		json.Unmarshal([]byte(conditionsJSON), &d.Conditions)
+		json.Unmarshal([]byte(actionsJSON), &d.Actions)
+		details = append(details, d)
+	}
+
+	return details, nil
+}
+
+// ========================== PROGRESS AUDIT ==========================
+
+var progressAuditEnabled bool = false
+
+// CreateProgressAuditTable crea la tabla para auditoría de progreso
+func CreateProgressAuditTable() {
+	if db == nil {
+		log.Println("⚠️  Progress audit database not initialized")
+		return
+	}
+
+	schema := `
+	CREATE TABLE IF NOT EXISTS rule_execution_state (
+		id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		imei VARCHAR(20) NOT NULL,
+		rule_id BIGINT NOT NULL,
+		rule_name VARCHAR(100) NOT NULL,
+		components_executed JSON,
+		component_details JSON,
+		step_number INT DEFAULT 0,
+		stage_reached VARCHAR(50) NOT NULL,
+		stop_reason VARCHAR(100) NOT NULL,
+		buffer_size INT DEFAULT 0,
+		metrics_ready BOOLEAN DEFAULT false,
+		geofence_eval VARCHAR(50) DEFAULT 'not_evaluated',
+		context_snapshot JSON,
+		execution_time DATETIME(6) NOT NULL,
+		INDEX idx_imei_time (imei, execution_time),
+		INDEX idx_imei_step (imei, step_number),
+		INDEX idx_rule_stage (rule_name, stage_reached),
+		INDEX idx_execution_time (execution_time),
+		INDEX idx_rule_id (rule_id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+
+	if _, err := db.Exec(schema); err != nil {
+		log.Printf("⚠️  Error creating rule_execution_state: %v", err)
+	} else {
+		log.Println("✅ Tabla rule_execution_state verificada/creada")
+	}
+}
+
+// EnableProgressAudit activa la auditoría de progreso
+func EnableProgressAudit() error {
+	CreateProgressAuditTable()
+	progressAuditEnabled = true
+	log.Println("✅ Progress Audit ENABLED")
+	return nil
+}
+
+// DisableProgressAudit desactiva la auditoría de progreso
+func DisableProgressAudit() error {
+	progressAuditEnabled = false
+	log.Println("⚠️  Progress Audit DISABLED")
+	return nil
+}
+
+// IsProgressAuditEnabled retorna el estado actual
+func IsProgressAuditEnabled() bool {
+	return progressAuditEnabled
+}
+
+// SaveProgressAudit guarda el estado de progreso de una ejecución
+func SaveProgressAudit(progress ProgressAudit) error {
+	if !progressAuditEnabled || db == nil {
+		return nil // No guardar si está desactivado
+	}
+
+	contextSnapshotJSON, _ := json.Marshal(progress.ContextSnapshot)
+	componentsExecutedJSON, _ := json.Marshal(progress.ComponentsExecuted)
+	componentDetailsJSON, _ := json.Marshal(progress.ComponentDetails)
+
+	query := `
+		INSERT INTO rule_execution_state 
+		(imei, rule_id, rule_name, components_executed, component_details, stage_reached, stop_reason, buffer_size, 
+		 metrics_ready, geofence_eval, context_snapshot, execution_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+
+	_, err := db.Exec(query,
+		progress.IMEI,
+		progress.RuleID,
+		progress.RuleName,
+		string(componentsExecutedJSON),
+		string(componentDetailsJSON),
+		progress.StageReached,
+		progress.StopReason,
+		progress.BufferSize,
+		progress.MetricsReady,
+		progress.GeofenceEval,
+		string(contextSnapshotJSON),
+		progress.ExecutionTime,
+	)
+
+	if err != nil {
+		log.Printf("❌ Error insertando progress audit: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+// GetProgressByIMEI obtiene el historial de progreso de un IMEI
+func GetProgressByIMEI(imei string, limit int) ([]ProgressAudit, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+
+	query := `
+		SELECT id, imei, rule_id, rule_name, components_executed, component_details, stage_reached, stop_reason, 
+		       buffer_size, metrics_ready, geofence_eval, context_snapshot, execution_time
+		FROM rule_execution_state
+		WHERE imei = ?
+		ORDER BY execution_time DESC
+		LIMIT ?
+	`
+
+	rows, err := db.Query(query, imei, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var progressList []ProgressAudit
+	for rows.Next() {
+		var p ProgressAudit
+		var contextSnapshotJSON, componentsExecutedJSON, componentDetailsJSON string
+
+		err := rows.Scan(
+			&p.ID,
+			&p.IMEI,
+			&p.RuleID,
+			&p.RuleName,
+			&componentsExecutedJSON,
+			&componentDetailsJSON,
+			&p.StageReached,
+			&p.StopReason,
+			&p.BufferSize,
+			&p.MetricsReady,
+			&p.GeofenceEval,
+			&contextSnapshotJSON,
+			&p.ExecutionTime,
+		)
+
+		if err != nil {
+			log.Printf("❌ Error scanning progress: %v", err)
+			continue
+		}
+
+		json.Unmarshal([]byte(contextSnapshotJSON), &p.ContextSnapshot)
+		json.Unmarshal([]byte(componentsExecutedJSON), &p.ComponentsExecuted)
+		json.Unmarshal([]byte(componentDetailsJSON), &p.ComponentDetails)
+		progressList = append(progressList, p)
+	}
+
+	return progressList, nil
+}
+
+// ClearProgressAudit limpia todos los registros de auditoría de progreso
+func ClearProgressAudit() error {
+	if db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	_, err := db.Exec("TRUNCATE TABLE rule_execution_state")
+	if err != nil {
+		log.Printf("⚠️  Error clearing progress audit: %v", err)
+		return err
+	}
+
+	log.Println("✅ Progress audit cleared")
+	return nil
+}
+
+// SaveProgressFrame guarda un frame de película con snapshot completo
+func SaveProgressFrame(imei string, ruleID int64, ruleName string, componentsExecuted []string, componentDetails map[string]interface{},
+	stepNumber int, stageReached, stopReason string, bufferSize int, metricsReady bool, geofenceEval string,
+	contextSnapshot map[string]interface{}) error {
+
+	if db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	// Serializar datos a JSON
+	snapshotJSON, _ := json.Marshal(contextSnapshot)
+	componentsJSON, _ := json.Marshal(componentsExecuted)
+	detailsJSON, _ := json.Marshal(componentDetails)
+
+	query := `
+		INSERT INTO rule_execution_state 
+		(imei, rule_id, rule_name, components_executed, component_details, step_number, stage_reached, stop_reason, 
+		 buffer_size, metrics_ready, geofence_eval, context_snapshot, execution_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
+	`
+
+	_, err := db.Exec(query, imei, ruleID, ruleName, componentsJSON, detailsJSON, stepNumber, stageReached, stopReason,
+		bufferSize, metricsReady, geofenceEval, snapshotJSON)
+
+	if err != nil {
+		return fmt.Errorf("error saving progress frame: %v", err)
+	}
+
+	return nil
+}
+
+// GetIMEISummary obtiene resumen de IMEIs con su step máximo alcanzado
+// Para jqGrid Nivel 1: lista de IMEIs con progreso
+// Si ruleName != "", filtra por esa regla específica
+func GetIMEISummary(ruleName string, limit int) ([]map[string]interface{}, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+
+	var query string
+	var rows *sql.Rows
+	var err error
+
+	if ruleName != "" {
+		// Filtrar por regla específica
+		query = `
+			SELECT 
+				imei,
+				rule_name,
+				MAX(step_number) as max_step,
+				COUNT(*) as total_frames,
+				MAX(execution_time) as last_frame_time
+			FROM rule_execution_state
+			WHERE rule_name = ?
+			GROUP BY imei, rule_name
+			ORDER BY last_frame_time DESC
+			LIMIT ?
+		`
+		rows, err = db.Query(query, ruleName, limit)
+	} else {
+		// Todas las reglas
+		query = `
+			SELECT 
+				imei,
+				rule_name,
+				MAX(step_number) as max_step,
+				COUNT(*) as total_frames,
+				MAX(execution_time) as last_frame_time
+			FROM rule_execution_state
+			GROUP BY imei, rule_name
+			ORDER BY last_frame_time DESC
+			LIMIT ?
+		`
+		rows, err = db.Query(query, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error querying IMEI summary: %v", err)
+	}
+	defer rows.Close()
+
+	result := []map[string]interface{}{}
+	for rows.Next() {
+		var imei, ruleName, lastFrameTime string
+		var maxStep, totalFrames int
+
+		err := rows.Scan(&imei, &ruleName, &maxStep, &totalFrames, &lastFrameTime)
+		if err != nil {
+			log.Printf("⚠️  Error scanning IMEI summary: %v", err)
+			continue
+		}
+
+		result = append(result, map[string]interface{}{
+			"imei":            imei,
+			"rule_name":       ruleName,
+			"max_step":        maxStep,
+			"total_frames":    totalFrames,
+			"last_frame_time": lastFrameTime,
+		})
+	}
+
+	return result, nil
+}
+
+// GetAvailableRules obtiene lista de reglas disponibles en progress audit
+func GetAvailableRules() ([]map[string]interface{}, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+
+	query := `
+		SELECT DISTINCT 
+			rule_name,
+			COUNT(*) as total_frames,
+			COUNT(DISTINCT imei) as total_imeis,
+			MAX(execution_time) as last_execution
+		FROM rule_execution_state
+		GROUP BY rule_name
+		ORDER BY last_execution DESC
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("error querying available rules: %v", err)
+	}
+	defer rows.Close()
+
+	result := []map[string]interface{}{}
+	for rows.Next() {
+		var ruleName, lastExecution string
+		var totalFrames, totalImeis int
+
+		err := rows.Scan(&ruleName, &totalFrames, &totalImeis, &lastExecution)
+		if err != nil {
+			log.Printf("⚠️  Error scanning rule: %v", err)
+			continue
+		}
+
+		result = append(result, map[string]interface{}{
+			"rule_name":      ruleName,
+			"total_frames":   totalFrames,
+			"total_imeis":    totalImeis,
+			"last_execution": lastExecution,
+		})
+	}
+
+	return result, nil
+}
+
+// GetFrameTimeline obtiene timeline de frames por IMEI (orden cronológico ascendente)
+// Para jqGrid Nivel 2: cuadros de película por IMEI
+// Si ruleName != "", filtra por esa regla específica
+func GetFrameTimeline(imei, ruleName string, limit int) ([]map[string]interface{}, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+
+	var query string
+	var rows *sql.Rows
+	var err error
+
+	if ruleName != "" {
+		// Filtrar por regla específica
+		query = `
+			SELECT 
+				id,
+				rule_id,
+				rule_name,
+				components_executed,
+				component_details,
+				step_number,
+				stage_reached,
+				stop_reason,
+				buffer_size,
+				metrics_ready,
+				geofence_eval,
+				context_snapshot,
+				execution_time
+			FROM rule_execution_state
+			WHERE imei = ? AND rule_name = ?
+			ORDER BY execution_time ASC
+			LIMIT ?
+		`
+		rows, err = db.Query(query, imei, ruleName, limit)
+	} else {
+		// Todas las reglas
+		query = `
+			SELECT 
+				id,
+				rule_id,
+				rule_name,
+				components_executed,
+				component_details,
+				step_number,
+				stage_reached,
+				stop_reason,
+				buffer_size,
+				metrics_ready,
+				geofence_eval,
+				context_snapshot,
+				execution_time
+			FROM rule_execution_state
+			WHERE imei = ?
+			ORDER BY execution_time ASC
+			LIMIT ?
+		`
+		rows, err = db.Query(query, imei, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error querying frame timeline: %v", err)
+	}
+	defer rows.Close()
+
+	result := []map[string]interface{}{}
+	for rows.Next() {
+		var id, stepNumber, bufferSize int
+		var ruleID int64
+		var ruleName, stageReached, stopReason, geofenceEval, executionTime string
+		var metricsReady bool
+		var contextSnapshotJSON, componentsExecutedJSON, componentDetailsJSON []byte
+
+		err := rows.Scan(&id, &ruleID, &ruleName, &componentsExecutedJSON, &componentDetailsJSON, &stepNumber, &stageReached, &stopReason,
+			&bufferSize, &metricsReady, &geofenceEval, &contextSnapshotJSON, &executionTime)
+		if err != nil {
+			log.Printf("⚠️  Error scanning frame: %v", err)
+			continue
+		}
+
+		// Deserializar JSON data
+		var snapshot, componentDetails map[string]interface{}
+		var componentsExecuted []string
+
+		if err := json.Unmarshal(contextSnapshotJSON, &snapshot); err != nil {
+			log.Printf("⚠️  Error unmarshaling snapshot: %v", err)
+			snapshot = map[string]interface{}{"error": "invalid JSON"}
+		}
+
+		if err := json.Unmarshal(componentsExecutedJSON, &componentsExecuted); err != nil {
+			log.Printf("⚠️  Error unmarshaling components: %v", err)
+			componentsExecuted = []string{}
+		}
+
+		if err := json.Unmarshal(componentDetailsJSON, &componentDetails); err != nil {
+			log.Printf("⚠️  Error unmarshaling component details: %v", err)
+			componentDetails = map[string]interface{}{}
+		}
+
+		result = append(result, map[string]interface{}{
+			"id":                  id,
+			"rule_id":             ruleID,
+			"rule_name":           ruleName,
+			"components_executed": componentsExecuted,
+			"component_details":   componentDetails,
+			"step_number":         stepNumber,
+			"stage_reached":       stageReached,
+			"stop_reason":         stopReason,
+			"buffer_size":         bufferSize,
+			"metrics_ready":       metricsReady,
+			"geofence_eval":       geofenceEval,
+			"snapshot":            snapshot,
+			"execution_time":      executionTime,
+		})
+	}
+
+	return result, nil
+}

@@ -1,0 +1,230 @@
+package data
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"time"
+
+	"github.com/MaddSystems/jonobridge/common/models"
+	"github.com/MaddSystems/jonobridge/common/utils"
+)
+
+// Local structs for parsing token responses in different formats
+type tokenRespAlt struct {
+	TokenAccess string `json:"token_access"`
+}
+
+type tokenRespNested struct {
+	Data struct {
+		Token string `json:"token"`
+	} `json:"data"`
+}
+
+var dicsa_url string
+var dicsa_token_url string
+var dicsa_user string
+var dicsa_user_key string
+var elastic_doc_name string
+
+// simple in-memory token cache
+var cachedToken string
+var tokenExpiry time.Time
+
+// Initialize function to be called once at startup
+func InitDicsa() {
+	elastic_doc_name = os.Getenv("ELASTIC_DOC_NAME")
+	dicsa_token_url = os.Getenv("DICSA_TOKEN_URL")
+	dicsa_url = os.Getenv("DICSA_URL")
+	dicsa_user = os.Getenv("DICSA_USER")
+	dicsa_user_key = os.Getenv("DICSA_USER_KEY")
+}
+
+// getToken queries the token endpoint as described in DICSA.md (GET with query params)
+func getToken(cveUsuario, password string) (string, error) {
+	// return cached token if still valid
+	if cachedToken != "" && time.Now().Before(tokenExpiry) {
+		utils.VPrint("Using cached token (expires %v)", tokenExpiry)
+		return cachedToken, nil
+	}
+
+	if dicsa_token_url == "" {
+		return "", fmt.Errorf("DICSA_TOKEN_URL not configured")
+	}
+
+	// Build URL with query params: ?user=...&password=...
+	u, err := url.Parse(dicsa_token_url)
+	if err != nil {
+		return "", fmt.Errorf("token url parse error: %v", err)
+	}
+	q := u.Query()
+	q.Set("user", cveUsuario)
+	q.Set("password", password)
+	u.RawQuery = q.Encode()
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	utils.VPrint("Requesting token from %s", u.String())
+	resp, err := client.Get(u.String())
+	if err != nil {
+		return "", fmt.Errorf("error requesting token: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error reading token response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("token endpoint returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Try different response formats
+	var alt tokenRespAlt
+	if err := json.Unmarshal(body, &alt); err == nil && alt.TokenAccess != "" {
+		cachedToken = alt.TokenAccess
+		tokenExpiry = time.Now().Add(23 * time.Hour)
+		utils.VPrint("Token received (token_access)")
+		return cachedToken, nil
+	}
+	var nested tokenRespNested
+	if err := json.Unmarshal(body, &nested); err == nil && nested.Data.Token != "" {
+		// trim Bearer if present
+		t := nested.Data.Token
+		if len(t) > 7 && t[:7] == "Bearer " {
+			t = t[7:]
+		}
+		cachedToken = t
+		tokenExpiry = time.Now().Add(23 * time.Hour)
+		utils.VPrint("Token received (nested.data.token)")
+		return cachedToken, nil
+	}
+
+	// fallback: try to parse a flat {"token":"..."}
+	var flat map[string]interface{}
+	if err := json.Unmarshal(body, &flat); err == nil {
+		if v, ok := flat["token_access"].(string); ok && v != "" {
+			cachedToken = v
+			tokenExpiry = time.Now().Add(23 * time.Hour)
+			return cachedToken, nil
+		}
+		if v, ok := flat["token"].(string); ok && v != "" {
+			t := v
+			if len(t) > 7 && t[:7] == "Bearer " {
+				t = t[7:]
+			}
+			cachedToken = t
+			tokenExpiry = time.Now().Add(23 * time.Hour)
+			return cachedToken, nil
+		}
+	}
+
+	return "", fmt.Errorf("unable to parse token response: %s", string(body))
+}
+
+// send2server sends the tracker data according to DICSA.md: POST to data endpoint
+// with params and Authorization header. It logs to Elastic and returns body.
+func send2server(plates, neco, speed, imei, latitud, longitud string) (string, error) {
+	token, err := getToken(dicsa_user, dicsa_user_key)
+	if err != nil {
+		return "", fmt.Errorf("error obtaining token: %v", err)
+	}
+
+	if dicsa_url == "" {
+		return "", fmt.Errorf("DICSA_URL not configured")
+	}
+
+	// Prepare params as query string (the API accepts params in URL)
+	params := url.Values{}
+	params.Set("user", dicsa_user)
+	params.Set("password", dicsa_user_key)
+	params.Set("token", token)
+	params.Set("placa", plates)
+	if neco != "" {
+		params.Set("neconomico", neco)
+	}
+	params.Set("latitud", latitud)
+	params.Set("longitud", longitud)
+	// optional fields left empty or omitted
+	params.Set("altitud", "")
+	params.Set("direccion", "")
+	params.Set("velocidad", speed)
+	params.Set("fecha_localizacion", time.Now().UTC().Format("2006-01-02 15:04:05"))
+
+	reqURL := dicsa_url
+	// ensure base URL doesn't already contain query
+	if _, err := url.ParseRequestURI(dicsa_url); err != nil {
+		return "", fmt.Errorf("invalid DICSA_URL: %v", err)
+	}
+	fullURL := reqURL + "?" + params.Encode()
+
+	utils.VPrint("Enviando a %s", fullURL)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("POST", fullURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("error creating request: %v", err)
+	}
+	req.Header.Set("Authorization", token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error performing request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error reading response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		utils.VPrint("Error StatusCode=%d url:%s Imei:%s", resp.StatusCode, dicsa_url, imei)
+	} else {
+		utils.VPrint("StatusCode = %d url: %s Imei: %s", resp.StatusCode, dicsa_url, imei)
+	}
+
+	utils.VPrint("Posting payload StatusCode=%v", resp.StatusCode)
+	bodyText := fullURL // record the sent params for Elastic
+
+	logData := utils.ElasticLogData{
+		Client:     elastic_doc_name,
+		IMEI:       imei,
+		Payload:    bodyText,
+		Time:       time.Now().Format(time.RFC3339),
+		StatusCode: resp.StatusCode,
+		StatusText: resp.Status,
+	}
+	if err := utils.SendToElastic(logData, elastic_doc_name); err != nil {
+		utils.VPrint("Error sending to Elasticsearch: %v", err)
+	}
+
+	return string(body), nil
+}
+
+func ProcessAndSendDicsa(plates, eco, vin, dataStr string) error {
+	// Parse the incoming JSON data
+	var data models.JonoModel
+	err := json.Unmarshal([]byte(dataStr), &data)
+	if err != nil {
+		fmt.Println("Error deserializando JSON:", err)
+		return fmt.Errorf("error deserializando JSON: %v", err)
+	}
+	// Process all packets in the data
+	for _, packet := range data.ListPackets {
+		utils.VPrint("IMEI: %s", data.IMEI)
+		utils.VPrint("Coordinates: %f,%f", packet.Latitude, packet.Longitude)
+		imei := data.IMEI
+		longitude := fmt.Sprintf("%f", packet.Longitude)
+		latitude := fmt.Sprintf("%f", packet.Latitude)
+		speed := fmt.Sprintf("%d", packet.Speed)
+		// pass eco (neconomico) through to send2server
+		if _, err := send2server(plates, eco, speed, imei, latitude, longitude); err != nil {
+			utils.VPrint("Error sending to DICSA: %v", err)
+			// continue processing other packets but record the error
+		}
+	}
+	return nil
+}

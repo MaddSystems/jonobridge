@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h4 class="mb-0">Database Management</h4>
+    </div>
+    
+    <!-- Flash Messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="alert alert-{{ category }} alert-dismissible fade show m-3" role="alert">
+                    {{ message }}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+
+    <div class="card-body">
+        <div class="row">
+            <div class="col-md-4">
+                <div class="card h-100">
+                    <div class="card-body text-center">
+                        <h5 class="card-title">Create Database</h5>
+                        <p class="card-text">Initialize a new database with required tables</p>
+                        <form action="{{ url_for('create_database') }}" method="post">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="fas fa-database"></i> Create Database
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-4">
+                <div class="card h-100">
+                    <div class="card-body text-center">
+                        <h5 class="card-title">Delete Database</h5>
+                        <p class="card-text">Remove the existing database and all its data</p>
+                        <button type="button" class="btn btn-danger" data-bs-toggle="modal" data-bs-target="#deleteDbModal">
+                            <i class="fas fa-trash"></i> Delete Database
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-4">
+                <div class="card h-100">
+                    <div class="card-body text-center">
+                        <h5 class="card-title">Add Missing Tables</h5>
+                        <p class="card-text">Create any missing tables in the database</p>
+                        <form action="{{ url_for('add_missing_tables') }}" method="post">
+                            <button type="submit" class="btn btn-warning">
+                                <i class="fas fa-table"></i> Add Missing Tables
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="row mt-4">
+            <div class="col-md-12 text-center">
+                <a href="{{ url_for('admin_monitor') }}" class="btn btn-info">
+                    <i class="fas fa-cogs"></i> Monitor Params
+                </a>
+            </div>
+        </div>
+        </div>
+    </div>
+</div>
+
+<!-- Delete Database Modal -->
+<div class="modal fade" id="deleteDbModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Delete Database</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-danger">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <strong>Warning:</strong> This action cannot be undone!
+                </div>
+                <p>Are you sure you want to delete the database? This will:</p>
+                <ul>
+                    <li>Remove all client data</li>
+                    <li>Delete all tables</li>
+                    <li>Require database recreation before using the application</li>
+                </ul>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <form action="{{ url_for('delete_database') }}" method="post" class="d-inline">
+                    <button type="submit" class="btn btn-danger">
+                        <i class="fas fa-trash"></i> Delete Database
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

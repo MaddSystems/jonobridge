@@ -1,0 +1,137 @@
+{
+  "DataPackets": null,
+  "IMEI": "862170018685956",
+  "ListPackets": {
+    "Packet1": {
+      "AdditionalAlertInfoADASDMS": {
+        "AlarmProtocol": null,
+        "AlarmType": null,
+        "PhotoName": null
+      },
+      "Altitude": 0,
+      "AnalogInputs": {
+        "AD1": "0.10",
+        "AD10": null,
+        "AD2": "0.09",
+        "AD3": "",
+        "AD4": "7.20",
+        "AD5": "2.77",
+        "AD6": null,
+        "AD7": null,
+        "AD8": null,
+        "AD9": null
+      },
+      "BaseStationInfo": {
+        "CellID": "39854",
+        "LAC": "1244",
+        "MCC": "334",
+        "MNC": "20"
+      },
+      "BluetoothBeaconA": {
+        "BatteryPower": null,
+        "DeviceName": null,
+        "MAC": null,
+        "SignalStrength": null,
+        "Version": null
+      },
+      "BluetoothBeaconB": {
+        "BatteryPower": null,
+        "DeviceName": null,
+        "MAC": null,
+        "SignalStrength": null,
+        "Version": null
+      },
+      "CameraStatus": {
+        "CameraNumber": null,
+        "Status": null
+      },
+      "CurrentNetworkInfo": {
+        "Descriptor": null,
+        "Type": null,
+        "Version": null
+      },
+      "Datetime": "",
+      "Direction": 0,
+      "EventCode": {
+        "Code": 9999,
+        "Name": "Unknown Event"
+      },
+      "FatigueDrivingInformation": {
+        "Descriptor": null,
+        "Type": null,
+        "Version": null
+      },
+      "GSMSignalStrength": 28,
+      "HDOP": 0,
+      "InputPortStatus": {
+        "Input1": null,
+        "Input2": null,
+        "Input3": null,
+        "Input4": null,
+        "Input5": null,
+        "Input6": null,
+        "Input7": null,
+        "Input8": null
+      },
+      "IoPortStatus": {
+        "Port1": 1,
+        "Port2": 0,
+        "Port3": 0,
+        "Port4": 1,
+        "Port5": 0,
+        "Port6": 1,
+        "Port7": 0,
+        "Port8": 0
+      },
+      "Latitude": 0,
+      "Longitude": 0,
+      "Mileage": 524306927,
+      "NumberOfSatellites": 0,
+      "OutputPortStatus": {
+        "Output1": null,
+        "Output2": null,
+        "Output3": null,
+        "Output4": null,
+        "Output5": null,
+        "Output6": null,
+        "Output7": null,
+        "Output8": null
+      },
+      "PositioningStatus": "",
+      "RunTime": 0,
+      "Speed": 0,
+      "SystemFlag": {
+        "ACC": null,
+        "AntiTheft": null,
+        "Charging": null,
+        "EEP2": null,
+        "ExternalPowerSupply": null,
+        "FMS": null,
+        "FMSFunction": null,
+        "MovingFlag": null,
+        "SleepMode": null,
+        "SystemFlagExtras": null,
+        "VibrationFlag": null
+      },
+      "TemperatureAndHumiditySensor": {
+        "AlertHighHumidity": null,
+        "AlertHighTemperature": null,
+        "AlertLowHumidity": null,
+        "AlertLowTemperature": null,
+        "BatteryPower": null,
+        "DeviceName": null,
+        "Humidity": null,
+        "MAC": null,
+        "Temperature": null
+      },
+      "TemperatureSensor": {
+        "SensorNumber": null,
+        "Value": null
+      }
+    }
+  },
+  "Message": "$$x149,862170018685956,AAA,32,19.302180,-99.613370,251210193420,A,10,28,6,359,0.8,2629,524306927,383003473,334|20|04DC|9BAE,0800,000A|0009||02D0|0115,*6D\r\n"
+}
+
+
+01:34:22 p.m. 10/12/2025 200.68.186.213:52741 Meitrack tcp Client: $$x149,862170018685956,AAA,32,19.302180,-99.613370,251210193420,A,10,28,6,359,0.8,2629,524306927,383003473,334|20|04DC|9BAE,0800,000A|0009||02D0|0115,*6D[0x0D][0x0A]

@@ -1,0 +1,183 @@
+package data
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/MaddSystems/jonobridge/common/models"
+	"github.com/MaddSystems/jonobridge/common/utils"
+)
+
+var skyangelToken string
+var skyangelURL string
+
+// Initialize function to be called once at startup
+func InitSkyyangel() {
+	skyangelToken = os.Getenv("SKYANGEL_TOKEN")
+	if skyangelToken == "" {
+		skyangelToken = "87a0239529b1515b2a7a5a173699e3310a5404e1d8b2c8400a6139e4" // Default fallback
+	}
+
+	skyangelURL = os.Getenv("SKYANGEL_URL")
+	if skyangelURL == "" {
+		skyangelURL = "https://pegasus248.peginstances.com/receivers/json" // Default fallback
+	}
+
+	utils.VPrint("Initialized Skyyangel with URL: %s and token length: %d", skyangelURL, len(skyangelToken))
+}
+func send2SkyAngel(imei, eco, latitude, longitude, speed, azimuth, altitude, skyDate, receptionDate string) {
+
+	user := "gpscontrol"
+	user_key := "skygerenciador"
+
+	// Envío a SkyAngel
+	apiUrl := "http://ws.skyangel.com.mx"
+	resource := "/Gerenciador.php/"
+	data := url.Values{}
+	data.Add("usuario", user)
+	data.Add("password", user_key)
+	data.Add("neconomico", eco)
+	data.Add("imei", imei)
+	data.Add("fechahora", skyDate)
+	data.Add("latitud", latitude)
+	data.Add("longitud", longitude)
+	data.Add("altitud", altitude)
+	data.Add("velocidad", speed)
+	data.Add("direccion", azimuth)
+
+	u, _ := url.ParseRequestURI(apiUrl)
+	u.Path = resource
+	urlStr := u.String()
+
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 100
+	t.MaxConnsPerHost = 100
+	t.MaxIdleConnsPerHost = 100
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: t,
+	}
+
+	r, errNR := http.NewRequest("POST", urlStr, strings.NewReader(data.Encode())) // URL-encoded payload
+	r.Close = true                                                                // https://stackoverflow.com/questions/17714494/golang-http-request-results-in-eof-errors-when-making-multiple-requests-successi/23963271#23963271
+
+	r.Header.Add("Authorization", "auth_token=\"XXXXXXX\"")
+	r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
+
+	if errNR != nil {
+		fmt.Println("Error en IntegratorSkyAngel: \nError enNewRequest: ", errNR)
+	}
+
+	resp, err := client.Do(r)
+	if err != nil {
+		fmt.Println("Error en IntegratorSkyAngel, client.Do. \nError: ", err)
+	}
+	defer resp.Body.Close()
+	utils.VPrint("Status SkyAngel:%d", resp.StatusCode)
+	body := fmt.Sprintf("%v", data)
+	utils.VPrint("SkyAngel Body: %s", body)
+	msgError := "No conexion a skyangel"
+	if resp.StatusCode == 200 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		sbody := string(body)
+		start := strings.Index(sbody, "<respuesta>")
+		end := strings.Index(sbody, "</respuesta>")
+		if start > -1 && end > -1 {
+			msgError = sbody[start+11 : end]
+		} else {
+			msgError = "Error en Sky Angel"
+			log.Println("\n\n Error en SkyAngel. StatusCode:", resp.StatusCode)
+			log.Println(resp.Status)
+		}
+	}
+	utils.VPrint("SkyAngel Response: %s", msgError)
+}
+
+func ProcessAndSendSkyyangel(plates, eco, vin, dataStr string) error {
+	// Parse the incoming JSON data
+	var data models.JonoModel
+	err := json.Unmarshal([]byte(dataStr), &data)
+	if err != nil {
+		fmt.Println("Error deserializando JSON:", err)
+		return fmt.Errorf("error deserializando JSON: %v", err)
+	}
+
+	// Process all packets in the data
+	for _, packet := range data.ListPackets {
+
+		// Extract and process values from alto_track_process
+		eventcode := fmt.Sprintf("%d", packet.EventCode.Code)
+		utils.VPrint(("skyangel url: %s"), skyangelURL)
+		utils.VPrint("IMEI: %s", data.IMEI)
+		utils.VPrint("Plates: %s", plates)
+		utils.VPrint("EventCode: %s", eventcode)
+		utils.VPrint("Latitude: %f", packet.Latitude)
+		utils.VPrint("Longitude: %f", packet.Longitude)
+		utils.VPrint("Speed: %d", packet.Speed)
+		utils.VPrint("Altitude: %d", packet.Altitude)
+		utils.VPrint("Direction: %d", packet.Direction)
+		utils.VPrint("HDOP: %f", packet.HDOP)
+		utils.VPrint("Satellites: %d", packet.NumberOfSatellites)
+		utils.VPrint("Mileage: %d", packet.Mileage)
+		utils.VPrint("RunTime: %d", packet.RunTime)
+		utils.VPrint("PositioningStatus: %s", packet.PositioningStatus)
+		utils.VPrint("Datetime: %s", packet.Datetime.Format(time.RFC3339))
+		if packet.AnalogInputs != nil {
+			if packet.AnalogInputs.AD1 != nil {
+				utils.VPrint("AD1: %v", *packet.AnalogInputs.AD1)
+			}
+			if packet.AnalogInputs.AD2 != nil {
+				utils.VPrint("AD2: %v", *packet.AnalogInputs.AD2)
+			}
+			if packet.AnalogInputs.AD3 != nil {
+				utils.VPrint("AD3: %v", *packet.AnalogInputs.AD3)
+			}
+			if packet.AnalogInputs.AD4 != nil {
+				utils.VPrint("AD4: %v", *packet.AnalogInputs.AD4)
+			}
+			if packet.AnalogInputs.AD5 != nil {
+				utils.VPrint("AD5: %v", *packet.AnalogInputs.AD5)
+			}
+			if packet.AnalogInputs.AD6 != nil {
+				utils.VPrint("AD6: %v", *packet.AnalogInputs.AD6)
+			}
+		}
+		imei := data.IMEI
+		latitud := fmt.Sprintf("%f", packet.Latitude)
+		longitud := fmt.Sprintf("%f", packet.Longitude)
+		altitud := fmt.Sprintf("%d", packet.Altitude)
+		speed := fmt.Sprintf("%d", packet.Speed)
+		angle := fmt.Sprintf("%d", packet.Direction)
+
+		mexicoCity, err := time.LoadLocation("America/Mexico_City")
+		if err != nil {
+			fmt.Println("Error loading Mexico City timezone:", err)
+			return fmt.Errorf("error loading Mexico City timezone: %v", err)
+		}
+
+		FechaTrama_UTC := packet.Datetime
+		FechaTrama_MexicoTime := FechaTrama_UTC.In(mexicoCity)
+		// Formato del integrador skyangel
+		skyDate := fmt.Sprintf("%02d/%02d/%02d %02d:%02d:%02d ",
+			FechaTrama_MexicoTime.Year(), FechaTrama_MexicoTime.Month(), FechaTrama_MexicoTime.Day(),
+			FechaTrama_MexicoTime.Hour(), FechaTrama_MexicoTime.Minute(), FechaTrama_MexicoTime.Second())
+		utils.VPrint("skydate: %v", skyDate)
+
+		// Fecha Hoy: //
+		current := time.Now()
+
+		receptionDate := fmt.Sprintf("%d/%02d/%02d %02d:%02d:%02d", current.Year(), current.Month(), current.Day(), current.Hour(), current.Minute(), current.Second())
+		send2SkyAngel(imei, eco, latitud, longitud, speed, angle, altitud, skyDate, receptionDate)
+
+	}
+	return nil
+}

@@ -1,0 +1,17 @@
+name: geofence
+version: "1.0.0"
+description: Geofence detection (jammer-only subset)
+grule_context_name: geo
+
+functions:
+  - name: IsInsideGroup
+    description: Check if device is inside any geofence of a named group
+    parameters:
+      - name: groupName
+        type: string
+      - name: lat
+        type: float64
+      - name: lon
+        type: float64
+    return_type: bool
+    example: 'geo.IsInsideGroup("Taller", packet.Latitude, packet.Longitude)'

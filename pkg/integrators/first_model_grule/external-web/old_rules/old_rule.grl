@@ -1,0 +1,177 @@
+// ═══════════════════════════════════════════════════════════════════
+// name: Old-Jammer-Real 
+// category: Jammer Detection
+// description: Sistema de detección de inhibidor GPS usando buffer circular de 10 posiciones
+//              Replica exacta del algoritmo GPSgate con expresiones de geofencing y métricas
+// ═══════════════════════════════════════════════════════════════════
+// ALGORITMO GPSgate (Líneas 56-84):
+// 1. SIEMPRE actualiza buffer circular (líneas 60-69)
+// 2. SIEMPRE calcula isValid (líneas 70-77)  
+// 3. EVALÚA solo si posición actual inválida (línea 82)
+//    - Si buffer completo (10 posiciones): Calcula métricas y evalúa thresholds
+//    - Si buffer incompleto: Solo registra y continúa
+// ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+// PASO 1: BUFFER UPDATE - SIEMPRE se ejecuta primero
+// ═══════════════════════════════════════════════════════════════════
+
+rule JammerReal_BufferUpdate "Buffer update SIEMPRE (réplica GPSgate)" salience 300 {
+    when
+        Jono.DebugProcessed &&
+        !Jono.BufferUpdated
+    then
+        // CRÍTICO: SIEMPRE actualiza buffer, independiente de posición válida/inválida
+        Jono.BufferHas10 = state.UpdateMemoryBuffer(Jono.Speed, Jono.GSMSignalStrength, 
+                                                     Jono.Datetime, Jono.PositioningStatus, 
+                                                     Jono.Latitude, Jono.Longitude);
+        
+        actions.Log("[JAMMER-REAL-BUFFER] SIEMPRE updated: Size=" + state.GetBufferSize(Jono.IMEI) + "/10, Has10=" + Jono.BufferHas10 + ", Status=" + Jono.PositioningStatus);
+        
+        // Notificar cambios a Grule para evitar memoización RETE
+        Changed("Jono.BufferUpdated");
+        Changed("Jono.BufferHas10");
+        
+        Jono.BufferUpdated = true;
+        
+        // Sincronizar flags al wrapper para auditoría de progreso
+        property.SetBufferUpdated(true);
+        property.SetBufferHas10(Jono.BufferHas10);
+        
+        // Registrar en auditoría
+        actions.Audit("JammerReal_BufferUpdate", "Buffer circular actualizado", 300, false);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PASO 2: CALCULAR MÉTRICAS - Solo si buffer completo y posición inválida
+// ═══════════════════════════════════════════════════════════════════
+
+rule JammerReal_CalculateMetrics "Calcular métricas del buffer si está listo" salience 290 {
+    when  
+        Jono.BufferUpdated &&
+        Jono.CurrentlyInvalid &&    // Solo si posición actual inválida (réplica línea 82)
+        Jono.BufferHas10 &&         // Solo si buffer completo (10 posiciones)
+        !Jono.MetricsReady
+    then
+        actions.Log("[JAMMER-REAL-METRICS] Buffer listo → Calculando métricas del buffer circular");
+        
+        // Calcular métricas desde buffer circular (réplica líneas 88-106)
+        state.CalculateJammerMetricsIfReady(Jono.CurrentlyInvalid);
+        
+        actions.Log("[JAMMER-REAL-METRICS] AvgSpeed90: " + state.GetCounter("jammer_avg_speed_90min") + " km/h");
+        actions.Log("[JAMMER-REAL-METRICS] AvgGSM5: " + state.GetCounter("jammer_avg_gsm_last5"));
+        
+        // Notificar cambios
+        Changed("Jono.MetricsReady");
+        
+        Jono.MetricsReady = true;
+        
+        // Sincronizar flag al wrapper para auditoría de progreso
+        property.SetMetricsReady(true);
+        
+        // Registrar en auditoría
+        actions.Audit("JammerReal_CalculateMetrics", "Métricas calculadas desde buffer", 290, false);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PASO 3: EVALUAR EXPRESIONES - Detección de Jammer Real
+// ═══════════════════════════════════════════════════════════════════
+
+rule JammerReal_Detection "Detección de Jammer Real con todas las expresiones" salience 100 {
+    when
+        // ✅ PREREQUISITOS: Buffer y métricas listos
+        Jono.BufferUpdated &&
+        Jono.MetricsReady &&
+        Jono.CurrentlyInvalid &&
+        
+        // 📍 EXPRESIÓN 1: Fuera de Taller
+        !state.IsInsideGroup("Taller", Jono.Latitude, Jono.Longitude) &&
+        
+        // 📍 EXPRESIÓN 2: Fuera de CLIENTES  
+        !state.IsInsideGroup("CLIENTES", Jono.Latitude, Jono.Longitude) &&
+        
+        // 📍 EXPRESIÓN 3: Fuera de Resguardo/Cedis/Puerto
+        !state.IsInsideGroup("Resguardo/Cedis/Puerto", Jono.Latitude, Jono.Longitude) &&
+        
+        // ⏰ EXPRESIÓN 4: 5+ minutos sin posición válida (offline)
+        state.IsOfflineFor(5) &&
+        
+        // 🧠 EXPRESIÓN 5: Script JavaScript (buffer circular + thresholds)
+        state.GetCounter("jammer_avg_speed_90min") >= 10 &&
+        state.GetCounter("jammer_avg_gsm_last5") >= 9 &&
+        
+        // 🚨 No se ha enviado alerta aún
+        !state.IsAlertSent("jammer_real_mercury_2025")
+    then
+        state.MarkAlertSent("jammer_real_mercury_2025");
+        
+        actions.Log("═══════════════════════════════════════════════════════");
+        actions.Log("[JAMMER-REAL] 🚨 JAMMER DETECTADO - TODAS LAS EXPRESIONES CUMPLIDAS");
+        actions.Log("═══════════════════════════════════════════════════════");
+        actions.Log("[EXPR1] ✅ Fuera de Taller");
+        actions.Log("[EXPR2] ✅ Fuera de CLIENTES"); 
+        actions.Log("[EXPR3] ✅ Fuera de Resguardo/Cedis/Puerto");
+        actions.Log("[EXPR4] ✅ Offline por 5+ minutos");
+        actions.Log("[EXPR5] ✅ Script Buffer OK");
+        actions.Log("[METRICS] Speed 90min: " + state.GetCounter("jammer_avg_speed_90min") + " km/h");
+        actions.Log("[METRICS] GSM últimos 5: " + state.GetCounter("jammer_avg_gsm_last5"));
+        actions.Log("[BUFFER] Buffer Size: " + state.GetBufferSize(Jono.IMEI) + "/10 posiciones");
+        actions.Log("[IMEI] " + Jono.IMEI);
+        actions.Log("[LOCATION] Lat: " + Jono.Latitude + ", Lon: " + Jono.Longitude);
+        actions.Log("[TIME] " + Jono.Datetime.String());
+        actions.Log("═══════════════════════════════════════════════════════");
+        
+        // Enviar alerta por Telegram (concatenación directa sin variables intermedias)
+        actions.SendTelegram(
+            "🚨 JAMMER REAL DETECTADO - Sistema Mercury\n\n" +
+            "IMEI: " + Jono.IMEI + "\n" +
+            "📋 TODAS LAS EXPRESIONES CUMPLIDAS:\n" +
+            "══════════════════════════════════\n" +
+            "✅ Expr1: Fuera de Taller\n" +
+            "✅ Expr2: Fuera de CLIENTES\n" +
+            "✅ Expr3: Fuera de Resguardo/Cedis/Puerto\n" +
+            "✅ Expr4: Offline 5+ minutos\n" +
+            "✅ Expr5: Buffer Script OK\n" +
+            "   🚗 Velocidad 90min: " + state.GetCounter("jammer_avg_speed_90min") + " km/h\n" +
+            "   📡 GSM últimos 5: " + state.GetCounter("jammer_avg_gsm_last5") + "\n" +
+            "🔄 Buffer Size: " + state.GetBufferSize(Jono.IMEI) + "/10 posiciones\n" +
+            "══════════════════════════════════\n" +
+            "📍 Lat: " + Jono.Latitude + "\n" +
+            "📍 Lon: " + Jono.Longitude + "\n" +
+            "🕐 " + Jono.Datetime.String()
+        );
+        
+        // Marcar alerta disparada
+        Jono.AlertFired = true;
+        Changed("Jono.AlertFired");
+        
+        // Sincronizar flag al wrapper para auditoría de progreso
+        property.SetAlertFired(true);
+        
+        // 🆕 NUEVO SISTEMA: Auditoría universal con snapshot automático
+        actions.Audit("JammerReal_Detection", "Jammer Real detectado con todas las expresiones", 100, true);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PASO 4: SKIP EVALUATION - Si posición válida, solo continuar
+// ═══════════════════════════════════════════════════════════════════
+
+rule JammerReal_SkipIfValid "Skip evaluación si posición válida (réplica GPSgate línea 115)" salience 280 {
+    when
+        Jono.BufferUpdated &&
+        !Jono.CurrentlyInvalid &&      // Posición válida (GPS OK)
+        !Jono.EvaluationSkipped
+    then
+        actions.Log("[JAMMER-REAL-SKIP] Posición válida → No evalúa métricas (réplica GPSgate línea 115)");
+        
+        // Notificar cambio
+        Changed("Jono.EvaluationSkipped");
+        
+        Jono.EvaluationSkipped = true;
+        
+        // Sincronizar flag al wrapper para auditoría de progreso
+        property.SetEvaluationSkipped(true);
+        
+        // Registrar en auditoría
+        actions.Audit("JammerReal_SkipIfValid", "Evaluación omitida - posición válida", 280, false);
+}

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosquitto
+  namespace: client01
+spec:
+  type: NodePort
+  selector:
+    app: mosquitto
+  ports:
+  - name: mqtt                # Name for the MQTT port
+    port: 1883                # Expose the Mosquitto MQTT port
+    targetPort: 1883          # Map to container port
+    nodePort: 30083           # External access for MQTT on NodePort 30083
+  - name: mqtt-websocket      # Name for the WebSocket port (optional)
+    port: 9001                # Optional: WebSocket port for MQTT
+    targetPort: 9001
+    nodePort: 30084

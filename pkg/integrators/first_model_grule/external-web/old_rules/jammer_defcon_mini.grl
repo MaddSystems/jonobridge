@@ -1,0 +1,64 @@
+// ═══════════════════════════════════════════════════════════════════
+// name: Jammer-Mini-DEFCON
+// category: Jammer Detection
+// description: Simplified logic to test DEFCON 2 -> 3 transition (5 min timer)
+// ═══════════════════════════════════════════════════════════════════
+
+// STEP 0: ALWAYS Update Buffer & Pre-calculate Flags
+// This rule MUST run for every packet to ensure history and timers are accurate.
+// "the buffer allways must be updated.. so this rule is infinite" (conceptually infinite stream, handled per packet)
+rule DEFCON0_Update "Step 0: Update Buffer and Timers" salience 1000 {
+    when
+        !Jono.BufferUpdated // Run once per packet
+    then
+        // 1. Update circular buffer in Go memory.
+        //    - If packet is Valid ('A'), this resets the offline timer in Go.
+        //    - If packet is Invalid ('V'), the timer continues counting.
+        Jono.BufferHas10 = state.UpdateMemoryBuffer(Jono.Speed, Jono.GSMSignalStrength, Jono.Datetime, Jono.PositioningStatus, Jono.Latitude, Jono.Longitude);
+        
+        // 2. Pre-calculate the 5-minute offline flag (Result stored in wrapper boolean)
+        //    "if we receive a Valid then the counter of time is reset" (Handled by UpdateMemoryBuffer)
+        Jono.IsOfflineFor5Min = state.IsOfflineFor(5);
+        
+        // 3. Mark as updated
+        Jono.BufferUpdated = true;
+        
+        actions.Log("✅ [MINI-DEFCON] Step 0 Done. BufferHas10=" + Jono.BufferHas10 + " | Offline5Min=" + Jono.IsOfflineFor5Min);
+        
+        Changed("Jono");
+}
+
+// STEP 1: DEFCON 1 - MEMORY BUFFER CHECK
+// "DEFCON 1 is the memory buffer" - implied check for invalid status + buffer readiness
+rule DEFCON1_CheckInvalid "Step 1: Check Invalid Status" salience 900 {
+    when
+        Jono.BufferUpdated && 
+        Jono.CurrentlyInvalid && 
+        Jono.BufferHas10 &&
+        !Jono.Cond1Passed
+    then
+        Jono.Cond1Passed = true;
+        actions.Log("✅ [MINI-DEFCON] Step 1 Passed: Invalid Packet + Full Buffer");
+        
+        Changed("Jono");
+}
+
+// STEP 2: DEFCON 2 - 5 MINUTE TIMER CHECK
+// "DEFCON2 is evaluating all the received data and if is invalid will counter for 5 minutes"
+// "Only if pass for 5 minutes of invalid we pass to defcon 3"
+rule DEFCON2_CheckTimer "Step 2: Check 5 Min Offline Timer" salience 800 {
+    when
+        Jono.Cond1Passed && 
+        Jono.IsOfflineFor5Min && // The boolean flag from Step 0
+        !Jono.Cond2Passed
+    then
+        Jono.Cond2Passed = true;
+        
+        // 🎯 GOAL REACHED
+        actions.Log("🚀 [MINI-DEFCON] Step 2 Passed: Offline > 5 Minutes -> GOAL REACHED: DEFCON 3");
+        
+        // Signal transition to DEFCON 3 (Metrics Eval)
+        property.SetMetricsReady(true);
+        
+        Changed("Jono");
+}

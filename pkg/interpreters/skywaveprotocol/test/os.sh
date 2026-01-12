@@ -1,0 +1,6 @@
+#!bin/bash
+export FROMIDSKYWAVE=13969586728 #10099079751
+
+export FROMIDSKYWAVE=3898451771
+
+go run main.go 

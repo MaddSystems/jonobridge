@@ -1,0 +1,4 @@
+2026/01/07 20:35:59 Starting GRULE Backend (Jammer) on port 8081...
+2026/01/07 20:35:59 🔌 Connecting to MySQL with DSN: gpscontrol:qazwsxedc@tcp(127.0.0.1:3306)/grule?parseTime=true&charset=utf8mb4
+2026/01/07 20:35:59 ✅ Connected to MySQL (Backend)
+2026/01/07 20:35:59 📁 Current database: grule

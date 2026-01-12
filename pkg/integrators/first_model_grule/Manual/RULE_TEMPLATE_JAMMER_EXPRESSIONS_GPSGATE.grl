@@ -1,0 +1,140 @@
+// ═══════════════════════════════════════════════════════════════════
+// SISTEMA EXPRESIONES GPSgate: "Coincidir TODO" - RÉPLICA EXACTA
+// Implementación del TODO: Sistema de Buffers Circulares en Memoria
+// ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+// PASO 1: BUFFER UPDATE - SIEMPRE se ejecuta primero (RÉPLICA GPSgate)
+// ═══════════════════════════════════════════════════════════════════
+
+rule UpdateMemoryBuffer_ALWAYS "Buffer update SIEMPRE (réplica GPSgate)" salience 300 {
+    when
+        Jono.DebugProcessed &&
+        !Jono.BufferUpdated
+    then
+        // CRÍTICO: SIEMPRE actualiza buffer, réplica líneas 60-69 GPSgate
+        bufferHas10 := state.UpdateMemoryBuffer(Jono.Speed, Jono.GSMSignalStrength, 
+                                                Jono.Datetime, Jono.PositioningStatus, 
+                                                Jono.Latitude, Jono.Longitude);
+        
+        // UNA SOLA LLAMADA: actions.Log() maneja destino automáticamente via GRULE_LOG_DESTINATION
+        actions.Log("[BUFFER] SIEMPRE updated: Size=%d/10, Has10=%v, Status='%s'", 
+                   state.GetBufferSize(Jono.IMEI), bufferHas10, Jono.PositioningStatus);
+        
+        // USAR MÉTODOS QUE EXISTEN: 
+        property.SetCond1Passed(true);      // Marca BufferUpdated como true
+        property.SetDebugProcessed(true);   // Marca BufferHas10 estado
+        
+        // CRÍTICO: Notificar cambios a Grule para evitar memoización RETE
+        // Manual RETE_en.md línea 217: "tell grule if the variable has changed using Changed function"
+        Changed("Jono.BufferUpdated");
+        Changed("Jono.BufferHas10");
+        
+        Jono.BufferUpdated = true;
+        Jono.BufferHas10 = bufferHas10;
+        
+        // ✅ SIN RETRACT: Dejar que salience controle flujo natural
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PASO 2: CALCULAR MÉTRICAS si buffer completo + posición inválida
+// ═══════════════════════════════════════════════════════════════════
+
+rule CalculateMetrics_IfReady "Calcular métricas del buffer si está listo" salience 290 {
+    when  
+        Jono.BufferUpdated &&
+        Jono.CurrentlyInvalid &&    // Solo si posición actual inválida
+        Jono.BufferHas10 &&         // Solo si buffer completo (10 posiciones)
+        !Jono.MetricsReady
+    then
+        actions.Log("[METRICS-START] Buffer listo → Calculando métricas del buffer circular");
+        
+        // Calcular métricas desde buffer circular (réplica líneas 88-106)
+        metricsCalculated := state.CalculateJammerMetricsIfReady(Jono.CurrentlyInvalid);
+        
+        actions.Log("[METRICS-RESULT] AvgSpeed90=%d km/h AvgGSM5=%d", 
+                   state.GetCounter("jammer_avg_speed_90min"), state.GetCounter("jammer_avg_gsm_last5"));
+        
+        // USAR MÉTODO QUE EXISTE:
+        state.SetCounter("metrics_ready_flag", 1); // Marca métricas como listas
+        
+        // CRÍTICO: Notificar cambios a Grule para evitar memoización RETE
+        Changed("Jono.MetricsReady");
+        
+        Jono.MetricsReady = metricsCalculated;
+        
+        // ✅ SIN RETRACT: Dejar que salience controle flujo natural
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// EXPRESIONES GPSgate: "Coincidir TODO" - UNA SOLA REGLA CON AND
+// ═══════════════════════════════════════════════════════════════════
+
+rule JammerExpressions_MatchAll "Sistema expresiones GPSgate: Coincidir TODO" salience 100 {
+    when
+        // ✅ PREREQUISITOS: Buffer y métricas listos
+        Jono.BufferUpdated &&
+        Jono.MetricsReady &&
+        Jono.CurrentlyInvalid &&
+        
+        // 📍 EXPRESIÓN 1: Fuera de Taller
+        !state.IsInsideGroup("Taller", Jono.Latitude, Jono.Longitude) &&
+        
+        // 📍 EXPRESIÓN 2: Fuera de CLIENTES  
+        !state.IsInsideGroup("CLIENTES", Jono.Latitude, Jono.Longitude) &&
+        
+        // 📍 EXPRESIÓN 3: Fuera de Resguardo/Cedis/Puerto
+        !state.IsInsideGroup("Resguardo/Cedis/Puerto", Jono.Latitude, Jono.Longitude) &&
+        
+        // ⏰ EXPRESIÓN 4: 5+ minutos sin posición válida (offline)
+        state.IsOfflineFor(5) &&
+        
+        // 🧠 EXPRESIÓN 5: Script JavaScript (buffer circular + thresholds)
+        state.GetCounter("jammer_avg_speed_90min") >= 10 &&
+        state.GetCounter("jammer_avg_gsm_last5") >= 9 &&
+        
+        // 🚨 No se ha enviado alerta aún
+        !state.IsAlertSent("jammer_gpsgate_expressions_2025")
+    then
+        state.MarkAlertSent("jammer_gpsgate_expressions_2025");
+        
+        actions.Log("═══════════════════════════════════════════════════════");
+        actions.Log("[EXPRESSIONS] 🚨 TODAS LAS EXPRESIONES CUMPLIDAS");
+        actions.Log("═══════════════════════════════════════════════════════");
+        actions.Log("[EXPR1] ✅ Fuera de Taller");
+        actions.Log("[EXPR2] ✅ Fuera de CLIENTES"); 
+        actions.Log("[EXPR3] ✅ Fuera de Resguardo/Cedis/Puerto");
+        actions.Log("[EXPR4] ✅ Offline por 5+ minutos");
+        actions.Log("[EXPR5] ✅ Script Buffer: Speed=%d km/h GSM=%d", 
+                   state.GetCounter("jammer_avg_speed_90min"), state.GetCounter("jammer_avg_gsm_last5"));
+        actions.Log("[BUFFER] Buffer circular: 10/10 posiciones completas");
+        actions.Log("═══════════════════════════════════════════════════════");
+        
+        actions.SendTelegram(
+            "🚨 JAMMER DETECTADO - Sistema Expresiones GPSgate\n\n" +
+            "IMEI: " + Jono.IMEI + "\n" +
+            "📋 TODAS LAS EXPRESIONES CUMPLIDAS:\n" +
+            "══════════════════════════════════\n" +
+            "✅ Expr1: Fuera de Taller\n" +
+            "✅ Expr2: Fuera de CLIENTES\n" +
+            "✅ Expr3: Fuera de Resguardo/Cedis/Puerto\n" +
+            "✅ Expr4: Offline 5+ minutos\n" +
+            "✅ Expr5: Buffer Script OK\n" +
+            "   🚗 Velocidad 90min: " + state.GetCounter("jammer_avg_speed_90min") + " km/h\n" +
+            "   📡 GSM últimos 5: " + state.GetCounter("jammer_avg_gsm_last5") + "\n" +
+            "🔄 Buffer circular: 10/10 posiciones\n" +
+            "══════════════════════════════════\n" +
+            "📍 " + Jono.Latitude + "," + Jono.Longitude + "\n" +
+            "🕐 " + Jono.Datetime
+        );
+        
+        // USAR MÉTODO QUE EXISTE:
+        state.SetCounter("alert_fired_flag", 1); // Marca alerta como enviada
+        
+        // CRÍTICO: Notificar cambio a Grule para evitar memoización RETE
+        Changed("Jono.AlertFired");
+        
+        Jono.AlertFired = true;
+        
+        // ✅ SIN RETRACT: Una vez disparada, condition !state.IsAlertSent() previene re-ejecución
+}

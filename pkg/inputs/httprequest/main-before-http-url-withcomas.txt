@@ -1,0 +1,352 @@
+package main
+
+/*Autor: Maria Lacayo / Jorge Macias
+Created: 07/06/2024
+Modified: 09/05/2025
+Conexion: UDP
+Descripción:
+	Este servicio funciona con un cron que se ejecuta cada 3 minutos
+	El servicio consume una API de SpotX y actualiza la posicion de todos
+	los equipos registrados en Bridge y los envia a Server1*/
+
+import (
+	"encoding/hex"
+	"encoding/xml"
+	"flag"
+	"fmt"
+	"httprequest/utils"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"html"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	_ "github.com/go-sql-driver/mysql"
+)
+
+var mqttClient mqtt.Client
+
+// SkyWave XML response structure for pagination
+type SkyWaveResponse struct {
+	XMLName     xml.Name `xml:"GetReturnMessagesResult"`
+	ErrorID     string   `xml:"ErrorID"`
+	More        string   `xml:"More"`
+	NextStartID string   `xml:"NextStartID"`
+}
+
+// SkyWave configuration structure
+type SkyWaveConfig struct {
+	AccessID uint64
+	Password string
+	FromID   uint64
+	Enabled  bool
+}
+
+// Check if SkyWave/ORBCOMM variables are configured
+func getSkyWaveConfig() *SkyWaveConfig {
+	config := &SkyWaveConfig{}
+
+	// Check if SKYWAVE_ACCESS_ID is set
+	accessIDStr := os.Getenv("SKYWAVE_ACCESS_ID")
+	if accessIDStr == "" {
+		return &SkyWaveConfig{Enabled: false}
+	}
+
+	accessID, err := strconv.ParseUint(accessIDStr, 10, 64)
+	if err != nil {
+		utils.VPrint("Invalid SKYWAVE_ACCESS_ID: %v", err)
+		return &SkyWaveConfig{Enabled: false}
+	}
+	config.AccessID = accessID
+
+	// Check password
+	config.Password = os.Getenv("SKYWAVE_PASSWORD")
+	if config.Password == "" {
+		utils.VPrint("SKYWAVE_PASSWORD not set")
+		return &SkyWaveConfig{Enabled: false}
+	}
+
+	// Check FromID
+	fromIDStr := os.Getenv("SKYWAVE_FROM_ID")
+	if fromIDStr == "" {
+		utils.VPrint("SKYWAVE_FROM_ID not set")
+		return &SkyWaveConfig{Enabled: false}
+	}
+
+	fromID, err := strconv.ParseUint(fromIDStr, 10, 64)
+	if err != nil {
+		utils.VPrint("Invalid SKYWAVE_FROM_ID: %v", err)
+		return &SkyWaveConfig{Enabled: false}
+	}
+	config.FromID = fromID
+	config.Enabled = true
+
+	//utils.VPrint("SkyWave configuration loaded - AccessID: %d, FromID: %d", config.AccessID, config.FromID)
+	return config
+}
+
+func getEnvWithDefault(key, defaultValue string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return defaultValue
+}
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func getRequiredEnv(key string) string {
+	value, exists := os.LookupEnv(key)
+	if !exists {
+		log.Fatalf("Error: Required environment variable %s is not set", key)
+	}
+	return value
+}
+
+func getPollingTime() time.Duration {
+	pollStr := getEnvWithDefault("HTTP_POLLING_TIME", "180")
+	pollTime, err := strconv.Atoi(pollStr)
+	if err != nil {
+		log.Printf("Invalid HTTP_POLLING_TIME value: %s, using default of 180 seconds", pollStr)
+		return 180 * time.Second
+	}
+	return time.Duration(pollTime) * time.Second
+}
+
+func setupMQTT() error {
+	mqttBrokerHost := getRequiredEnv("MQTT_BROKER_HOST")
+	opts := mqtt.NewClientOptions()
+	opts.SetClientID("http-request-client")
+	opts.AddBroker(fmt.Sprintf("tcp://%s:1883", mqttBrokerHost))
+
+	// Create and start a client using the above ClientOptions
+	mqttClient = mqtt.NewClient(opts)
+	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("error connecting to MQTT broker: %v", token.Error())
+	}
+
+	return nil
+}
+
+func processHttpData() error {
+	url := getRequiredEnv("HTTP_URL")
+	utils.VPrint("Fetching data from HTTP GET: %s\n", url)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("error making GET request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading response body: %v", err)
+	}
+	bytes := []byte(body)
+	hexString := hex.EncodeToString(bytes)
+
+	// Create a fixed 32-byte buffer
+	dump := hex.Dump(body[:min(32, len(body))])
+	escapedDump := html.EscapeString(dump)
+	utils.VPrint("Data fetched from HTTP:\n%s\n", escapedDump)
+	// Publish to MQTT
+	if token := mqttClient.Publish("http/get", 0, false, hexString); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("error publishing to MQTT: %v", token.Error())
+	}
+
+	return nil
+}
+
+// Process SkyWave/ORBCOMM data and send to MQTT
+func processSkyWaveData(config *SkyWaveConfig, pollInterval time.Duration) error {
+	// Calculate UTC time range based on polling interval
+	// Use the exact polling duration rather than converting to whole minutes
+	// to avoid truncation and incorrect ranges.
+	nowUTC := time.Now().UTC()
+	fromTime := nowUTC.Add(-pollInterval).Format("2006-01-02 15:04:05")
+	endTime := nowUTC.Format("2006-01-02 15:04:05")
+
+	utils.VPrint("Using polling interval of %v — UTC: %s — from %s to %s", pollInterval, nowUTC.Format("2006-01-02 15:04:05"), fromTime, endTime)
+
+	// Pagination support: loop until More=false
+	var nextStartID string
+	pageNum := 0
+	totalEventsPublished := 0
+
+	for {
+		pageNum++
+		var apiUrl string
+
+		// Build query parameters
+		startEsc := strings.ReplaceAll(fromTime, " ", "+")
+		endEsc := strings.ReplaceAll(endTime, " ", "+")
+
+		// Check if HTTP_URL is provided first
+		if httpUrl := os.Getenv("HTTP_URL"); httpUrl != "" {
+			// Parse the base URL
+			parsedUrl, err := url.Parse(httpUrl)
+			if err != nil {
+				return fmt.Errorf("error parsing HTTP_URL: %v", err)
+			}
+
+			// Construct base (scheme://host/path) to avoid carrying any existing query
+			baseURL := parsedUrl.Scheme + "://" + parsedUrl.Host + parsedUrl.Path
+
+			// Build URL with pagination support
+			if nextStartID != "" {
+				// Subsequent pages: include start_id for pagination
+				apiUrl = fmt.Sprintf("%s?access_id=%d&password=%s&from_id=%d&start_utc=%s&end_utc=%s&start_id=%s",
+					baseURL, config.AccessID, config.Password, config.FromID, startEsc, endEsc, nextStartID)
+			} else {
+				// First page: no start_id
+				apiUrl = fmt.Sprintf("%s?access_id=%d&password=%s&from_id=%d&start_utc=%s&end_utc=%s",
+					baseURL, config.AccessID, config.Password, config.FromID, startEsc, endEsc)
+			}
+
+			if pageNum == 1 {
+				utils.VPrint("Using HTTP_URL for SkyWave API: %s\n", apiUrl)
+			} else {
+				utils.VPrint("Fetching page %d with start_id=%s", pageNum, nextStartID)
+			}
+		} else {
+			// Fall back to hardcoded URL template
+			if nextStartID != "" {
+				apiUrl = fmt.Sprintf("https://isatdatapro.skywave.com/GLGW/GWServices_v1/RestMessages.svc/get_return_messages.xml?access_id=%d&password=%s&from_id=%d&start_utc=%s&end_utc=%s&start_id=%s",
+					config.AccessID, config.Password, config.FromID, url.QueryEscape(fromTime), url.QueryEscape(endTime), nextStartID)
+			} else {
+				apiUrl = fmt.Sprintf("https://isatdatapro.skywave.com/GLGW/GWServices_v1/RestMessages.svc/get_return_messages.xml?access_id=%d&password=%s&from_id=%d&start_utc=%s&end_utc=%s",
+					config.AccessID, config.Password, config.FromID, url.QueryEscape(fromTime), url.QueryEscape(endTime))
+			}
+			if pageNum == 1 {
+				utils.VPrint("Using default SkyWave API URL: %s\n", apiUrl)
+			} else {
+				utils.VPrint("Fetching page %d with start_id=%s", pageNum, nextStartID)
+			}
+		}
+
+		resp, err := http.Get(apiUrl)
+		if err != nil {
+			return fmt.Errorf("error making SkyWave API request (page %d): %v", pageNum, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("SkyWave API returned status %d (page %d)", resp.StatusCode, pageNum)
+		}
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("error reading SkyWave response body (page %d): %v", pageNum, err)
+		}
+
+		// Print the full XML response in verbose mode
+		utils.VPrint("=== SkyWave API Response (Page %d) ===", pageNum)
+		utils.VPrint("%s", string(body))
+		utils.VPrint("=== End of Response (Page %d) ===\n", pageNum)
+
+		// Parse XML to check pagination fields
+		var skyResp SkyWaveResponse
+		if err := xml.Unmarshal(body, &skyResp); err != nil {
+			utils.VPrint("Warning: Failed to parse XML for pagination on page %d: %v", pageNum, err)
+			// Continue anyway and publish this page
+		}
+
+		// Convert to hex for MQTT transmission
+		hexString := hex.EncodeToString(body)
+		utils.VPrint("Page %d: Hex string length: %d characters", pageNum, len(hexString))
+		utils.VPrint("=== Hex String (Page %d) ===", pageNum)
+		utils.VPrint("%s", hexString)
+		utils.VPrint("=== End of Hex String (Page %d) ===\n", pageNum)
+
+		// Publish to MQTT with skywave topic
+		if token := mqttClient.Publish("skywave/xml", 0, false, hexString); token.Wait() && token.Error() != nil {
+			return fmt.Errorf("error publishing SkyWave data (page %d) to MQTT: %v", pageNum, token.Error())
+		}
+
+		utils.VPrint("Page %d: Successfully published to MQTT topic 'skywave/xml'", pageNum)
+		totalEventsPublished++
+
+		// Check if there are more pages
+		if strings.ToLower(strings.TrimSpace(skyResp.More)) == "true" && skyResp.NextStartID != "" {
+			nextStartID = skyResp.NextStartID
+			utils.VPrint("More pages available, NextStartID: %s", nextStartID)
+			// Continue to next page
+		} else {
+			// No more pages
+			utils.VPrint("No more pages. Total pages retrieved: %d", pageNum)
+			break
+		}
+
+		// Safety limit to avoid infinite loops
+		if pageNum >= 100 {
+			utils.VPrint("Warning: Reached page limit (100), stopping pagination")
+			break
+		}
+	}
+
+	utils.VPrint("Pagination complete: %d pages published to MQTT", totalEventsPublished)
+	return nil
+}
+
+func main() {
+	// Add debug flag
+	debugFlag := flag.Bool("v", false, "Enable verbose output")
+	flag.Parse()
+	utils.SetVerbose(*debugFlag)
+
+	pollInterval := getPollingTime()
+	//utils.VPrint("Using polling interval of %v", pollInterval)
+
+	// Check for SkyWave configuration
+	skyWaveConfig := getSkyWaveConfig()
+	if skyWaveConfig.Enabled {
+		//utils.VPrint("SkyWave mode enabled - will fetch data from SkyWave API")
+	} else {
+		utils.VPrint("SkyWave mode disabled - will use HTTP_URL if configured")
+	}
+
+	// Setup MQTT client
+	if err := setupMQTT(); err != nil {
+		log.Fatalf("Failed to setup MQTT client: %v", err)
+	}
+	defer mqttClient.Disconnect(250)
+
+	// Main polling loop
+	for {
+		startTime := time.Now()
+		//utils.VPrint("Starting polling cycle at %v", startTime.Format(time.RFC3339))
+
+		// Process data based on configuration
+		if skyWaveConfig.Enabled {
+			// Process SkyWave/ORBCOMM data
+			if err := processSkyWaveData(skyWaveConfig, pollInterval); err != nil {
+				log.Printf("Error processing SkyWave data: %v", err)
+			}
+		} else {
+			// Fall back to original HTTP behavior
+			if err := processHttpData(); err != nil {
+				log.Printf("Error processing HTTP data: %v", err)
+			}
+		}
+
+		elapsed := time.Since(startTime)
+		//utils.VPrint("Polling cycle completed in %v", elapsed)
+
+		// Calculate sleep time, ensuring we don't have negative wait
+		sleepTime := pollInterval - elapsed
+		if sleepTime < 0 {
+			sleepTime = 0
+		}
+
+		utils.VPrint("Waiting %v until next cycle", sleepTime)
+		time.Sleep(sleepTime)
+	}
+}

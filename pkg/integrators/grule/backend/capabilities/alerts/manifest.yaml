@@ -1,0 +1,41 @@
+name: alerts
+version: "1.0.0"
+description: Alerting channels and spam protection
+grule_context_name: actions
+
+functions:
+  - name: SendTelegram
+    description: Send message to configured Telegram chat
+    parameters:
+      - name: message
+        type: string
+  - name: Log
+    description: Log message to backend logs
+    parameters:
+      - name: message
+        type: string
+  - name: MarkAlertSent
+    description: Mark an alert as sent for the device
+    parameters:
+      - name: imei
+        type: string
+      - name: alertID
+        type: string
+    return_type: bool
+  - name: Audit
+    description: Record rule execution step
+    parameters:
+      - name: ruleName
+        type: string
+      - name: description
+        type: string
+      - name: salience
+        type: int64
+      - name: alertFired
+        type: bool
+  - name: CastString
+    description: Cast value to string
+    parameters:
+      - name: value
+        type: any
+    return_type: string

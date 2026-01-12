@@ -1,0 +1,736 @@
+package main
+
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"regexp"
+	"runtime"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+
+	"gpsgatehttp/utils"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	_ "github.com/go-sql-driver/mysql"
+)
+
+// Global variables for monitoring and crash prevention
+var lastProcessedMessage time.Time
+var messageCounter int64
+var processingMutex sync.RWMutex
+
+// TelegramChatResponse represents the response from the chat_id API
+type TelegramChatResponse struct {
+	ChatID string `json:"chat_id"`
+}
+
+// sendTelegramNotification sends a notification to Telegram after successful Elasticsearch operation
+func sendTelegramNotification(data map[string]interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC RECOVERED in sendTelegramNotification: %v", r)
+			log.Printf("Stack trace: %s", debug.Stack())
+		}
+	}()
+
+	// Get environment variables
+	testMode := os.Getenv("GPSGATE_TEST_TELEGRAM")
+	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	telegramAPIURL := os.Getenv("TELEGRAM_API_URL")
+	testChatID := os.Getenv("GPSGATE_TEST_CHAT_ID")
+
+	if telegramToken == "" {
+		log.Printf("TELEGRAM_BOT_TOKEN not set, skipping Telegram notification")
+		return
+	}
+
+	log.Printf("Processing Telegram notification - Test mode: %s", testMode)
+
+	// Extract required fields from data
+	originalAppID, _ := data["APP_ID"].(string)
+	deviceIMEI, _ := data["DEVICE_IMEI"].(string)
+
+	// Get the correct APP_ID from EGO API using DEVICE_IMEI
+	var appID string
+	var appNameFromEGO string
+	if testMode != "Y" && deviceIMEI != "" {
+		egoAPIURL := os.Getenv("EGO_API_URL")
+		if egoAPIURL != "" {
+			// Call EGO API to get correct APP_ID
+			egoURL := fmt.Sprintf("%s?filter=imei&filter_value=%s", egoAPIURL, deviceIMEI)
+			log.Printf("Getting correct APP_ID from EGO API: %s", egoURL)
+
+			resp, err := http.Get(egoURL)
+			if err != nil {
+				log.Printf("Error calling EGO API: %v, using original APP_ID: %s", err, originalAppID)
+				appID = originalAppID
+			} else {
+				defer resp.Body.Close()
+
+				if resp.StatusCode == http.StatusOK {
+					var egoResp map[string]interface{}
+					if err := json.NewDecoder(resp.Body).Decode(&egoResp); err != nil {
+						log.Printf("Error decoding EGO API response: %v, using original APP_ID: %s", err, originalAppID)
+						appID = originalAppID
+					} else {
+						// Extract APP_ID
+						if egoAppID, exists := egoResp["APP ID"]; exists {
+							if appIDFloat, ok := egoAppID.(float64); ok {
+								appID = fmt.Sprintf("%.0f", appIDFloat)
+								log.Printf("Retrieved correct APP_ID from EGO API: %s (original was: %s) for IMEI: %s", appID, originalAppID, deviceIMEI)
+							} else if appIDStr, ok := egoAppID.(string); ok {
+								appID = appIDStr
+								log.Printf("Retrieved correct APP_ID from EGO API: %s (original was: %s) for IMEI: %s", appID, originalAppID, deviceIMEI)
+							} else {
+								log.Printf("APP ID field type unexpected in EGO response, using original APP_ID: %s", originalAppID)
+								appID = originalAppID
+							}
+						} else {
+							log.Printf("APP ID not found in EGO API response, using original APP_ID: %s", originalAppID)
+							appID = originalAppID
+						}
+
+						// Extract "Nombre de Aplicación server 1"
+						if appNameEGO, exists := egoResp["Nombre de Aplicación server 1"]; exists {
+							if appNameStr, ok := appNameEGO.(string); ok {
+								appNameFromEGO = appNameStr
+								log.Printf("Retrieved application name from EGO API: %s for IMEI: %s", appNameFromEGO, deviceIMEI)
+							}
+						}
+					}
+				} else {
+					log.Printf("EGO API returned status %d, using original APP_ID: %s", resp.StatusCode, originalAppID)
+					appID = originalAppID
+				}
+			}
+		} else {
+			log.Printf("EGO_API_URL not set, using original APP_ID: %s", originalAppID)
+			appID = originalAppID
+		}
+	} else {
+		appID = originalAppID
+		if testMode == "Y" {
+			log.Printf("Test mode enabled, using original APP_ID: %s", originalAppID)
+		} else if deviceIMEI == "" {
+			log.Printf("DEVICE_IMEI not found, using original APP_ID: %s", originalAppID)
+		}
+	}
+
+	// Try fields in priority order: USER_NAME → ASSIGNED_VEHICLE_DESC → ASSIGNED_VEHICLE_NAME → DRIVER_DESCRIPTION
+	assignedVehicleDesc, _ := data["USER_NAME"].(string)
+	if assignedVehicleDesc != "" {
+		log.Printf("Using USER_NAME for vehicle description: %s", assignedVehicleDesc)
+	} else {
+		assignedVehicleDesc, _ = data["ASSIGNED_VEHICLE_DESC"].(string)
+		if assignedVehicleDesc != "" {
+			log.Printf("Using ASSIGNED_VEHICLE_DESC for vehicle description: %s", assignedVehicleDesc)
+		} else {
+			assignedVehicleDesc, _ = data["ASSIGNED_VEHICLE_NAME"].(string)
+			if assignedVehicleDesc != "" {
+				log.Printf("Using ASSIGNED_VEHICLE_NAME as fallback for vehicle description: %s", assignedVehicleDesc)
+			} else {
+				assignedVehicleDesc, _ = data["DRIVER_DESCRIPTION"].(string)
+				log.Printf("Using DRIVER_DESCRIPTION as final fallback for vehicle description: %s", assignedVehicleDesc)
+			}
+		}
+	}
+
+	ruleName, _ := data["RULE_NAME"].(string)
+	eventTimeUTC, _ := data["EVENT_TIME"].(string)
+	posLatitude, _ := data["POS_LATITUDE"].(string)
+	posLongitude, _ := data["POS_LONGITUDE"].(string)
+	deviceIMEI, _ = data["DEVICE_IMEI"].(string)
+
+	// Convert UTC time to Mexico City time
+	var eventTime string
+	if eventTimeUTC != "" {
+		// Parse the UTC time (format: 2025-09-29T16:07:13)
+		if parsedTime, err := time.Parse("2006-01-02T15:04:05", eventTimeUTC); err != nil {
+			log.Printf("Warning: Could not parse EVENT_TIME '%s', using original: %v", eventTimeUTC, err)
+			eventTime = eventTimeUTC
+		} else {
+			// Load Mexico City timezone
+			mexicoTZ, err := time.LoadLocation("America/Mexico_City")
+			if err != nil {
+				log.Printf("Warning: Could not load Mexico City timezone, using UTC: %v", err)
+				eventTime = eventTimeUTC
+			} else {
+				// Convert UTC to Mexico City time
+				mexicoTime := parsedTime.UTC().In(mexicoTZ)
+				eventTime = mexicoTime.Format("2006-01-02 15:04:05 MST")
+				log.Printf("Converted time from UTC '%s' to Mexico City '%s'", eventTimeUTC, eventTime)
+			}
+		}
+	} else {
+		eventTime = eventTimeUTC
+	}
+
+	log.Printf("Extracted fields - APP_ID: %s, Vehicle: %s, Rule: %s, Event Time: %s",
+		appID, assignedVehicleDesc, ruleName, eventTime)
+
+	// Determine chat_id based on test mode
+	var chatID string
+	if testMode == "Y" {
+		if testChatID == "" {
+			testChatID = "-1002135388607" // Default fallback if not set in env
+			log.Printf("GPSGATE_TEST_CHAT_ID not set, using default: %s", testChatID)
+		}
+		chatID = testChatID
+		log.Printf("Using test Telegram chat_id: %s", chatID)
+	} else {
+		if telegramAPIURL == "" {
+			log.Printf("TELEGRAM_API_URL not set and not in test mode, skipping Telegram notification")
+			return
+		}
+
+		if appID == "" {
+			log.Printf("APP_ID not found in data, skipping Telegram notification")
+			return
+		}
+
+		// Get chat_id from API
+		apiURL := fmt.Sprintf("%s?appid=%s", telegramAPIURL, appID)
+		log.Printf("Getting chat_id from API: %s", apiURL)
+
+		resp, err := http.Get(apiURL)
+		if err != nil {
+			log.Printf("Error getting chat_id from API: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("API returned status %d when getting chat_id", resp.StatusCode)
+			return
+		}
+
+		var chatResp TelegramChatResponse
+		if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+			log.Printf("Error decoding chat_id response: %v", err)
+			return
+		}
+
+		chatID = chatResp.ChatID
+		log.Printf("Retrieved chat_id from API: %s for app_id: %s", chatID, appID)
+	}
+
+	// Format the message
+	header := os.Getenv("TELEGRAM_MESSAGE_HEADER")
+	if header == "" {
+		header = "🚨 *Alerta: %s*"
+	}
+	message := fmt.Sprintf(header+"\n\n"+
+		"*Unidad:* %s\n"+
+		"*Fecha y hora:* %s",
+		ruleName, assignedVehicleDesc, eventTime)
+
+	// Add application name for specific chat_id
+	if chatID == "-4762712497" {
+		if deviceIMEI != "" {
+			message += fmt.Sprintf("\n*IMEI:* %s", deviceIMEI)
+		}
+	}
+
+	// Add additional fields from environment variable
+	additionalFields := os.Getenv("TELEGRAM_ADDITIONAL_FIELDS")
+	if additionalFields != "" {
+		fieldList := strings.Split(additionalFields, ",")
+		for _, field := range fieldList {
+			field = strings.TrimSpace(field)
+			if value, exists := data[field]; exists {
+				if strVal, ok := value.(string); ok && strVal != "" {
+					message += fmt.Sprintf("\n*%s:* %s", field, strVal)
+				}
+			}
+		}
+	}
+
+	log.Printf("Final Telegram message to be sent: %s", message)
+	log.Printf("Telegram message prepared for chat_id: %s", chatID)
+
+	// Send the text message first
+	telegramURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", telegramToken)
+
+	payload := map[string]interface{}{
+		"chat_id":    chatID,
+		"text":       message,
+		"parse_mode": "Markdown",
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error marshaling Telegram payload: %v", err)
+		return
+	}
+
+	// Send text message to Telegram
+	resp, err := http.Post(telegramURL, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("Error sending Telegram notification: %v", err)
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("Telegram text notification sent successfully to chat_id: %s", chatID)
+	} else {
+		log.Printf("Telegram text API returned status %d", resp.StatusCode)
+		return
+	}
+
+	// Send location as a separate message if coordinates are available
+	if posLatitude != "" && posLongitude != "" {
+		locationURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendLocation", telegramToken)
+
+		locationPayload := map[string]interface{}{
+			"chat_id":   chatID,
+			"latitude":  posLatitude,
+			"longitude": posLongitude,
+		}
+
+		locationJSON, err := json.Marshal(locationPayload)
+		if err != nil {
+			log.Printf("Error marshaling location payload: %v", err)
+			return
+		}
+
+		// Send location to Telegram
+		locationResp, err := http.Post(locationURL, "application/json", bytes.NewBuffer(locationJSON))
+		if err != nil {
+			log.Printf("Error sending Telegram location: %v", err)
+			return
+		}
+		defer locationResp.Body.Close()
+
+		if locationResp.StatusCode == http.StatusOK {
+			log.Printf("Telegram location sent successfully to chat_id: %s (lat: %s, lon: %s)",
+				chatID, posLatitude, posLongitude)
+		} else {
+			log.Printf("Telegram location API returned status %d", locationResp.StatusCode)
+		}
+	}
+}
+
+// messageHandler handles MQTT messages with enhanced logging and error handling
+func messageHandler(client mqtt.Client, msg mqtt.Message) {
+	// Add comprehensive panic recovery to prevent service crashes
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC RECOVERED in messageHandler: %v", r)
+			log.Printf("Stack trace: %s", debug.Stack())
+			log.Printf("CRITICAL ERROR: Panic recovered, service continuing. Check logs for stack trace.")
+		}
+	}()
+
+	// Setup monitoring with processing timeout detection
+	startTime := time.Now()
+	defer func() {
+		processingTime := time.Since(startTime)
+		if processingTime > 5*time.Second {
+			log.Printf("WARNING: Message processing took %v seconds (potentially stuck)", processingTime.Seconds())
+		}
+	}()
+
+	// Update message processing tracking
+	processingMutex.Lock()
+	lastProcessedMessage = time.Now()
+	messageCounter++
+	currentCounter := messageCounter
+	processingMutex.Unlock()
+
+	log.Printf("=== MQTT MESSAGE RECEIVED #%d ===", currentCounter)
+	log.Printf("Topic: %s", msg.Topic())
+	log.Printf("Message ID: %d", msg.MessageID())
+	log.Printf("Payload length: %d", len(msg.Payload()))
+
+	trackerPayload := string(msg.Payload())
+	var trackerData []byte
+
+	// Try to decode as hex, if it fails, use the original message
+	bytes, err := hex.DecodeString(trackerPayload)
+	if err != nil {
+		trackerData = []byte(trackerPayload)
+		log.Printf("Using original payload (not hex): %s", trackerPayload)
+	} else {
+		trackerData = bytes
+		log.Printf("Decoded hex payload: %s", string(trackerData))
+	}
+
+	// Sanitize the tracker data to fix invalid URL escapes
+	sanitizedData := SanitizeInvalidURLS(trackerData)
+
+	// Unmarshal JSON into a map with enhanced error handling
+	var data Message
+	if err := json.Unmarshal(sanitizedData, &data); err != nil {
+		log.Printf("ERROR: Failed to unmarshal JSON payload: %v", err)
+		log.Printf("Raw data (first 500 chars): %s", string(sanitizedData)[:min(len(sanitizedData), 500)])
+		log.Printf("CRITICAL: Skipping malformed message to prevent further processing errors")
+		return
+	}
+
+	// Validate that we actually have data to process
+	if len(data) == 0 {
+		log.Printf("WARNING: Received empty data map, skipping processing")
+		return
+	}
+
+	// Get the document name from environment variable with validation
+	elasticDocName := os.Getenv("ELASTIC_DOC_NAME")
+	if elasticDocName == "" {
+		elasticDocName = "gpsgate_default" // Fallback if not set
+		log.Println("Warning: ELASTIC_DOC_NAME not set, using default 'gpsgate_default'")
+	}
+
+	// Decode percent-encoded characters in all string fields
+	log.Printf("Decoding percent-encoded characters in GPS data...")
+	decodedData := decodeAllStringFields(data)
+
+	// Add timeout protection for Elasticsearch operations
+	log.Printf("Sending all message fields dynamically to Elasticsearch - Index: %s", elasticDocName)
+	log.Printf("Available fields: %v", getMapKeys(decodedData))
+
+	// Wrap Elasticsearch call with error recovery
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC RECOVERED in Elasticsearch operation: %v", r)
+				log.Printf("Stack trace: %s", debug.Stack())
+			}
+		}()
+
+		if err := utils.SendDynamicToElastic(decodedData, elasticDocName); err != nil {
+			log.Printf("ERROR: Failed to send to Elasticsearch index '%s': %v", elasticDocName, err)
+			log.Printf("Data that failed to send (truncated): %+v", truncateMapForLogging(decodedData))
+		} else {
+			log.Printf("Successfully sent data to Elasticsearch index: '%s'", elasticDocName)
+			// Send Telegram notification after successful Elasticsearch operation
+			sendTelegramNotification(decodedData)
+		}
+	}()
+}
+
+func processGPSgateData() error {
+	// Set up MQTT client options
+	opts := mqtt.NewClientOptions()
+	mqttBrokerHost := os.Getenv("MQTT_BROKER_HOST")
+	if mqttBrokerHost == "" {
+		log.Fatal("MQTT_BROKER_HOST environment variable not set")
+	}
+	brokerURL := fmt.Sprintf("tcp://%s:1883", mqttBrokerHost)
+	opts.AddBroker(brokerURL)
+
+	// Get hostname with fallback
+	hostname := os.Getenv("HOSTNAME")
+	if hostname == "" {
+		if h, err := os.Hostname(); err == nil {
+			hostname = h
+		} else {
+			hostname = "unknown"
+		}
+	}
+
+	// Use a more stable client ID - remove the random component that changes on restart
+	clientID := fmt.Sprintf("%s", hostname)
+	opts.SetClientID(clientID)
+	log.Printf("Using MQTT Client ID: %s", clientID)
+
+	// CRITICAL FIXES for MQTT connection stability - match working Pino configuration
+	opts.SetCleanSession(false) // Maintain persistent session like working Pino code
+	opts.SetAutoReconnect(true)
+	opts.SetKeepAlive(60 * time.Second) // Match Pino code settings
+	opts.SetOrderMatters(true)          // Match Pino code - maintain message order
+	opts.SetResumeSubs(true)            // Match Pino code - resume stored subscriptions
+
+	// Enhanced connection handlers
+	opts.SetConnectionLostHandler(func(client mqtt.Client, err error) {
+		log.Printf("MQTT Connection lost: %v", err)
+		log.Printf("Client connected status: %t", client.IsConnected())
+	})
+	opts.SetReconnectingHandler(func(client mqtt.Client, opts *mqtt.ClientOptions) {
+		log.Printf("MQTT Attempting to reconnect to broker")
+	})
+
+	// Add connection established handler with re-subscription
+	opts.SetOnConnectHandler(func(client mqtt.Client) {
+		log.Printf("MQTT Client connected successfully")
+		// Re-subscribe on reconnect
+		if token := client.Subscribe("gpsgate", 0, messageHandler); token.Wait() && token.Error() != nil {
+			log.Printf("Error re-subscribing on reconnect: %v", token.Error())
+		} else {
+			log.Printf("Successfully re-subscribed to topic: gpsgate")
+		}
+	})
+
+	// Create and connect MQTT client
+	mqttClient := mqtt.NewClient(opts)
+
+	log.Printf("Attempting to connect to MQTT broker at %s", brokerURL)
+	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("error connecting to MQTT broker: %v", token.Error())
+	}
+	log.Printf("Connected to MQTT broker at %s", brokerURL)
+	log.Printf("Client connection status: %t", mqttClient.IsConnected())
+
+	// The OnConnectHandler will handle the subscription, so no need to subscribe here.
+	// The listener will start receiving messages once the connection is established.
+
+	log.Printf("Successfully subscribed via OnConnectHandler. MQTT listener is running, waiting for messages...")
+
+	// Add enhanced periodic health check with comprehensive connection monitoring
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				connected := mqttClient.IsConnected()
+				log.Printf("Health check - MQTT client connected: %t", connected)
+				if !connected {
+					log.Printf("MQTT client not connected, attempting reconnect...")
+					// Add retry logic with exponential backoff
+					retryCount := 0
+					maxRetries := 3
+					for retryCount < maxRetries && !mqttClient.IsConnected() {
+						retryCount++
+						log.Printf("Reconnection attempt %d/%d", retryCount, maxRetries)
+						if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+							log.Printf("Reconnection attempt %d failed: %v", retryCount, token.Error())
+							if retryCount < maxRetries {
+								time.Sleep(time.Duration(retryCount*5) * time.Second) // Exponential backoff
+							}
+						} else {
+							log.Printf("Reconnection successful on attempt %d", retryCount)
+							break
+						}
+					}
+					if !mqttClient.IsConnected() {
+						log.Printf("CRITICAL: Failed to reconnect after %d attempts", maxRetries)
+					}
+				}
+			}
+		}
+	}()
+
+	// Keep the connection alive
+	select {}
+}
+
+func SanitizeInvalidURLS(data []byte) []byte {
+	// This regex finds the invalid URL escape sequence "%u00e1" and similar
+	re := regexp.MustCompile(`%u00([0-9a-fA-F]{2})`)
+
+	// Replace the invalid sequence with a standard URL-encoded equivalent
+	// For example, %u00e1 becomes %e1
+	sanitized := re.ReplaceAllString(string(data), `%$1`)
+
+	return []byte(sanitized)
+}
+
+// getMapKeys returns the keys of a map for debugging purposes
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// truncateMapForLogging truncates large map values for safe logging
+func truncateMapForLogging(m map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+	for k, v := range m {
+		if str, ok := v.(string); ok && len(str) > 100 {
+			result[k] = str[:100] + "...[truncated]"
+		} else {
+			result[k] = v
+		}
+		// Limit to first 10 keys for logging
+		if len(result) >= 10 {
+			result["..."] = "more fields truncated for logging"
+			break
+		}
+	}
+	return result
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// decodePercentEncoded decodes percent-encoded strings like %e9 → é, %e1 → á
+// This matches the behavior of the Python test script for Latin-1 encoding
+func decodePercentEncoded(text string) string {
+	// Regex to match percent-encoded sequences like %XX
+	re := regexp.MustCompile(`%([0-9A-Fa-f]{2})`)
+
+	result := re.ReplaceAllStringFunc(text, func(match string) string {
+		// Extract the hex part (without the %)
+		hexStr := match[1:]
+
+		// Convert hex to byte
+		if hexByte, err := hex.DecodeString(hexStr); err == nil && len(hexByte) == 1 {
+			// Convert the byte to Latin-1 character and then to UTF-8
+			// This handles characters like é (0xE9) and á (0xE1) correctly
+			char := rune(hexByte[0])
+			return string(char)
+		}
+
+		// If conversion fails, return the original match
+		return match
+	})
+
+	return result
+}
+
+// decodeAllStringFields recursively decodes percent-encoded strings in a map
+func decodeAllStringFields(data map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	for key, value := range data {
+		switch v := value.(type) {
+		case string:
+			// Decode percent-encoded characters in string fields
+			decoded := decodePercentEncoded(v)
+			if decoded != v {
+				log.Printf("Decoded field '%s': '%s' → '%s'", key, v, decoded)
+			}
+			result[key] = decoded
+		case map[string]interface{}:
+			// Recursively decode nested maps
+			result[key] = decodeAllStringFields(v)
+		case []interface{}:
+			// Handle arrays - decode strings within arrays
+			decodedArray := make([]interface{}, len(v))
+			for i, item := range v {
+				if str, ok := item.(string); ok {
+					decodedArray[i] = decodePercentEncoded(str)
+				} else if nestedMap, ok := item.(map[string]interface{}); ok {
+					decodedArray[i] = decodeAllStringFields(nestedMap)
+				} else {
+					decodedArray[i] = item
+				}
+			}
+			result[key] = decodedArray
+		default:
+			// Keep other types unchanged
+			result[key] = value
+		}
+	}
+
+	return result
+}
+
+func main() {
+	// Define our own -v flag since we're not using the common utils library anymore
+	verbose := flag.Bool("v", false, "Enable verbose logging")
+	flag.Parse()
+
+	// Set verbose logging based on our flag
+	if *verbose {
+		utils.SetVerbose(true)
+		log.Println("Verbose logging enabled")
+	}
+
+	// Add startup logging with environment info
+	log.Printf("=== GPS GATE HTTP SERVICE STARTING ===")
+	log.Printf("Version: 1.0.0")
+	log.Printf("Build Time: %s", time.Now().Format("2006-01-02 15:04:05 UTC"))
+	log.Printf("Go Version: %s", runtime.Version())
+	log.Printf("Pod Name: %s", os.Getenv("HOSTNAME"))
+
+	// Log critical environment variables (without sensitive data)
+	mqttHost := os.Getenv("MQTT_BROKER_HOST")
+	elasticDoc := os.Getenv("ELASTIC_DOC_NAME")
+	testMode := os.Getenv("GPSGATE_TEST_TELEGRAM")
+	log.Printf("MQTT_BROKER_HOST: %s", mqttHost)
+	log.Printf("ELASTIC_DOC_NAME: %s", elasticDoc)
+	log.Printf("GPSGATE_TEST_TELEGRAM: %s", testMode)
+
+	if mqttHost == "" {
+		log.Fatal("CRITICAL: MQTT_BROKER_HOST environment variable not set")
+	}
+
+	log.Println("Starting MQTT listener for GPSgate data...")
+
+	// Initialize monitoring system
+	processingMutex.Lock()
+	lastProcessedMessage = time.Now()
+	processingMutex.Unlock()
+
+	// Start monitoring goroutine to detect if service gets stuck
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				processingMutex.RLock()
+				timeSinceLastMessage := time.Since(lastProcessedMessage)
+				currentCount := messageCounter
+				processingMutex.RUnlock()
+
+				if timeSinceLastMessage > 2*time.Minute {
+					log.Printf("WARNING: No messages processed in %v (last message #%d at %v)",
+						timeSinceLastMessage, currentCount, lastProcessedMessage.Format("15:04:05"))
+				} else {
+					log.Printf("Service healthy: Last message processed %v ago (total: %d)",
+						timeSinceLastMessage, currentCount)
+				}
+			}
+		}
+	}()
+
+	// Start health check HTTP server
+	go func() {
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			processingMutex.RLock()
+			timeSinceLastMessage := time.Since(lastProcessedMessage)
+			currentCount := messageCounter
+			processingMutex.RUnlock()
+
+			status := map[string]interface{}{
+				"status":           "healthy",
+				"uptime":           time.Since(time.Now().Add(-time.Since(lastProcessedMessage))).String(),
+				"last_message_ago": timeSinceLastMessage.String(),
+				"total_messages":   currentCount,
+				"timestamp":        time.Now().Format(time.RFC3339),
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(status)
+		})
+
+		log.Printf("Health check server starting on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Printf("Health check server error: %v", err)
+		}
+	}()
+
+	log.Printf("GPS Gate HTTP service started successfully - monitoring for crashes and deadlocks")
+
+	// Add panic recovery for main process
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("CRITICAL PANIC in main process: %v", r)
+			log.Printf("Stack trace: %s", debug.Stack())
+			log.Fatal("Application crashed with panic")
+		}
+	}()
+
+	if err := processGPSgateData(); err != nil {
+		log.Fatalf("FATAL ERROR in processGPSgateData: %v", err)
+	}
+}

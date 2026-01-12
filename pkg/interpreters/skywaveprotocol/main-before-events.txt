@@ -1,0 +1,735 @@
+package main
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"encoding/xml"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"skywaveprotocol/features/jono"
+	"skywaveprotocol/features/jono/models"
+	"skywaveprotocol/features/skywave_protocol"
+	"strconv"
+	"strings"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+)
+
+var (
+	verbose = flag.Bool("v", false, "Enable verbose logging")
+)
+
+func vPrint(format string, v ...interface{}) {
+	if *verbose {
+		log.Printf(format, v...)
+	}
+}
+
+type TrackerData struct {
+	Payload    string `json:"payload"`
+	RemoteAddr string `json:"remoteaddr"`
+}
+
+type TrackerAssign struct {
+	Imei       string `json:"imei"`
+	Protocol   string `json:"protocol"`
+	RemoteAddr string `json:"remoteaddr"`
+}
+
+// SkyWave XML structures based on knowhow.md
+type GetReturnMessagesResult struct {
+	XMLName      xml.Name `xml:"GetReturnMessagesResult"`
+	ErrorID      int64    `xml:"ErrorID"`
+	More         bool     `xml:"More"`
+	NextStartUTC string   `xml:"NextStartUTC"`
+	NextStartID  int64    `xml:"NextStartID"`
+	Messages     Messages `xml:"Messages"`
+}
+
+type Messages struct {
+	XMLName          xml.Name           `xml:"Messages"`
+	ReturnedMessages []ReturnedMessages `xml:"ReturnMessage"`
+}
+
+type ReturnedMessages struct {
+	XMLName        xml.Name `xml:"ReturnMessage"`
+	ID             int64    `xml:"ID"`
+	MessageUTC     string   `xml:"MessageUTC"`
+	ReceiveUTC     string   `xml:"ReceiveUTC"`
+	SIN            int64    `xml:"SIN"`
+	MobileID       string   `xml:"MobileID"`
+	Payload        Payload  `xml:"Payload,omitempty"`
+	RegionName     string   `xml:"RegionName"`
+	OtaMessageSize string   `xml:"OTAMessageSize"`
+}
+
+type Payload struct {
+	XMLName xml.Name `xml:"Payload"`
+	Name    string   `xml:"Name,attr"`
+	Sin     string   `xml:"SIN,attr"`
+	Min     string   `xml:"MIN,attr"`
+	Fields  Fields   `xml:"Fields"`
+}
+
+type Fields struct {
+	XMLName xml.Name `xml:"Fields"`
+	Fields  []Field  `xml:"Field"`
+}
+
+type Field struct {
+	XMLName xml.Name `xml:"Field"`
+	Name    string   `xml:"Name,attr"`
+	Value   string   `xml:"Value,attr"`
+}
+
+type PayloadBridge struct {
+	ID             int64  `json:"id"`
+	MessageUTC     string `json:"messageUTC"`
+	ReceiveUTC     string `json:"receiveUTC"`
+	SIN            int64  `json:"sin"`
+	MobileID       string `json:"mobileid"`
+	RegionName     string `json:"regionname"`
+	OtaMessageSize string `json:"otamessagesize"`
+	Type           string `json:"type"`
+	Min            string `json:"min"`
+	Latitude       string `json:"latitude"`
+	Longitude      string `json:"longitude"`
+	Speed          string `json:"speed"`
+	Heading        string `json:"heading"`
+	EventTime      string `json:"eventtime"`
+	GpsFixAge      string `json:"gpsfixage"`
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Parse SkyWave XML and extract position messages
+func parseSkyWaveXML(xmlData []byte) ([]PayloadBridge, error) {
+	var result GetReturnMessagesResult
+	if err := xml.Unmarshal(xmlData, &result); err != nil {
+		return nil, fmt.Errorf("error parsing SkyWave XML: %v", err)
+	}
+
+	var messages []PayloadBridge
+	for _, mess := range result.Messages.ReturnedMessages {
+		// Only process position-related message types
+		switch mess.Payload.Name {
+		case "DistanceCell", "StationaryIntervalSat", "MovingIntervalSat", "MovingEnd", "MovingStart", "IgnitionOn", "StationaryIntervalCell":
+			payload := PayloadBridge{}
+			
+			// Extract fields from XML
+			for _, field := range mess.Payload.Fields.Fields {
+				switch field.Name {
+				case "Latitude":
+					payload.Latitude = field.Value
+				case "Longitude":
+					payload.Longitude = field.Value
+				case "Speed":
+					payload.Speed = field.Value
+				case "Heading":
+					payload.Heading = field.Value
+				case "EventTime":
+					payload.EventTime = field.Value
+				case "GpsFixAge":
+					payload.GpsFixAge = field.Value
+				}
+			}
+			
+			// Copy message metadata
+			payload.ID = mess.ID
+			payload.MessageUTC = mess.MessageUTC
+			payload.ReceiveUTC = mess.ReceiveUTC
+			payload.Type = mess.Payload.Name
+			payload.SIN = mess.SIN
+			payload.MobileID = mess.MobileID
+			payload.Min = mess.Payload.Min
+			payload.RegionName = mess.RegionName
+			payload.OtaMessageSize = mess.OtaMessageSize
+			
+			messages = append(messages, payload)
+		default:
+			// Skip unsupported message types
+			continue
+		}
+	}
+	
+	return messages, nil
+}
+
+// Convert SkyWave coordinates to decimal degrees (based on knowhow.md algorithm)
+func convertSkyWaveCoordinates(lat, lon string) (float64, float64, error) {
+	if len(lat) < 7 || len(lon) < 7 {
+		return 0, 0, fmt.Errorf("coordinate strings too short: lat=%d, lon=%d", len(lat), len(lon))
+	}
+
+	// Process latitude
+	var latdegrees, latdecimal string
+	if len(lat) == 7 {
+		latdegrees = lat[:4]
+		latdecimal = lat[4:]
+	} else {
+		latdegrees = lat[:5]
+		latdecimal = lat[5:]
+	}
+
+	latdegreesfloat, err := strconv.ParseFloat(latdegrees, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	latdegreesres := latdegreesfloat / 60
+	latdetwodec, err := strconv.ParseFloat(fmt.Sprintf("%.2f", latdegreesres), 64)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	latdecimalfloat, err := strconv.ParseFloat(latdecimal, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	latdecimalres := latdecimalfloat / 60000
+
+	if strings.Contains(latdegrees, "-") {
+		latdecimalres *= -1
+	}
+
+	finalLat := latdetwodec + latdecimalres - 0.003333
+
+	// Process longitude
+	var londegrees, londecimal string
+	if len(lon) == 7 {
+		londegrees = lon[:4]
+		londecimal = lon[4:]
+	} else {
+		londegrees = lon[:5]
+		londecimal = lon[5:]
+	}
+
+	londegreesfloat, err := strconv.ParseFloat(londegrees, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	londegreesres := londegreesfloat / 60
+	londetwodec, err := strconv.ParseFloat(fmt.Sprintf("%.2f", londegreesres), 64)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	londecimalfloat, err := strconv.ParseFloat(londecimal, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	londecimalres := londecimalfloat / 60000
+
+	if strings.Contains(londegrees, "-") {
+		londecimalres *= -1
+	}
+
+	finalLon := londetwodec + londecimalres
+
+	return finalLat, finalLon, nil
+}
+
+// Convert SkyWave PayloadBridge to MVT366 format
+func convertToMVT366(payload PayloadBridge) (string, error) {
+	// Convert coordinates
+	lat, lon, err := convertSkyWaveCoordinates(payload.Latitude, payload.Longitude)
+	if err != nil {
+		return "", fmt.Errorf("coordinate conversion error: %v", err)
+	}
+
+	// Parse speed
+	speed, err := strconv.ParseFloat(payload.Speed, 64)
+	if err != nil {
+		speed = 0.0
+	}
+
+	// Parse heading
+	heading, err := strconv.ParseUint(payload.Heading, 10, 16)
+	if err != nil {
+		heading = 361 // undefined
+	}
+
+	// Parse datetime from ReceiveUTC (2025-09-03 18:02:25 -> 250903180225)
+	datetime := strings.Replace(payload.ReceiveUTC, " ", "T", 1) + "Z"
+	parsedTime, err := time.Parse(time.RFC3339, datetime)
+	if err != nil {
+		parsedTime = time.Now()
+	}
+	
+	// Format as YYMMDDHHMMSS
+	datetimeStr := fmt.Sprintf("%02d%02d%02d%02d%02d%02d",
+		parsedTime.Year()%100,
+		parsedTime.Month(),
+		parsedTime.Day(),
+		parsedTime.Hour(),
+		parsedTime.Minute(),
+		parsedTime.Second())
+
+	// Build MVT366 message
+	mvt366 := fmt.Sprintf("%s,AAA,35,%.6f,%.6f,%s,A,0,0,%.6f,%d,0.000000,21.232345,0.000000,0,0030|0030|0030|0030|0030,,,3,,,0,0",
+		payload.MobileID,
+		lat,
+		lon,
+		datetimeStr,
+		speed,
+		heading)
+
+	// Calculate length and add header
+	length := len(mvt366) + 5
+	header := fmt.Sprintf("$$H%d", length)
+	
+	// Calculate checksum (simplified)
+	checksum := (len(header) + len(mvt366) + 2) % 256
+	
+	finalMessage := fmt.Sprintf("%s,%s*%02X\r\n", header, mvt366, checksum)
+	
+	return finalMessage, nil
+}
+
+// Convert SkyWave PayloadBridge directly to Jono protocol
+func convertSkyWaveToJonoProtocol(payload PayloadBridge) (string, error) {
+	// Convert coordinates
+	lat, lon, err := convertSkyWaveCoordinates(payload.Latitude, payload.Longitude)
+	if err != nil {
+		return "", fmt.Errorf("coordinate conversion error: %v", err)
+	}
+
+	// Parse speed
+	speed, err := strconv.ParseFloat(payload.Speed, 64)
+	if err != nil {
+		speed = 0.0
+	}
+	speedInt := int(speed)
+
+	// Parse heading
+	heading, err := strconv.ParseUint(payload.Heading, 10, 16)
+	if err != nil {
+		heading = 361 // undefined
+	}
+	headingInt := int(heading)
+
+	// Parse datetime from ReceiveUTC
+	datetime := strings.Replace(payload.ReceiveUTC, " ", "T", 1) + "Z"
+	parsedTime, err := time.Parse(time.RFC3339, datetime)
+	if err != nil {
+		parsedTime = time.Now()
+	}
+	datetimeStr := parsedTime.Format(time.RFC3339)
+
+	// Create the Jono protocol packet
+	packet := models.Packet{
+		Altitude:             21,  // Default altitude
+		Datetime:             &datetimeStr,
+		EventCode:            models.EventCode{Code: 35, Name: "Track By Time Interval"},
+		Latitude:             &lat,
+		Longitude:            &lon,
+		Speed:                &speedInt,
+		Direction:            &headingInt,
+		PositioningStatus:    stringPtr("true"),
+		NumberOfSatellites:   0,
+		GSMSignalStrength:    intPtr(0),
+		HDOP:                 float64Ptr(0.0),
+		Mileage:              intPtr(0),
+		RunTime:              intPtr(0),
+		
+		// Default structures for required fields
+		AnalogInputs: &models.AnalogInputs{
+			AD1: stringPtr("0"), AD2: stringPtr("0"), AD3: stringPtr("0"),
+			AD4: stringPtr("0"), AD5: stringPtr("0"),
+		},
+		IoPortStatus: &models.IoPortsStatus{
+			Port1: 0, Port2: 0, Port3: 0, Port4: 0, Port5: 0, Port6: 0, Port7: 0, Port8: 0,
+		},
+		BaseStationInfo: &models.BaseStationInfo{
+			MCC: stringPtr("334"), MNC: stringPtr("50"), LAC: stringPtr("0030"), CellID: stringPtr("0030"),
+		},
+		OutputPortStatus: &models.OutputPortStatus{},
+		InputPortStatus:  &models.InputPortStatus{},
+		SystemFlag:       &models.SystemFlag{},
+		TemperatureSensor: &models.TemperatureSensor{},
+		CameraStatus:     &models.CameraStatus{},
+		CurrentNetworkInfo: &models.CurrentNetworkInfo{},
+		FatigueDrivingInformation: &models.FatigueDrivingInformation{},
+		AdditionalAlertInfoADASDMS: &models.AdditionalAlertInfoADASDMS{},
+		BluetoothBeaconA: &models.BluetoothBeacon{},
+		BluetoothBeaconB: &models.BluetoothBeacon{},
+		TemperatureAndHumiditySensor: &models.TemperatureAndHumidity{},
+	}
+
+	// Create the MVT366 message for reference
+	mvt366Message, _ := convertToMVT366(payload)
+	
+	// Create the final parsed model
+	dataPackets := 1
+	jonoModel := models.ParsedModel{
+		IMEI:        &payload.MobileID,
+		Message:     &mvt366Message,
+		DataPackets: &dataPackets,
+		ListPackets: map[string]models.Packet{
+			"packet_1": packet,
+		},
+	}
+
+	// Convert to JSON
+	return jonoModel.ToJSON()
+}
+
+// Helper functions for pointer creation
+func stringPtr(s string) *string {
+	return &s
+}
+
+func intPtr(i int) *int {
+	return &i
+}
+
+func float64Ptr(f float64) *float64 {
+	return &f
+}
+
+type MQTTClient struct {
+	client    mqtt.Client
+	brokerURL string
+	clientID  string
+	verbose   bool
+}
+
+func NewMQTTClient(brokerHost string, clientID string, verbose bool) (*MQTTClient, error) {
+	if brokerHost == "" {
+		return nil, fmt.Errorf("broker host cannot be empty")
+	}
+
+	brokerURL := fmt.Sprintf("tcp://%s:1883", brokerHost)
+	return &MQTTClient{
+		brokerURL: brokerURL,
+		clientID:  clientID,
+		verbose:   verbose,
+	}, nil
+}
+
+func (m *MQTTClient) Connect() error {
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker(m.brokerURL)
+
+	subscribe_topic := "skywave"
+	clientID := fmt.Sprintf("skywaveprotocol_%s_%s_%d",
+		subscribe_topic,
+		os.Getenv("HOSTNAME"),
+		time.Now().UnixNano()%100000)
+	opts.SetClientID(clientID)
+
+	opts.SetCleanSession(false)
+	opts.SetAutoReconnect(true)
+	opts.SetKeepAlive(60 * time.Second)
+	opts.SetOrderMatters(true)
+	opts.SetResumeSubs(true)
+	opts.SetDefaultPublishHandler(m.messageHandler)
+
+	m.client = mqtt.NewClient(opts)
+
+	for {
+		if token := m.client.Connect(); token.Wait() && token.Error() != nil {
+			if m.verbose {
+				vPrint("Error connecting to MQTT broker at %s: %v. Retrying in 5 seconds...", m.brokerURL, token.Error())
+			}
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if m.verbose {
+			vPrint("Successfully connected to MQTT broker!")
+		}
+		break
+	}
+
+	return nil
+}
+
+func (m *MQTTClient) Subscribe(topic string, qos byte) error {
+	if token := m.client.Subscribe(topic, qos, nil); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("error subscribing to topic %s: %v", topic, token.Error())
+	}
+	if m.verbose {
+		vPrint("Subscribed to topic: %s", topic)
+	}
+	return nil
+}
+
+func (m *MQTTClient) Publish(topic string, payload interface{}) error {
+	token := m.client.Publish(topic, 0, false, payload)
+	token.Wait()
+	if token.Error() != nil {
+		if m.verbose {
+			vPrint("Failed to publish to MQTT topic %s: %v", topic, token.Error())
+		}
+		return token.Error()
+	}
+	if m.verbose {
+		vPrint("Successfully published to MQTT topic: %s", topic)
+	}
+	return nil
+}
+
+func (m *MQTTClient) messageHandler(client mqtt.Client, msg mqtt.Message) {
+	// Handle SkyWave XML data
+	if msg.Topic() == "skywave/xml" {
+		if m.verbose {
+			vPrint("Received SkyWave XML data on topic: %s", msg.Topic())
+		}
+		
+		// Decode hex data back to XML
+		xmlHex := string(msg.Payload())
+		xmlBytes, err := hex.DecodeString(xmlHex)
+		if err != nil {
+			if m.verbose {
+				vPrint("Error decoding hex data: %v", err)
+			}
+			return
+		}
+		
+		if m.verbose {
+			xmlPreview := string(xmlBytes)
+			if len(xmlPreview) > 200 {
+				xmlPreview = xmlPreview[:200] + "..."
+			}
+			vPrint("SkyWave XML Preview: %s", strings.ReplaceAll(xmlPreview, "\n", " "))
+		}
+		
+		// Parse SkyWave XML
+		payloadBridges, err := parseSkyWaveXML(xmlBytes)
+		if err != nil {
+			if m.verbose {
+				vPrint("Error parsing SkyWave XML: %v", err)
+			}
+			return
+		}
+		
+		if m.verbose {
+			vPrint("Found %d position messages in SkyWave XML", len(payloadBridges))
+		}
+		
+		// Process each position message
+		for _, payload := range payloadBridges {
+			if m.verbose {
+				vPrint("Processing message from device: %s, type: %s", payload.MobileID, payload.Type)
+			}
+			
+			// Convert SkyWave data directly to Jono protocol (bypass MVT366 parsing)
+			jonoNormalize, err := convertSkyWaveToJonoProtocol(payload)
+			if err != nil {
+				if m.verbose {
+					vPrint("Error converting SkyWave to Jono protocol: %v", err)
+				}
+				continue
+			}
+			
+			// Publish to jonoprotocol topic
+			if err := m.Publish("tracker/jonoprotocol", jonoNormalize); err != nil {
+				if m.verbose {
+					vPrint("Error publishing to jonoprotocol: %v", err)
+				}
+				continue
+			}
+			
+			if m.verbose {
+				var jsonObj map[string]interface{}
+				if err := json.Unmarshal([]byte(jonoNormalize), &jsonObj); err == nil {
+					if compactJSON, err := json.Marshal(jsonObj); err == nil {
+						vPrint("SkyWave->Jono Protocol: %s", string(compactJSON))
+					}
+				}
+			}
+			
+			// Create assignment data
+			trackerAssign := TrackerAssign{
+				Imei:       payload.MobileID,
+				Protocol:   "skywave",
+				RemoteAddr: "skywave-api",
+			}
+			
+			assignJSON, err := json.Marshal(trackerAssign)
+			if err != nil {
+				if m.verbose {
+					vPrint("Error marshaling assign data: %v", err)
+				}
+				continue
+			}
+			
+			// Publish assignment
+			if err := m.Publish("tracker/assign-imei2remoteaddr", assignJSON); err != nil {
+				if m.verbose {
+					vPrint("Error publishing assignment: %v", err)
+				}
+			} else if m.verbose {
+				vPrint("Published assignment: %s", string(assignJSON))
+			}
+		}
+		return
+	}
+
+	// Handle existing tracker data from UDP (legacy behavior)
+	if msg.Topic() == "tracker/from-udp" {
+		if m.verbose {
+			tracker_bytes := []byte(msg.Payload())
+			vPrint("Received message on topic :\n%v", hex.Dump(tracker_bytes[:min(32, len(tracker_bytes))]))
+		}
+		trackerPayload := string(msg.Payload())
+
+		var trackerData string
+		bytes, err := hex.DecodeString(trackerPayload)
+		if err != nil {
+			trackerData = trackerPayload
+			if m.verbose {
+				vPrint("error: %s", err)
+			}
+		} else {
+			trackerData = string(bytes)
+		}
+
+		dataskywave, err := skywave_protocol.Initialize(trackerData)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		jonoNormalize, err := jono.Initialize(dataskywave)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		if err := m.Publish("tracker/jonoprotocol", jonoNormalize); err != nil {
+			fmt.Println("Error publishing to jonoprotocol:", err)
+			return
+		}
+		if m.verbose {
+			var jsonObj map[string]interface{}
+			if err := json.Unmarshal([]byte(jonoNormalize), &jsonObj); err == nil {
+				if compactJSON, err := json.Marshal(jsonObj); err == nil {
+					vPrint("Jono Protocol: %s", string(compactJSON))
+				} else {
+					vPrint("Jono Protocol: %s", jonoNormalize)
+				}
+			} else {
+				vPrint("Jono Protocol: %s", jonoNormalize)
+			}
+		}
+		return
+	}
+
+	// Handle existing tracker data from TCP (legacy behavior)
+	var json_data TrackerData
+	if err := json.Unmarshal(msg.Payload(), &json_data); err != nil {
+		fmt.Println("Error unmarshaling JSON:", err)
+		return
+	}
+	payload := json_data.Payload
+	remote_addr := json_data.RemoteAddr
+
+	trackerPayload := payload
+
+	var trackerData string
+	bytes, err := hex.DecodeString(trackerPayload)
+	if err != nil {
+		trackerData = trackerPayload
+		if m.verbose {
+			vPrint("error: %s", err)
+		}
+	} else {
+		trackerData = string(bytes)
+	}
+
+	if m.verbose {
+		vPrint("Received message on topic %s: %s", msg.Topic(), msg.Payload())
+		tracker_bytes := []byte(trackerData)
+		vPrint("Received message on topic :\n%v", hex.Dump(tracker_bytes[:min(32, len(tracker_bytes))]))
+	}
+
+	dataskywave, err := skywave_protocol.Initialize(trackerData)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	imei := ""
+	jonoNormalize, err := jono.Initialize(dataskywave)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	if err := m.Publish("tracker/jonoprotocol", jonoNormalize); err != nil {
+		fmt.Println("Error publishing to jonoprotocol:", err)
+		return
+	}
+	if m.verbose {
+		var jsonObj map[string]interface{}
+		if err := json.Unmarshal([]byte(jonoNormalize), &jsonObj); err == nil {
+			if compactJSON, err := json.Marshal(jsonObj); err == nil {
+				vPrint("Jono Protocol: %s", string(compactJSON))
+			} else {
+				vPrint("Jono Protocol: %s", jonoNormalize)
+			}
+		} else {
+			vPrint("Jono Protocol: %s", jonoNormalize)
+		}
+	}
+	tracker_data_json := TrackerAssign{
+		Imei:       imei,
+		Protocol:   "skywave",
+		RemoteAddr: remote_addr,
+	}
+
+	assignImeiJson, err := json.Marshal(tracker_data_json)
+	if err != nil {
+		fmt.Println("Error marshaling assign-imei data:", err)
+		return
+	}
+
+	if err := m.Publish("tracker/assign-imei2remoteaddr", assignImeiJson); err != nil {
+		fmt.Println("Error publishing to assign-imei2remoteaddr:", err)
+	}
+	if m.verbose {
+		fmt.Printf("Publishing to tracker/assign-imei2remoteaddr: %s", assignImeiJson)
+	}
+}
+
+func main() {
+	flag.Parse()
+
+	mqttBrokerHost := os.Getenv("MQTT_BROKER_HOST")
+	if mqttBrokerHost == "" {
+		log.Fatal("MQTT_BROKER_HOST environment variable not set")
+	}
+
+	mqttClient, err := NewMQTTClient(mqttBrokerHost, "go_mqtt_client", *verbose)
+	if err != nil {
+		log.Fatal("Failed to create MQTT client:", err)
+	}
+
+	if err := mqttClient.Connect(); err != nil {
+		log.Fatal("Failed to connect to MQTT broker:", err)
+	}
+
+	if err := mqttClient.Subscribe("tracker/from-tcp", 1); err != nil {
+		log.Fatal("Failed to subscribe:", err)
+	}
+
+	if err := mqttClient.Subscribe("tracker/from-udp", 1); err != nil {
+		log.Fatal("Failed to subscribe:", err)
+	}
+
+	if err := mqttClient.Subscribe("skywave/xml", 1); err != nil {
+		log.Fatal("Failed to subscribe to skywave/xml:", err)
+	}
+
+	vPrint("Successfully subscribed to all topics: tracker/from-tcp, tracker/from-udp, skywave/xml")
+
+	select {}
+}

@@ -1,0 +1,3 @@
+module github.com/JaimeOli/skywaveproto
+
+go 1.15

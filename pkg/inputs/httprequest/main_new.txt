@@ -1,0 +1,613 @@
+package main
+
+/*Autor: Maria Lacayo / Jorge Macias
+Created: 07/06/2024
+Modified: 09/05/2025
+Conexion: UDP
+Descripción:
+	Este servicio funciona con un cron que se ejecuta cada 3 minutes
+	El servicio consume una API de SpotX y actualiza la posicion de todos
+	los equipos registrados en Bridge y los envia a Server1*/
+
+import (
+	"encoding/hex"
+	"encoding/xml"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"html"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	_ "github.com/go-sql-driver/mysql"
+)
+
+var mqttClient mqtt.Client
+
+// SkyWave XML response structures
+type SkyWaveResponse struct {
+	XMLName      xml.Name        `xml:"GetReturnMessagesResult"`
+	ErrorID      int             `xml:"ErrorID"`
+	More         bool            `xml:"More"`
+	NextStartID  string          `xml:"NextStartID"`
+	NextStartUTC string          `xml:"NextStartUTC"`
+	Messages     []ReturnMessage `xml:"Messages>ReturnMessage"`
+}
+
+type ReturnMessage struct {
+	ID            string  `xml:"ID"`
+	MessageUTC    string  `xml:"MessageUTC"`
+	ReceiveUTC    string  `xml:"ReceiveUTC"`
+	SIN           int     `xml:"SIN"`
+	MobileID      string  `xml:"MobileID"`
+	Payload       Payload `xml:"Payload"`
+	RegionName    string  `xml:"RegionName"`
+	OTAMessageSize int    `xml:"OTAMessageSize"`
+}
+
+type Payload struct {
+	Name   string `xml:"Name,attr"`
+	SIN    int    `xml:"SIN,attr"`
+	MIN    int    `xml:"MIN,attr"`
+	Fields []Field `xml:"Fields>Field"`
+}
+
+type Field struct {
+	Name  string `xml:"Name,attr"`
+	Value string `xml:"Value,attr"`
+}
+
+// SkyWave configuration structure
+type SkyWaveConfig struct {
+	AccessID uint64
+	Password string
+	FromID   uint64
+	Enabled  bool
+}
+
+// Check if SkyWave/ORBCOMM variables are configured
+func getSkyWaveConfig() *SkyWaveConfig {
+	config := &SkyWaveConfig{}
+
+	// Check if SKYWAVE_ACCESS_ID is set
+	accessIDStr := os.Getenv("SKYWAVE_ACCESS_ID")
+	if accessIDStr == "" {
+		log.Println("SKYWAVE_ACCESS_ID not set")
+		return &SkyWaveConfig{Enabled: false}
+	}
+
+	accessID, err := strconv.ParseUint(accessIDStr, 10, 64)
+	if err != nil {
+		log.Printf("Invalid SKYWAVE_ACCESS_ID: %v", err)
+		return &SkyWaveConfig{Enabled: false}
+	}
+	config.AccessID = accessID
+
+	// Check password
+	config.Password = os.Getenv("SKYWAVE_PASSWORD")
+	if config.Password == "" {
+		log.Println("SKYWAVE_PASSWORD not set")
+		return &SkyWaveConfig{Enabled: false}
+	}
+
+	// Check FromID
+	fromIDStr := os.Getenv("SKYWAVE_FROM_ID")
+	if fromIDStr == "" {
+		log.Println("SKYWAVE_FROM_ID not set")
+		return &SkyWaveConfig{Enabled: false}
+	}
+
+	fromID, err := strconv.ParseUint(fromIDStr, 10, 64)
+	if err != nil {
+		log.Printf("Invalid SKYWAVE_FROM_ID: %v", err)
+		return &SkyWaveConfig{Enabled: false}
+	}
+	config.FromID = fromID
+	config.Enabled = true
+
+	log.Printf("SkyWave configuration loaded - AccessID: %d, FromID: %d", config.AccessID, config.FromID)
+	return config
+}
+
+func getEnvWithDefault(key, defaultValue string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return defaultValue
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func getRequiredEnv(key string) string {
+	value, exists := os.LookupEnv(key)
+	if !exists {
+		log.Fatalf("Error: Required environment variable %s is not set", key)
+	}
+	return value
+}
+
+func getPollingTime() time.Duration {
+	pollStr := getEnvWithDefault("HTTP_POLLING_TIME", "180")
+	pollTime, err := strconv.Atoi(pollStr)
+	if err != nil {
+		log.Printf("Invalid HTTP_POLLING_TIME value: %s, using default of 180 seconds", pollStr)
+		return 180 * time.Second
+	}
+	return time.Duration(pollTime) * time.Second
+}
+
+// Parse SkyWave timestamp (various formats)
+func parseSkyWaveTime(timeStr string) (time.Time, error) {
+	// Try different timestamp formats used by SkyWave
+	formats := []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05.000Z",
+		"2006-01-02 15:04:05",
+		"01/02/2006 15:04:05",
+		time.RFC3339,
+		time.RFC3339Nano,
+	}
+
+	for _, format := range formats {
+		if t, err := time.Parse(format, timeStr); err == nil {
+			return t.UTC(), nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("unable to parse timestamp: %s", timeStr)
+}
+
+// Filter messages by time within polling interval
+func filterMessagesByTime(messages []ReturnMessage, pollInterval time.Duration) []ReturnMessage {
+	now := time.Now().UTC()
+	cutoffTime := now.Add(-pollInterval)
+
+	log.Printf("=== TIME FILTERING WINDOW ===")
+	log.Printf("Current UTC time: %s", now.Format(time.RFC3339))
+	log.Printf("Cutoff time (Current - %v): %s", pollInterval, cutoffTime.Format(time.RFC3339))
+	log.Printf("Processing %d messages for time filtering", len(messages))
+	log.Printf("=============================")
+
+	var filteredMessages []ReturnMessage
+	includedCount := 0
+	excludedCount := 0
+
+	for i, msg := range messages {
+		log.Printf("--- Message %d (ID: %s) ---", i+1, msg.ID)
+
+		// Try to parse EventTime from payload fields first (most accurate)
+		var msgTime time.Time
+		var err error
+		var timeSource string
+
+		// Look for EventTime in payload fields
+		for _, field := range msg.Payload.Fields {
+			if field.Name == "EventTime" {
+				eventTimeUnix, parseErr := strconv.ParseInt(field.Value, 10, 64)
+				if parseErr == nil {
+					msgTime = time.Unix(eventTimeUnix, 0).UTC()
+					timeSource = "EventTime"
+					log.Printf("  EventTime: %s (unix: %s)", msgTime.Format(time.RFC3339), field.Value)
+					break
+				}
+			}
+		}
+
+		// If EventTime not found or invalid, try MessageUTC
+		if msgTime.IsZero() && msg.MessageUTC != "" {
+			msgTime, err = parseSkyWaveTime(msg.MessageUTC)
+			timeSource = "MessageUTC"
+			log.Printf("  MessageUTC: %s", msg.MessageUTC)
+		}
+
+		// If that fails, try ReceiveUTC
+		if err != nil && msg.ReceiveUTC != "" {
+			msgTime, err = parseSkyWaveTime(msg.ReceiveUTC)
+			timeSource = "ReceiveUTC"
+			log.Printf("  ReceiveUTC: %s", msg.ReceiveUTC)
+		}
+
+		if msgTime.IsZero() {
+			log.Printf("  ❌ ERROR: Could not parse any timestamp for message %s", msg.ID)
+			log.Printf("  ⚠️  INCLUDING message due to parse failure (fail-safe behavior)")
+			filteredMessages = append(filteredMessages, msg)
+			includedCount++
+			continue
+		}
+
+		log.Printf("  📅 Parsed timestamp from %s: %s", timeSource, msgTime.Format(time.RFC3339))
+
+		// Check if message is within our time window
+		if msgTime.After(cutoffTime) || msgTime.Equal(cutoffTime) {
+			log.Printf("  ✅ INCLUDED: Message timestamp %s is AFTER or AT cutoff %s",
+				msgTime.Format(time.RFC3339), cutoffTime.Format(time.RFC3339))
+			log.Printf("     Age: %v (within %v window)", now.Sub(msgTime), pollInterval)
+			filteredMessages = append(filteredMessages, msg)
+			includedCount++
+		} else {
+			log.Printf("  ❌ EXCLUDED: Message timestamp %s is BEFORE cutoff %s",
+				msgTime.Format(time.RFC3339), cutoffTime.Format(time.RFC3339))
+			log.Printf("     Age: %v (older than %v window)", now.Sub(msgTime), pollInterval)
+			excludedCount++
+		}
+	}
+
+	log.Printf("=== FILTERING SUMMARY ===")
+	log.Printf("Total messages processed: %d", len(messages))
+	log.Printf("Messages included: %d", includedCount)
+	log.Printf("Messages excluded: %d", excludedCount)
+	log.Printf("========================")
+
+	return filteredMessages
+}
+
+// Check if data contains recent timestamps (for non-XML data)
+func isDataRecent(data []byte, pollInterval time.Duration) bool {
+	dataStr := string(data)
+	now := time.Now().UTC()
+	cutoffTime := now.Add(-pollInterval)
+
+	log.Printf("=== RAW DATA TIME FILTERING ===")
+	log.Printf("Current UTC time: %s", now.Format(time.RFC3339))
+	log.Printf("Cutoff time (Current - %v): %s", pollInterval, cutoffTime.Format(time.RFC3339))
+	log.Printf("Searching for timestamps in %d bytes of data", len(data))
+
+	// Look for timestamp patterns in the data
+	timestampPatterns := []string{
+		`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}`,
+		`\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}`,
+		`\d{2}/\d{2}/\d{4}\s\d{2}:\d{2}:\d{2}`,
+	}
+
+	foundRecentTimestamp := false
+	totalTimestamps := 0
+	recentTimestamps := 0
+
+	for _, pattern := range timestampPatterns {
+		re := regexp.MustCompile(pattern)
+		matches := re.FindAllString(dataStr, -1)
+
+		log.Printf("Pattern '%s' found %d matches", pattern, len(matches))
+
+		for _, match := range matches {
+			totalTimestamps++
+			log.Printf("  Found timestamp: %s", match)
+
+			if timestamp, err := parseSkyWaveTime(match); err == nil {
+				log.Printf("    Parsed as: %s", timestamp.Format(time.RFC3339))
+				if timestamp.After(cutoffTime) || timestamp.Equal(cutoffTime) {
+					log.Printf("    ✅ RECENT: timestamp is AFTER or AT cutoff")
+					recentTimestamps++
+					foundRecentTimestamp = true
+				} else {
+					log.Printf("    ❌ OLD: timestamp is BEFORE cutoff (age: %v)", now.Sub(timestamp))
+				}
+			} else {
+				log.Printf("    ❌ PARSE ERROR: %v", err)
+			}
+		}
+	}
+
+	log.Printf("=== RAW DATA FILTERING SUMMARY ===")
+	log.Printf("Total timestamps found: %d", totalTimestamps)
+	log.Printf("Recent timestamps found: %d", recentTimestamps)
+
+	if totalTimestamps == 0 {
+		log.Printf("⚠️ No timestamps found in data, assuming it's recent (fail-safe)")
+		log.Printf("================================")
+		return true
+	} else if foundRecentTimestamp {
+		log.Printf("✅ Data contains recent timestamps - INCLUDING")
+		log.Printf("================================")
+		return true
+	} else {
+		log.Printf("❌ Data contains only old timestamps - EXCLUDING")
+		log.Printf("================================")
+		return false
+	}
+}
+
+func setupMQTT() error {
+	mqttBrokerHost := getRequiredEnv("MQTT_BROKER_HOST")
+	opts := mqtt.NewClientOptions()
+	opts.SetClientID("http-request-client")
+	opts.AddBroker(fmt.Sprintf("tcp://%s:1883", mqttBrokerHost))
+
+	// Create and start a client using the above ClientOptions
+	mqttClient = mqtt.NewClient(opts)
+	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("error connecting to MQTT broker: %v", token.Error())
+	}
+
+	return nil
+}
+
+func processHttpData(pollInterval time.Duration) error {
+	url := getRequiredEnv("HTTP_URL")
+	log.Printf("Fetching data from HTTP GET: %s", url)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("error making GET request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading response body: %v", err)
+	}
+
+	// Check if data is recent before processing
+	if !isDataRecent(body, pollInterval) {
+		log.Printf("=== NO MQTT PUBLISH ===")
+		log.Printf("Reason: No recent data found in HTTP response")
+		log.Printf("Data size: %d bytes", len(body))
+		log.Printf("Checked at: %s", time.Now().UTC().Format(time.RFC3339))
+		log.Printf("=====================")
+		return nil
+	}
+
+	hexString := hex.EncodeToString(body)
+
+	// Create a fixed 32-byte buffer
+	dump := hex.Dump(body[:min(32, len(body))])
+	escapedDump := html.EscapeString(dump)
+	log.Printf("Recent data fetched from HTTP:\n%s", escapedDump)
+
+	// Publish to MQTT
+	if token := mqttClient.Publish("http/get", 0, false, hexString); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("error publishing to MQTT: %v", token.Error())
+	}
+
+	log.Printf("=== MQTT PUBLISH SUMMARY ===")
+	log.Printf("Topic: http/get")
+	log.Printf("Data size: %d bytes (original), %d bytes (hex)", len(body), len(hexString))
+	log.Printf("Published at: %s", time.Now().UTC().Format(time.RFC3339))
+	log.Printf("===========================")
+
+	log.Printf("Successfully published recent HTTP data to MQTT")
+	return nil
+}
+
+// Process SkyWave/ORBCOMM data and send to MQTT
+func processSkyWaveData(config *SkyWaveConfig, pollInterval time.Duration) error {
+	// Calculate time range for API filtering
+	now := time.Now().UTC()
+	startTime := now.Add(-pollInterval)
+	endTime := now
+
+	// Format times for SkyWave API
+	startUTCStr := startTime.Format("2006-01-02 15:04:05")
+	endUTCStr := endTime.Format("2006-01-02 15:04:05")
+
+	// Use HTTP_URL if provided, otherwise default
+	baseURL := os.Getenv("HTTP_URL")
+	if baseURL == "" {
+		baseURL = "https://isatdatapro.skywave.com/GLGW/GWServices_v1/RestMessages.svc/get_return_messages.xml"
+		log.Printf("Using default SkyWave API base URL: %s", baseURL)
+	} else {
+		log.Printf("Using HTTP_URL for SkyWave API base: %s", baseURL)
+	}
+
+	// Parse base URL and add query parameters
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("error parsing base URL: %v", err)
+	}
+
+	// Create query parameters
+	params := url.Values{}
+	params.Set("access_id", strconv.FormatUint(config.AccessID, 10))
+	params.Set("password", config.Password)
+	params.Set("from_id", strconv.FormatUint(config.FromID, 10)) // Matches working curl
+	params.Set("start_utc", startUTCStr)
+	params.Set("end_utc", endUTCStr)
+
+	// Set the encoded query string
+	u.RawQuery = params.Encode()
+	apiURL := u.String()
+
+	log.Printf("Time range: %s to %s (last %v)", startUTCStr, endUTCStr, pollInterval)
+	log.Printf("Fetching data from SkyWave API: %s", apiURL)
+
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return fmt.Errorf("error making SkyWave API request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("SkyWave API returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading SkyWave response body: %v", err)
+	}
+
+	log.Printf("Retrieved %d bytes of data", len(body))
+
+	// Log raw response for debugging
+	log.Printf("Raw SkyWave Response (first 200 chars): %s", string(body[:min(200, len(body))]))
+
+	// Parse XML to check for errors and messages
+	var skyWaveResp SkyWaveResponse
+	if err := xml.Unmarshal(body, &skyWaveResp); err != nil {
+		log.Printf("Error parsing XML response: %v", err)
+		// Fallback to raw data processing
+		if !isDataRecent(body, pollInterval) {
+			log.Printf("=== NO MQTT PUBLISH ===")
+			log.Printf("Reason: No recent data found in SkyWave response (XML parse failed)")
+			log.Printf("Data size: %d bytes", len(body))
+			log.Printf("Checked at: %s", time.Now().UTC().Format(time.RFC3339))
+			log.Printf("=====================")
+			return nil
+		}
+
+		hexString := hex.EncodeToString(body)
+		dump := hex.Dump(body[:min(32, len(body))])
+		escapedDump := html.EscapeString(dump)
+		log.Printf("Raw SkyWave data (no XML parsing):\n%s", escapedDump)
+
+		// Publish to MQTT with skywave topic
+		if token := mqttClient.Publish("skywave/xml", 0, false, hexString); token.Wait() && token.Error() != nil {
+			return fmt.Errorf("error publishing SkyWave data to MQTT: %v", token.Error())
+		}
+
+		log.Printf("=== MQTT PUBLISH SUMMARY (RAW) ===")
+		log.Printf("Topic: skywave/xml")
+		log.Printf("Data size: %d bytes (original), %d bytes (hex)", len(body), len(hexString))
+		log.Printf("Published at: %s", time.Now().UTC().Format(time.RFC3339))
+		log.Printf("Reason: XML parsing failed, publishing raw data")
+		log.Printf("================================")
+
+		log.Printf("Successfully published raw SkyWave data to MQTT topic 'skywave/xml'")
+		return nil
+	}
+
+	// Check for API error
+	if skyWaveResp.ErrorID != 0 {
+		log.Printf("❌ SkyWave API Error: ErrorID %d", skyWaveResp.ErrorID)
+		if skyWaveResp.ErrorID == 513 {
+			log.Printf("Error 513: Likely authentication or parameter issue. Verify access_id (%d), password, and from_id (%d).",
+				config.AccessID, config.FromID)
+			log.Printf("Note: Try replacing 'from_id' with 'mobile_id' in params if this persists.")
+		}
+		return fmt.Errorf("SkyWave API returned ErrorID %d", skyWaveResp.ErrorID)
+	}
+
+	log.Printf("Successfully parsed XML response with %d messages", len(skyWaveResp.Messages))
+
+	// Filter messages by time
+	originalCount := len(skyWaveResp.Messages)
+	skyWaveResp.Messages = filterMessagesByTime(skyWaveResp.Messages, pollInterval)
+	filteredCount := len(skyWaveResp.Messages)
+
+	if originalCount != filteredCount {
+		log.Printf("Additional filtering applied: %d total -> %d recent (within %v)",
+			originalCount, filteredCount, pollInterval)
+	} else {
+		log.Printf("API time filtering worked correctly - all %d messages are within time range", filteredCount)
+	}
+
+	// If no recent messages, don't publish
+	if len(skyWaveResp.Messages) == 0 {
+		log.Printf("=== NO MQTT PUBLISH ===")
+		log.Printf("Reason: No recent messages found after XML filtering")
+		log.Printf("Original message count: %d", originalCount)
+		log.Printf("Filtered message count: 0")
+		log.Printf("Checked at: %s", time.Now().UTC().Format(time.RFC3339))
+		log.Printf("=====================")
+		return nil
+	}
+
+	// Marshal filtered data back to XML
+	filteredXML, err := xml.Marshal(skyWaveResp)
+	if err != nil {
+		return fmt.Errorf("error marshaling filtered XML: %v", err)
+	}
+
+	// Convert to hex for MQTT transmission
+	hexString := hex.EncodeToString(filteredXML)
+
+	// Create debug dump (first 32 bytes)
+	dump := hex.Dump(filteredXML[:min(32, len(filteredXML))])
+	escapedDump := html.EscapeString(dump)
+	log.Printf("Filtered SkyWave data:\n%s", escapedDump)
+
+	// Log XML preview for debugging
+	xmlPreview := string(filteredXML)
+	if len(xmlPreview) > 200 {
+		xmlPreview = xmlPreview[:200] + "..."
+	}
+	log.Printf("Filtered SkyWave XML Response Preview: %s", strings.ReplaceAll(xmlPreview, "\n", " "))
+
+	// Publish to MQTT with skywave topic
+	if token := mqttClient.Publish("skywave/xml", 0, false, hexString); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("error publishing SkyWave data to MQTT: %v", token.Error())
+	}
+
+	log.Printf("=== MQTT PUBLISH SUMMARY (FILTERED) ===")
+	log.Printf("Topic: skywave/xml")
+	log.Printf("Messages published: %d (out of %d total)", filteredCount, originalCount)
+	log.Printf("Data size: %d bytes (filtered), %d bytes (hex)", len(filteredXML), len(hexString))
+	log.Printf("Published at: %s", time.Now().UTC().Format(time.RFC3339))
+	log.Printf("====================================")
+
+	log.Printf("Successfully published %d filtered SkyWave messages to MQTT topic 'skywave/xml'", filteredCount)
+	return nil
+}
+
+func main() {
+	// Add debug flag
+	debugFlag := flag.Bool("v", false, "Enable verbose output")
+	flag.Parse()
+	// Note: Assuming utils.SetVerbose controls logging; replace with standard log if needed
+	if *debugFlag {
+		log.SetFlags(log.LstdFlags | log.Lshortfile)
+	} else {
+		log.SetFlags(log.LstdFlags)
+	}
+
+	pollInterval := getPollingTime()
+	log.Printf("Using polling interval of %v", pollInterval)
+
+	// Check for SkyWave configuration
+	skyWaveConfig := getSkyWaveConfig()
+	if skyWaveConfig.Enabled {
+		log.Printf("SkyWave mode enabled - will fetch data from SkyWave API")
+	} else {
+		log.Printf("SkyWave mode disabled - will use HTTP_URL if configured")
+	}
+
+	// Setup MQTT client
+	if err := setupMQTT(); err != nil {
+		log.Fatalf("Failed to setup MQTT client: %v", err)
+	}
+	defer mqttClient.Disconnect(250)
+
+	// Main polling loop
+	for {
+		startTime := time.Now()
+		log.Printf("Starting polling cycle at %v", startTime.Format(time.RFC3339))
+
+		// Process data based on configuration
+		if skyWaveConfig.Enabled {
+			// Process SkyWave/ORBCOMM data with time filtering
+			if err := processSkyWaveData(skyWaveConfig, pollInterval); err != nil {
+				log.Printf("Error processing SkyWave data: %v", err)
+			}
+		} else {
+			// Fall back to original HTTP behavior with time filtering
+			if err := processHttpData(pollInterval); err != nil {
+				log.Printf("Error processing HTTP data: %v", err)
+			}
+		}
+
+		elapsed := time.Since(startTime)
+		log.Printf("Polling cycle completed in %v", elapsed)
+
+		// Calculate sleep time, ensuring we don't have negative wait
+		sleepTime := pollInterval - elapsed
+		if sleepTime < 0 {
+			sleepTime = 0
+		}
+
+		log.Printf("Waiting %v until next cycle", sleepTime)
+		time.Sleep(sleepTime)
+	}
+}

@@ -1,0 +1,8 @@
+{
+  "track_id": "multi_imei_test_20260105",
+  "type": "test",
+  "status": "new",
+  "created_at": "2026-01-05T12:00:00Z",
+  "updated_at": "2026-01-05T12:00:00Z",
+  "description": "Create a multi-IMEI test script to verify concurrent per-IMEI state isolation."
+}
