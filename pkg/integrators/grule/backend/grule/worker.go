@@ -89,9 +89,9 @@ func (w *Worker) Process(payload string) {
 			if w.manifest != nil {
 				meta := w.manifest.GetRuleMeta(rkb.RuleName)
 				if meta != nil {
-					log.Printf("📸 [Worker] Meta found for '%s' (Enabled: %v)", rkb.RuleName, meta.Enabled)
 					if meta.Enabled {
-						snapshot, err := audit.ExtractSnapshot(dataContext, packet.IMEI, packet)
+						log.Printf("[Worker] Capturing post-snapshot for '%s' (using dc state, no override)", rkb.RuleName)
+						snapshot, err := audit.ExtractSnapshot(dataContext, packet.IMEI, nil)
 						if err != nil {
 							log.Printf("❌ [Worker] Error capturing post-snapshot for rule '%s': %v", rkb.RuleName, err)
 						} else {

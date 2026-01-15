@@ -28,7 +28,7 @@ import (
 
 func main() {
 	log.Println("====================================")
-	log.Println("🚀 NEW BACKEND v3.0.3 - Declarative Audit System")
+	log.Println("🚀 NEW BACKEND v3.0.7 - Declarative Audit System")
 	log.Println("====================================")
 	log.Println("Starting GRULE Backend (Jammer) on port 8081...")
 

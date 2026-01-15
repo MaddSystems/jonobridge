@@ -101,24 +101,9 @@ func (l *AuditListener) ExecuteRuleEntry(ctx context.Context, cycle uint64, entr
 		}
 	}
 
-	// RESOLVE PACKET FOR SNAPSHOT
-	// Priority 1: Field set on listener (safest)
-	// Priority 2: Context value
-	// Priority 3: DataContext (fallback, might be wrapped)
-	var finalPacket interface{}
-	if l.packet != nil {
-		finalPacket = l.packet
-		log.Printf("📸 [Listener] Using packet from listener field for '%s' (Type: %T)", entry.RuleName, finalPacket)
-	} else if ctxPacket := ctx.Value("originalPacket"); ctxPacket != nil {
-		finalPacket = ctxPacket
-		log.Printf("📸 [Listener] Using packet from context for '%s' (Type: %T)", entry.RuleName, finalPacket)
-	} else {
-		finalPacket = nil // ExtractSnapshot will use dc.Get("IncomingPacket")
-		log.Printf("⚠️ [Listener] No original packet found in listener or context for '%s', falling back to DataContext", entry.RuleName)
-	}
-
-	// Extract snapshot with resolved packet
-	snapshot, err := ExtractSnapshot(dc, imei, finalPacket)
+	// Extract snapshot with nil override to use updated DataContext state
+	log.Printf("[Listener] Preparing snapshot for '%s' (using DataContext state, no override)", entry.RuleName)
+	snapshot, err := ExtractSnapshot(dc, imei, nil)
 	if err != nil {
 		log.Printf("[AuditListener] Snapshot error for '%s': %v", entry.RuleName, err)
 		snapshot = map[string]interface{}{"error": err.Error()}
