@@ -13,24 +13,30 @@ type TrackerAdapter interface {
 	Parse(payload string) ([]*IncomingPacket, error)
 }
 
+type RuleKB struct {
+	RuleName string
+	KB       *ast.KnowledgeBase
+	Order    int
+}
+
 type Worker struct {
 	contextBuilder *ContextBuilder
 	adapter        TrackerAdapter
-	knowledgeBases []*ast.KnowledgeBase
+	ruleKBs        []RuleKB
 	manifest       *audit.AuditManifest
 }
 
-func NewWorker(cb *ContextBuilder, adapter TrackerAdapter, kbs []*ast.KnowledgeBase, manifest *audit.AuditManifest) *Worker {
+func NewWorker(cb *ContextBuilder, adapter TrackerAdapter, kbs []RuleKB, manifest *audit.AuditManifest) *Worker {
 	return &Worker{
 		contextBuilder: cb,
 		adapter:        adapter,
-		knowledgeBases: kbs,
+		ruleKBs:        kbs,
 		manifest:       manifest,
 	}
 }
 
-func (w *Worker) UpdateRules(kbs []*ast.KnowledgeBase, manifest *audit.AuditManifest) {
-	w.knowledgeBases = kbs
+func (w *Worker) UpdateRules(kbs []RuleKB, manifest *audit.AuditManifest) {
+	w.ruleKBs = kbs
 	w.manifest = manifest
 }
 
@@ -56,21 +62,58 @@ func (w *Worker) Process(payload string) {
 
 		// Wire listener for declarative audit
 		if w.manifest != nil {
+			listener := audit.NewAuditListener(w.manifest)
+			listener.SetPacket(packet)
 			eng.Listeners = []engine.GruleEngineListener{
-				audit.NewAuditListener(w.manifest),
+				listener,
 			}
 		} else {
 			log.Printf("⚠️ [Worker] No audit manifest loaded, listener will not be attached")
 		}
 
-		for _, kb := range w.knowledgeBases {
+		for _, rkb := range w.ruleKBs {
 			// Create context with dataContext and imei for listener
 			ctx := context.WithValue(context.Background(), "dataContext", dataContext)
 			ctx = context.WithValue(ctx, "imei", packet.IMEI)
 			ctx = context.WithValue(ctx, "originalPacket", packet) // Pass original packet to bypass DataContext wrappers
-			err = eng.ExecuteWithContext(ctx, dataContext, kb)
+			
+			log.Printf("🔍 [Worker] Executing rule '%s' (Order: %d)", rkb.RuleName, rkb.Order)
+			err = eng.ExecuteWithContext(ctx, dataContext, rkb.KB)
 			if err != nil {
-				log.Printf("❌ [Worker] Error executing rules for IMEI %s: %v", packet.IMEI, err)
+				log.Printf("❌ [Worker] Error executing rule '%s' for IMEI %s: %v", rkb.RuleName, packet.IMEI, err)
+			} else {
+				log.Printf("✅ [Worker] Execution finished for '%s'", rkb.RuleName)
+			}
+
+			// Capture POST-execution snapshot
+			if w.manifest != nil {
+				meta := w.manifest.GetRuleMeta(rkb.RuleName)
+				if meta != nil {
+					log.Printf("📸 [Worker] Meta found for '%s' (Enabled: %v)", rkb.RuleName, meta.Enabled)
+					if meta.Enabled {
+						snapshot, err := audit.ExtractSnapshot(dataContext, packet.IMEI, packet)
+						if err != nil {
+							log.Printf("❌ [Worker] Error capturing post-snapshot for rule '%s': %v", rkb.RuleName, err)
+						} else {
+							log.Printf("📤 [Worker] Sending post-capture for '%s'", rkb.RuleName)
+							audit.Capture(&audit.AuditEntry{
+								IMEI:         packet.IMEI,
+								RuleName:     rkb.RuleName,
+								Description:  meta.Description,
+								Level:        meta.Level,
+								IsAlert:      meta.IsAlert,
+								StepNumber:   meta.Order,
+								StageReached: meta.Description,
+								Snapshot:     snapshot,
+								IsPost:       true,
+							})
+						}
+					}
+				} else {
+					log.Printf("⚠️ [Worker] No manifest meta for rule '%s'", rkb.RuleName)
+				}
+			} else {
+				log.Printf("⚠️ [Worker] Manifest is nil, skipping post-capture")
 			}
 		}
 	}

@@ -18,25 +18,25 @@ Capture audit snapshots after each rule's `then` block executes (post-state), wi
 ## Phase 1: Backend Implementation
 
 ### TODO 1.1: Add RuleKB Struct & Update Loading
-**Status:** `[ ]` Pending  
-**File:** `backend/main.go`  
-- Define `RuleKB` struct  
-- Modify `loadRulesFromSlice` to accept `manifest` and return `[]RuleKB` with sorting by manifest `Order`  
+**Status:** `[x]` Complete
+**File:** `backend/main.go`
+- Define `RuleKB` struct
+- Modify `loadRulesFromSlice` to accept `manifest` and return `[]RuleKB` with sorting by manifest `Order`
 - Update caller in `main()` to pass `ruleKBs` to worker
 
 ### TODO 1.2: Implement Ordered Execution Loop with Post-Capture
-**Status:** `[ ]` Pending  
-**File:** `backend/grule/worker.go`  
-- Change current rule execution to explicit loop over `w.ruleKBs`  
-- After `ExecuteWithContext`, call `audit.ExtractSnapshot` + `audit.Capture`  
-- Populate entry with manifest metadata  
+**Status:** `[x]` Complete
+**File:** `backend/grule/worker.go`
+- Change current rule execution to explicit loop over `w.ruleKBs`
+- After `ExecuteWithContext`, call `audit.ExtractSnapshot` + `audit.Capture`
+- Populate entry with manifest metadata
 - **Important:** Ensure `audit.FinishCapture(imei)` is called at the end of the packet processing loop (if applicable/needed) to flush any pending buffers.
 
 ### TODO 1.3: Add IsPost Flag & Handle in Audit
-**Status:** `[ ]` Pending  
-**Files:** `backend/audit/types.go`, `backend/audit/capture.go`, `backend/audit/db.go`  
-- Add `IsPost bool` to `AuditEntry`  
-- Update `Capture` logic to save to DB (add `is_post` BOOLEAN column to `rule_execution_state`)  
+**Status:** `[x]` Complete
+**Files:** `backend/audit/types.go`, `backend/audit/capture.go`, `backend/audit/db.go`
+- Add `IsPost bool` to `AuditEntry`
+- Update `Capture` logic to save to DB (add `is_post` BOOLEAN column to `rule_execution_state`)
 - Run migration or backfill existing rows (default to `false`)
 
 ### TODO 1.4: Optional Listener Cleanup

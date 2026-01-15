@@ -19,17 +19,24 @@ type AuditEntry struct {
 	StepNumber   int                    // From manifest order field
 	StageReached string                 // Same as Description for now
 	Snapshot     map[string]interface{} // Rich snapshot from extractSnapshot()
+	IsPost       bool                   // true if captured after rule execution
 }
 
 // Capture saves audit entry to database in frontend-compatible format
 // This function MUST populate rule_execution_state in the exact format
 // expected by the frontend at /progress-audit-movie
 func Capture(entry *AuditEntry) {
-	if entry == nil || !IsProgressAuditEnabled() {
+	if entry == nil {
+		log.Println("[Capture] ⚠️ Entry is nil")
+		return
+	}
+	
+	if !IsProgressAuditEnabled() {
+		log.Println("[Capture] ⚠️ Progress Audit is DISABLED globally")
 		return
 	}
 
-	log.Printf("[Capture] Capturing audit for IMEI %s, Rule %s, IsAlert=%v", entry.IMEI, entry.RuleName, entry.IsAlert)
+	log.Printf("[Capture] 🟢 Capturing audit for IMEI %s, Rule %s, IsAlert=%v, IsPost=%v", entry.IMEI, entry.RuleName, entry.IsAlert, entry.IsPost)
 
 	// Build ProgressAudit compatible with existing SaveProgressAudit
 	progress := ProgressAudit{
@@ -39,6 +46,7 @@ func Capture(entry *AuditEntry) {
 		StepNumber:         entry.StepNumber,
 		StageReached:       entry.StageReached,
 		Level:              entry.Level,
+		IsPost:             entry.IsPost,
 		StopReason:         "", // Set if rule didn't fire
 		BufferSize:         extractBufferSize(entry.Snapshot),
 		MetricsReady:       extractMetricsReady(entry.Snapshot),

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,7 +28,7 @@ import (
 
 func main() {
 	log.Println("====================================")
-	log.Println("🚀 NEW BACKEND v3.0.2 - Declarative Audit System")
+	log.Println("🚀 NEW BACKEND v3.0.3 - Declarative Audit System")
 	log.Println("====================================")
 	log.Println("Starting GRULE Backend (Jammer) on port 8081...")
 
@@ -87,7 +88,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load rules: %v", err)
 	}
-	kbs := loadRulesFromSlice(rules)
 
 	// Build audit manifest from rules
 	manifest := audit.NewAuditManifest()
@@ -95,6 +95,8 @@ func main() {
 		log.Printf("Warning: Failed to load audit manifests: %v", err)
 	}
 	log.Printf("Loaded %d audit rule entries", manifest.Count())
+
+	kbs := loadRulesFromSlice(rules, manifest)
 
 	// 5. Worker
 	worker := grule.NewWorker(ctxBuilder, adapter, kbs, manifest)
@@ -108,7 +110,7 @@ func main() {
 		CapabilitiesDir: "./capabilities",
 		PortalEndpoint:  portalEndpoint,
 		Worker:          worker,
-		ReloadFunc: func() ([]*ast.KnowledgeBase, *audit.AuditManifest, error) {
+		ReloadFunc: func() ([]grule.RuleKB, *audit.AuditManifest, error) {
 			log.Println("🔄 Reloading rules and manifests...")
 			// 1. Load active rules from DB
 			newRules, err := store.LoadActiveRules()
@@ -116,14 +118,14 @@ func main() {
 				return nil, nil, err
 			}
 
-			// 2. Build new KnowledgeBases
-			newKBs := loadRulesFromSlice(newRules)
-
-			// 3. Build new Manifest
+			// 2. Build new Manifest
 			newManifest := audit.NewAuditManifest()
 			if err := newManifest.LoadFromRules(newRules); err != nil {
 				log.Printf("Warning: Failed to reload audit manifests: %v", err)
 			}
+
+			// 3. Build new KnowledgeBases
+			newKBs := loadRulesFromSlice(newRules, newManifest)
 
 			log.Printf("✅ Reloaded %d rules and %d manifest entries", len(newRules), newManifest.Count())
 			return newKBs, newManifest, nil
@@ -506,8 +508,8 @@ func swaggerJSONHandler(portalEndpoint string) http.HandlerFunc {
 	}
 }
 
-func loadRulesFromSlice(rules []persistence.Rule) []*ast.KnowledgeBase {
-	var kbs []*ast.KnowledgeBase
+func loadRulesFromSlice(rules []persistence.Rule, manifest *audit.AuditManifest) []grule.RuleKB {
+	var kbs []grule.RuleKB
 	for _, r := range rules {
 		log.Printf("Loading rule: %s", r.Name)
 		kb := ast.NewKnowledgeLibrary()
@@ -522,8 +524,24 @@ func loadRulesFromSlice(rules []persistence.Rule) []*ast.KnowledgeBase {
 			log.Printf("Error creating KB instance for %s: %v", r.Name, err)
 			continue
 		}
-		kbs = append(kbs, kbInstance)
+
+		order := 100 // Default order
+		if meta := manifest.GetRuleMeta(r.Name); meta != nil {
+			order = meta.Order
+		}
+
+		kbs = append(kbs, grule.RuleKB{
+			RuleName: r.Name,
+			KB:       kbInstance,
+			Order:    order,
+		})
 	}
+
+	// Sort by Order
+	sort.Slice(kbs, func(i, j int) bool {
+		return kbs[i].Order < kbs[j].Order
+	})
+
 	return kbs
 }
 

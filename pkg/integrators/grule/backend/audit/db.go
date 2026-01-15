@@ -209,6 +209,7 @@ func CreateProgressAuditTable() {
 		step_number INT DEFAULT 0,
 		stage_reached VARCHAR(50) NOT NULL,
 		level VARCHAR(20) DEFAULT 'info',
+		is_post BOOLEAN DEFAULT false,
 		stop_reason VARCHAR(100) NOT NULL,
 		buffer_size INT DEFAULT 0,
 		metrics_ready BOOLEAN DEFAULT false,
@@ -252,9 +253,9 @@ func SaveProgressAudit(progress ProgressAudit) error {
 
 	query := `
 		INSERT INTO rule_execution_state 
-		(imei, rule_id, rule_name, components_executed, component_details, step_number, stage_reached, level, stop_reason, buffer_size, 
+		(imei, rule_id, rule_name, components_executed, component_details, step_number, stage_reached, level, is_post, stop_reason, buffer_size, 
 		 metrics_ready, geofence_eval, context_snapshot, execution_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	_, err := db.Exec(query,
@@ -266,6 +267,7 @@ func SaveProgressAudit(progress ProgressAudit) error {
 		progress.StepNumber,
 		progress.StageReached,
 		progress.Level,
+		progress.IsPost,
 		progress.StopReason,
 		progress.BufferSize,
 		progress.MetricsReady,
@@ -290,12 +292,12 @@ func SaveProgressFrame(imei string, ruleID int64, ruleName string, componentsExe
 
 	query := `
 		INSERT INTO rule_execution_state 
-		(imei, rule_id, rule_name, components_executed, component_details, step_number, stage_reached, level, stop_reason, 
+		(imei, rule_id, rule_name, components_executed, component_details, step_number, stage_reached, level, is_post, stop_reason, 
 		 buffer_size, metrics_ready, geofence_eval, context_snapshot, execution_time)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
 	`
 
-	_, err := db.Exec(query, imei, ruleID, ruleName, string(componentsJSON), string(detailsJSON), stepNumber, stageReached, level, stopReason,
+	_, err := db.Exec(query, imei, ruleID, ruleName, string(componentsJSON), string(detailsJSON), stepNumber, stageReached, level, false, stopReason,
 		bufferSize, metricsReady, geofenceEval, string(snapshotJSON))
 
 	return err
@@ -411,7 +413,7 @@ func GetFrameTimelinePaginated(imei string, limit, offset int, sortBy, sortOrder
 	db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM rule_execution_state %s", whereClause), args...).Scan(&total)
 
 	query := fmt.Sprintf(`
-		SELECT id, rule_id, rule_name, components_executed, component_details, step_number, stage_reached, level, stop_reason,
+		SELECT id, rule_id, rule_name, components_executed, component_details, step_number, stage_reached, level, is_post, stop_reason,
 		buffer_size, metrics_ready, geofence_eval, context_snapshot, execution_time
 		FROM rule_execution_state %s ORDER BY %s %s LIMIT ? OFFSET ?
 	`, whereClause, sortBy, sortOrder)
@@ -428,11 +430,11 @@ func GetFrameTimelinePaginated(imei string, limit, offset int, sortBy, sortOrder
 		var id, step, bufSize int
 		var rId int64
 		var rName, stage, level, stop, geo string
-		var metrics bool
+		var metrics, isPost bool
 		var snapJSON, compJSON, detJSON []byte
 		var execTime sql.NullTime
 
-		rows.Scan(&id, &rId, &rName, &compJSON, &detJSON, &step, &stage, &level, &stop, &bufSize, &metrics, &geo, &snapJSON, &execTime)
+		rows.Scan(&id, &rId, &rName, &compJSON, &detJSON, &step, &stage, &level, &isPost, &stop, &bufSize, &metrics, &geo, &snapJSON, &execTime)
 
 		var snap, det map[string]interface{}
 		var comp []string
@@ -442,7 +444,7 @@ func GetFrameTimelinePaginated(imei string, limit, offset int, sortBy, sortOrder
 
 		frame := map[string]interface{}{
 			"id": id, "rule_id": rId, "rule_name": rName, "components_executed": comp, "component_details": det,
-			"step_number": step, "stage_reached": stage, "level": level, "stop_reason": stop, "buffer_size": bufSize,
+			"step_number": step, "stage_reached": stage, "level": level, "is_post": isPost, "stop_reason": stop, "buffer_size": bufSize,
 			"metrics_ready": metrics, "geofence_eval": geo, "snapshot": snap,
 		}
 		if execTime.Valid {

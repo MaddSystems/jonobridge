@@ -64,20 +64,41 @@ func (j JSONMap) Value() (driver.Value, error) {
 }
 
 // ProgressAudit representa el estado de ejecución de una regla
+
 type ProgressAudit struct {
-	ID                int64     `json:"id"`
-	IMEI              string    `json:"imei"`
-	RuleID            int64     `json:"rule_id"`
-	RuleName          string    `json:"rule_name"`
-	ComponentsExecuted []string `json:"components_executed"`
-	ComponentDetails  JSONMap   `json:"component_details"`
-	StepNumber        int       `json:"step_number"`
-	StageReached      string    `json:"stage_reached"`
-	Level             string    `json:"level"`
-	StopReason        string    `json:"stop_reason"`
-	BufferSize        int       `json:"buffer_size"`
-	MetricsReady      bool      `json:"metrics_ready"`
-	GeofenceEval      string    `json:"geofence_eval"`
-	ContextSnapshot   JSONMap   `json:"context_snapshot"`
-	ExecutionTime     time.Time `json:"execution_time"`
+
+	ID                 int64     `json:"id"`
+
+	IMEI               string    `json:"imei"`
+
+	RuleID             int64     `json:"rule_id"`
+
+	RuleName           string    `json:"rule_name"`
+
+	ComponentsExecuted []string  `json:"components_executed"`
+
+	ComponentDetails   JSONMap   `json:"component_details"`
+
+	StepNumber         int       `json:"step_number"`
+
+	StageReached       string    `json:"stage_reached"`
+
+	Level              string    `json:"level"`
+
+	IsPost             bool      `json:"is_post"`
+
+	StopReason         string    `json:"stop_reason"`
+
+	BufferSize         int       `json:"buffer_size"`
+
+	MetricsReady       bool      `json:"metrics_ready"`
+
+	GeofenceEval       string    `json:"geofence_eval"`
+
+	ContextSnapshot    JSONMap   `json:"context_snapshot"`
+
+	ExecutionTime      time.Time `json:"execution_time"`
+
 }
+
+

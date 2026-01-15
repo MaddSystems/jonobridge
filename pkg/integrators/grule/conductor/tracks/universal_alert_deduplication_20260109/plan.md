@@ -92,7 +92,7 @@ state.MarkAlertSentForRule("DEFCON4_JammerAlert_Fire")
 ## Phase 3: Verification
 
 ### TODO 3.1: Test for Duplicates
-**Status:** `[ ]` Pending User Verification
+**Status:** `[x]` Complete
 - Run `tests/send_multiple.py`
 - Verify logs show "BLOCKED (local)" for re-evaluations.
-- Verify exactly 1 alert per IMEI/Rule in `alert_details` table.
+- Verify exactly 1 alert per rule/IMEI in the database.

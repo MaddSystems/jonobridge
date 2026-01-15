@@ -15,6 +15,7 @@ type AuditListener struct {
 	loggedMu    sync.Mutex
 	dataContext ast.IDataContext // Store data context for use in ExecuteRuleEntry
 	dcMu        sync.RWMutex
+	packet      interface{}      // Store original packet to bypass context issues
 }
 
 func NewAuditListener(manifest *AuditManifest) *AuditListener {
@@ -23,6 +24,11 @@ func NewAuditListener(manifest *AuditManifest) *AuditListener {
 		enabled:    true,
 		loggedOnce: make(map[string]bool),
 	}
+}
+
+// SetPacket sets the original packet to be used in snapshots
+func (l *AuditListener) SetPacket(p interface{}) {
+	l.packet = p
 }
 
 // SetEnabled - Global kill switch for performance
@@ -47,6 +53,8 @@ func (l *AuditListener) ExecuteRuleEntry(ctx context.Context, cycle uint64, entr
 	if !IsProgressAuditEnabled() {
 		return
 	}
+
+	log.Printf("👂 [Listener] Detected execution of '%s'", entry.RuleName)
 
 	// Get data context from context value
 	dcValue := ctx.Value("dataContext")
@@ -93,11 +101,24 @@ func (l *AuditListener) ExecuteRuleEntry(ctx context.Context, cycle uint64, entr
 		}
 	}
 
-	// Get original packet from context (to bypass possible DataContext wrappers/proxies)
-	originalPacket := ctx.Value("originalPacket")
+	// RESOLVE PACKET FOR SNAPSHOT
+	// Priority 1: Field set on listener (safest)
+	// Priority 2: Context value
+	// Priority 3: DataContext (fallback, might be wrapped)
+	var finalPacket interface{}
+	if l.packet != nil {
+		finalPacket = l.packet
+		log.Printf("📸 [Listener] Using packet from listener field for '%s' (Type: %T)", entry.RuleName, finalPacket)
+	} else if ctxPacket := ctx.Value("originalPacket"); ctxPacket != nil {
+		finalPacket = ctxPacket
+		log.Printf("📸 [Listener] Using packet from context for '%s' (Type: %T)", entry.RuleName, finalPacket)
+	} else {
+		finalPacket = nil // ExtractSnapshot will use dc.Get("IncomingPacket")
+		log.Printf("⚠️ [Listener] No original packet found in listener or context for '%s', falling back to DataContext", entry.RuleName)
+	}
 
-	// Extract snapshot with nil-safety
-	snapshot, err := extractSnapshot(dc, imei, originalPacket)
+	// Extract snapshot with resolved packet
+	snapshot, err := ExtractSnapshot(dc, imei, finalPacket)
 	if err != nil {
 		log.Printf("[AuditListener] Snapshot error for '%s': %v", entry.RuleName, err)
 		snapshot = map[string]interface{}{"error": err.Error()}
@@ -114,6 +135,7 @@ func (l *AuditListener) ExecuteRuleEntry(ctx context.Context, cycle uint64, entr
 		StepNumber:   meta.Order,       // From manifest
 		StageReached: meta.Description, // Use description as stage name
 		Snapshot:     snapshot,
+		IsPost:       false,
 	})
 }
 

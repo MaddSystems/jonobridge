@@ -10,10 +10,10 @@ import (
 	"github.com/jonobridge/grule-backend/capabilities"
 )
 
-// extractSnapshot builds rich context snapshot using SnapshotProvider pattern
+// ExtractSnapshot builds rich context snapshot using SnapshotProvider pattern
 // Each capability self-reports its data - no modification needed when adding new capabilities
 // packetOverride allows passing the original packet pointer if DataContext holds a wrapped value
-func extractSnapshot(dc ast.IDataContext, imei string, packetOverride interface{}) (map[string]interface{}, error) {
+func ExtractSnapshot(dc ast.IDataContext, imei string, packetOverride interface{}) (map[string]interface{}, error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[AuditListener] Panic during snapshot: %v", r)
@@ -26,8 +26,10 @@ func extractSnapshot(dc ast.IDataContext, imei string, packetOverride interface{
 	var packetObj interface{}
 	if packetOverride != nil {
 		packetObj = packetOverride
+		log.Printf("📸 [Snapshot] Using packetOverride (Type: %T)", packetOverride)
 	} else {
 		packetObj = dc.Get("IncomingPacket")
+		log.Printf("📸 [Snapshot] Using IncomingPacket from DataContext (Type: %T)", packetObj)
 	}
 
 	if packetObj != nil {
@@ -38,6 +40,10 @@ func extractSnapshot(dc ast.IDataContext, imei string, packetOverride interface{
 		if m, ok := extracted.(map[string]interface{}); ok {
 			if len(m) == 0 {
 				log.Printf("[Snapshot] WARNING: packet_current is empty map. packetObj type: %T", packetObj)
+			} else {
+				// Log success and key fields
+				log.Printf("[Snapshot] packet_current extracted successfully. Fields: %d, BufferUpdated: %v, BufferHas10: %v", 
+					len(m), m["BufferUpdated"], m["BufferHas10"])
 			}
 		}
 	} else {

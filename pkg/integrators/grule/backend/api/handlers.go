@@ -13,6 +13,7 @@ import (
 	"github.com/hyperjumptech/grule-rule-engine/builder"
 	"github.com/hyperjumptech/grule-rule-engine/pkg"
 	"github.com/jonobridge/grule-backend/audit"
+	"github.com/jonobridge/grule-backend/grule"
 	"github.com/jonobridge/grule-backend/persistence"
 	"github.com/jonobridge/grule-backend/schema"
 )
@@ -22,9 +23,9 @@ type Server struct {
 	CapabilitiesDir string
 	PortalEndpoint  string
 	Worker          interface {
-		UpdateRules(kbs []*ast.KnowledgeBase, manifest *audit.AuditManifest)
+		UpdateRules(kbs []grule.RuleKB, manifest *audit.AuditManifest)
 	}
-	ReloadFunc func() ([]*ast.KnowledgeBase, *audit.AuditManifest, error)
+	ReloadFunc func() ([]grule.RuleKB, *audit.AuditManifest, error)
 }
 
 func (s *Server) ReloadHandler(w http.ResponseWriter, r *http.Request) {

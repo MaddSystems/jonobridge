@@ -24,7 +24,7 @@ func main() {
 	// ---------------------------------------------------------
 	// LOG DE VERIFICACIÓN DE DEPLOY (Simple y visible)
 	// ---------------------------------------------------------
-	log.Println("==== NEW DEPLOYMENT VERIFICATION LOG v1.0.11 ====")
+	log.Println("==== NEW DEPLOYMENT VERIFICATION LOG v1.0.12 ====")
 	log.Println("==== CHECK: PacketWrapper has IsOfflineFor5Min ====")
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("=== Iniciando Grule Engine Universal ===")
