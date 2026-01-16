@@ -38,6 +38,11 @@ func (bm *BufferManager) GetOrCreateBuffer(imei string) *FixedCircularBuffer {
 	return newBuffer
 }
 
+func (bm *BufferManager) GetAllEntries(imei string) []BufferEntry {
+	buffer := bm.GetOrCreateBuffer(imei)
+	return buffer.GetAllEntries()
+}
+
 func (bm *BufferManager) startCleanupRoutine() {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()

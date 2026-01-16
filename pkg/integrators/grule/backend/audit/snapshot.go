@@ -8,7 +8,33 @@ import (
 
 	"github.com/hyperjumptech/grule-rule-engine/ast"
 	"github.com/jonobridge/grule-backend/capabilities"
+	"github.com/jonobridge/grule-backend/capabilities/buffer"
 )
+
+// unwrapGruleNode extracts the underlying value from a Grule wrapper node if present
+func unwrapGruleNode(obj interface{}) interface{} {
+	if obj == nil {
+		return nil
+	}
+
+	// We check for an interface that has a GetValue() or Value() method
+	// Grule internal nodes usually implement these.
+	if gv, ok := obj.(interface{ GetValue() reflect.Value }); ok {
+		val := gv.GetValue()
+		if val.IsValid() && val.CanInterface() {
+			return val.Interface()
+		}
+	} else if gv, ok := obj.(interface{ Value() reflect.Value }); ok {
+		val := gv.Value()
+		if val.IsValid() && val.CanInterface() {
+			return val.Interface()
+		}
+	} else if gv, ok := obj.(interface{ GetValue() interface{} }); ok {
+		return gv.GetValue()
+	}
+
+	return obj
+}
 
 // ExtractSnapshot builds rich context snapshot using SnapshotProvider pattern
 // Each capability self-reports its data - no modification needed when adding new capabilities
@@ -37,27 +63,8 @@ func ExtractSnapshot(dc ast.IDataContext, imei string, packetOverride interface{
 		typeStr := reflect.TypeOf(packetObj).String()
 		log.Printf("[ExtractSnapshot] packetObj type: %s", typeStr)
 
-		var realPacket interface{} = packetObj
-
-		// Unwrap Grule node if needed
-		// We check for an interface that has a GetValue() or Value() method
-		// Grule internal nodes usually implement these.
-		if gv, ok := packetObj.(interface{ GetValue() reflect.Value }); ok {
-			val := gv.GetValue()
-			if val.IsValid() && val.CanInterface() {
-				realPacket = val.Interface()
-				log.Printf("[ExtractSnapshot] Unwrapped via GetValue() to: %T", realPacket)
-			}
-		} else if gv, ok := packetObj.(interface{ Value() reflect.Value }); ok {
-			val := gv.Value()
-			if val.IsValid() && val.CanInterface() {
-				realPacket = val.Interface()
-				log.Printf("[ExtractSnapshot] Unwrapped via Value() to: %T", realPacket)
-			}
-		} else if gv, ok := packetObj.(interface{ GetValue() interface{} }); ok {
-			realPacket = gv.GetValue()
-			log.Printf("[ExtractSnapshot] Unwrapped via GetValue() interface to: %T", realPacket)
-		}
+		realPacket := unwrapGruleNode(packetObj)
+		log.Printf("[ExtractSnapshot] Real packet type: %T", realPacket)
 
 		// Now extract manually if it matches our expected type name string
 		realTypeStr := reflect.TypeOf(realPacket).String()
@@ -83,6 +90,11 @@ func ExtractSnapshot(dc ast.IDataContext, imei string, packetOverride interface{
 				"MetricsReady":            getFieldBool(v, "MetricsReady"),
 				"MovingWithWeakSignal":    getFieldBool(v, "MovingWithWeakSignal"),
 				"OutsideAllSafeZones":     getFieldBool(v, "OutsideAllSafeZones"),
+			}
+
+			// ADD BUFFER CONTENTS TO PACKET_CURRENT
+			if bufferData := getBufferData(dc, imei); bufferData != nil {
+				extracted["buffer"] = bufferData
 			}
 
 			snapshot["packet_current"] = extracted
@@ -175,6 +187,50 @@ func getFieldMap(v reflect.Value, name string) map[string]interface{} {
 	return make(map[string]interface{})
 }
 
+// getBufferData extracts buffer contents from the DataContext
+func getBufferData(dc ast.IDataContext, imei string) interface{} {
+	stateObj := dc.Get("state")
+	if stateObj == nil {
+		log.Printf("[getBufferData] No state object in DataContext")
+		return nil
+	}
+
+	log.Printf("[getBufferData] Found state object: %T", stateObj)
+	realState := unwrapGruleNode(stateObj)
+	log.Printf("[getBufferData] Real state object type: %T", realState)
+
+	// Try to access the Buf field using reflection
+	stateValue := reflect.ValueOf(realState)
+	if stateValue.Kind() == reflect.Ptr {
+		stateValue = stateValue.Elem()
+	}
+
+	if stateValue.IsValid() && stateValue.Kind() == reflect.Struct {
+		bufField := stateValue.FieldByName("Buf")
+		if bufField.IsValid() && !bufField.IsNil() {
+			log.Printf("[getBufferData] Found Buf field: %T", bufField.Interface())
+			if bufCap, ok := bufField.Interface().(*buffer.BufferCapability); ok && bufCap != nil {
+				log.Printf("[getBufferData] Got buffer capability")
+				if data := bufCap.GetSnapshotData(imei); data != nil {
+					log.Printf("[getBufferData] Got buffer data (keys: %v)", reflect.ValueOf(data).MapKeys())
+					if bufferCircular, exists := data["buffer_circular"]; exists {
+						return bufferCircular
+					}
+				} else {
+					log.Printf("[getBufferData] GetSnapshotData returned nil")
+				}
+			} else {
+				log.Printf("[getBufferData] Buf field is not *BufferCapability")
+			}
+		} else {
+			log.Printf("[getBufferData] Buf field not found or is nil")
+		}
+	} else {
+		log.Printf("[getBufferData] State object is not a struct (Kind: %s)", stateValue.Kind())
+	}
+	return nil
+}
+
 // collectSnapshotProviders gathers all capabilities that implement SnapshotProvider
 func collectSnapshotProviders(dc ast.IDataContext) []capabilities.SnapshotProvider {
 	var providers []capabilities.SnapshotProvider
@@ -185,7 +241,8 @@ func collectSnapshotProviders(dc ast.IDataContext) []capabilities.SnapshotProvid
 		return providers
 	}
 
-	v := reflect.ValueOf(stateObj)
+	realState := unwrapGruleNode(stateObj)
+	v := reflect.ValueOf(realState)
 	if v.Kind() == reflect.Ptr {
 		v = v.Elem()
 	}

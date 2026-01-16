@@ -47,6 +47,16 @@ func (b *FixedCircularBuffer) AddEntry(entry BufferEntry) bool {
 	}
 }
 
+func (b *FixedCircularBuffer) GetAllEntries() []BufferEntry {
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
+
+	// Return copy of slice up to current size
+	result := make([]BufferEntry, b.size)
+	copy(result, b.entries[:b.size])
+	return result
+}
+
 func (b *FixedCircularBuffer) GetEntriesInTimeWindow90Min() []BufferEntry {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()

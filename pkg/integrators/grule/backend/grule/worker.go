@@ -41,7 +41,7 @@ func (w *Worker) UpdateRules(kbs []RuleKB, manifest *audit.AuditManifest) {
 }
 
 func (w *Worker) Process(payload string) {
-	log.Printf("📥 [Worker] Processing new payload: %s", payload)
+	// log.Printf("📥 [Worker] Processing new payload: %s", payload)
 	packets, err := w.adapter.Parse(payload)
 	if err != nil {
 		log.Printf("❌ [Worker] Error parsing packets: %v", err)

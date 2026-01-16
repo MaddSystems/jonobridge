@@ -40,7 +40,7 @@ func (c *BufferCapability) GetSnapshotData(imei string) map[string]interface{} {
 		return nil
 	}
 
-	entries := c.GetEntriesInTimeWindow90Min(imei)
+	entries := c.manager.GetAllEntries(imei)
 	var bufferData []map[string]interface{}
 	for _, e := range entries {
 		bufferData = append(bufferData, map[string]interface{}{

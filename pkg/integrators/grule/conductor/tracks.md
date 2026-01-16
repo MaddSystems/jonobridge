@@ -4,8 +4,13 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [ ] Track: Update Documentation and Programming Guides
-*Link: [./conductor/tracks/update_documentation_20260116/](./conductor/tracks/update_documentation_20260116/)*
+## [ ] Track: Explain and Enhance Buffer Snapshot Visibility
+*Link: [./conductor/tracks/explain_buffer_snapshot_20260116/](./conductor/tracks/explain_buffer_snapshot_20260116/)*
+
+---
+
+## [x] Track: Update Documentation and Programming Guides
+*Link: [./conductor/archive/update_documentation_20260116/](./conductor/archive/update_documentation_20260116/)*
 
 ---
 
