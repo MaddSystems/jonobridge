@@ -51,6 +51,12 @@ El ensamblaje ocurre en `main.go`, donde se registran y conectan los bricks a tr
 - **Razón de ser**: Proporciona trazabilidad completa de decisiones de reglas sin modificar las reglas mismas.
 - **Modularidad**: Implementa `SnapshotProvider` para contribuir datos a auditoría. Se puede deshabilitar o reemplazar por bricks alternativos (e.g., logging a Kafka).
 
+### Refactorización del Sistema de Auditoría (Enero 2026)
+Se ha implementado una estrategia de **"Captura Explícita Pura"** para eliminar duplicados y ruido:
+1.  **Sin Captura Automática**: Se eliminaron los listeners automáticos y las capturas post-ejecución en el worker.
+2.  **Control Manual**: Las reglas GRL deciden cuándo capturar usando `actions.CaptureSnapshot("RuleName")`.
+3.  **SnapshotProvider**: Las capabilities exponen sus datos implementando esta interfaz, y el sistema de auditoría los agrega automáticamente al snapshot.
+
 ## `capabilities/`
 **Propósito**: Núcleo modular del sistema. Cada subcarpeta es un brick funcional.
 - `interface.go`: Define `Capability` interface que todos los bricks deben implementar.

@@ -79,14 +79,14 @@ func ExtractSnapshot(dc ast.IDataContext, imei string, packetOverride interface{
 				"BufferUpdated":           getFieldBool(v, "BufferUpdated"),
 				"BufferHas10":             getFieldBool(v, "BufferHas10"),
 				"IsOfflineFor5Min":        getFieldBool(v, "IsOfflineFor5Min"),
-				"PositionInvalidDetected": getFieldBool(v, "PositionInvalidDetected"),	
+				"PositionInvalidDetected": getFieldBool(v, "PositionInvalidDetected"),
 				"MetricsReady":            getFieldBool(v, "MetricsReady"),
 				"MovingWithWeakSignal":    getFieldBool(v, "MovingWithWeakSignal"),
 				"OutsideAllSafeZones":     getFieldBool(v, "OutsideAllSafeZones"),
 			}
-			
+
 			snapshot["packet_current"] = extracted
-			log.Printf("[ExtractSnapshot] Manually extracted packet_current: BufferUpdated=%v, BufferHas10=%v", 
+			log.Printf("[ExtractSnapshot] Manually extracted packet_current: BufferUpdated=%v, BufferHas10=%v",
 				extracted["BufferUpdated"], extracted["BufferHas10"])
 		} else {
 			// Fallback for other types
@@ -159,6 +159,22 @@ func getFieldBool(v reflect.Value, name string) bool {
 	return false
 }
 
+func getFieldMap(v reflect.Value, name string) map[string]interface{} {
+	f := v.FieldByName(name)
+	if f.IsValid() && f.Kind() == reflect.Map {
+		if f.Type().Key().Kind() == reflect.String {
+			result := make(map[string]interface{})
+			for _, key := range f.MapKeys() {
+				if value := f.MapIndex(key); value.IsValid() && value.CanInterface() {
+					result[key.String()] = value.Interface()
+				}
+			}
+			return result
+		}
+	}
+	return make(map[string]interface{})
+}
+
 // collectSnapshotProviders gathers all capabilities that implement SnapshotProvider
 func collectSnapshotProviders(dc ast.IDataContext) []capabilities.SnapshotProvider {
 	var providers []capabilities.SnapshotProvider
@@ -198,7 +214,7 @@ func safeExtract(v interface{}) interface{} {
 		log.Printf("[safeExtract] Input is NIL")
 		return nil
 	}
-	
+
 	// Key debug: Log type and value
 	log.Printf("[safeExtract] Input type: %T, value: %+v", v, v)
 
@@ -207,7 +223,7 @@ func safeExtract(v interface{}) interface{} {
 		log.Printf("[Snapshot] json.Marshal error: %v, type: %T, value: %+v", err, v, v)
 		return fmt.Sprintf("%+v", v)
 	}
-	
+
 	// Key debug: Log raw JSON
 	if len(data) < 200 {
 		log.Printf("[safeExtract] Raw JSON from marshal: %s", string(data))

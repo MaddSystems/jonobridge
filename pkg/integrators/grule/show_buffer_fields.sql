@@ -1,1 +1,0 @@
-SELECT      id,     imei,     rule_name,     execution_time,     JSON_EXTRACT(context_snapshot, '$.packet_current.BufferUpdated') AS bufferupdated,     JSON_EXTRACT(context_snapshot, '$.packet_current.BufferHas10') AS bufferhas10 FROM rule_execution_state ORDER BY execution_time ASC;
