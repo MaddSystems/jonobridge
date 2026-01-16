@@ -52,7 +52,7 @@ func (w *Worker) Process(payload string) {
 
 	for _, packet := range packets {
 		log.Printf("🛰️ [Worker] Running rules for IMEI %s (Speed: %d)", packet.IMEI, packet.Speed)
-		dataContext, err := w.contextBuilder.Build(packet)
+		dataContext, err := w.contextBuilder.Build(packet, w.manifest)
 		if err != nil {
 			log.Printf("❌ [Worker] Error building context for IMEI %s: %v", packet.IMEI, err)
 			continue
@@ -61,22 +61,23 @@ func (w *Worker) Process(payload string) {
 		eng := engine.NewGruleEngine()
 
 		// Wire listener for declarative audit
-		if w.manifest != nil {
-			listener := audit.NewAuditListener(w.manifest)
-			listener.SetPacket(packet)
-			eng.Listeners = []engine.GruleEngineListener{
-				listener,
-			}
-		} else {
-			log.Printf("⚠️ [Worker] No audit manifest loaded, listener will not be attached")
-		}
+		// DISABLED: Using explicit captures only (Fix #1 & #2)
+		// if w.manifest != nil {
+		// 	listener := audit.NewAuditListener(w.manifest)
+		// 	listener.SetPacket(packet)
+		// 	eng.Listeners = []engine.GruleEngineListener{
+		// 		listener,
+		// 	}
+		// } else {
+		// 	log.Printf("⚠️ [Worker] No audit manifest loaded, listener will not be attached")
+		// }
 
 		for _, rkb := range w.ruleKBs {
 			// Create context with dataContext and imei for listener
 			ctx := context.WithValue(context.Background(), "dataContext", dataContext)
 			ctx = context.WithValue(ctx, "imei", packet.IMEI)
 			ctx = context.WithValue(ctx, "originalPacket", packet) // Pass original packet to bypass DataContext wrappers
-			
+
 			log.Printf("🔍 [Worker] Executing rule '%s' (Order: %d)", rkb.RuleName, rkb.Order)
 			err = eng.ExecuteWithContext(ctx, dataContext, rkb.KB)
 			if err != nil {
@@ -86,35 +87,36 @@ func (w *Worker) Process(payload string) {
 			}
 
 			// Capture POST-execution snapshot
-			if w.manifest != nil {
-				meta := w.manifest.GetRuleMeta(rkb.RuleName)
-				if meta != nil {
-					if meta.Enabled {
-						log.Printf("[Worker] Capturing post-snapshot for '%s' (using dc state, no override)", rkb.RuleName)
-						snapshot, err := audit.ExtractSnapshot(dataContext, packet.IMEI, nil)
-						if err != nil {
-							log.Printf("❌ [Worker] Error capturing post-snapshot for rule '%s': %v", rkb.RuleName, err)
-						} else {
-							log.Printf("📤 [Worker] Sending post-capture for '%s'", rkb.RuleName)
-							audit.Capture(&audit.AuditEntry{
-								IMEI:         packet.IMEI,
-								RuleName:     rkb.RuleName,
-								Description:  meta.Description,
-								Level:        meta.Level,
-								IsAlert:      meta.IsAlert,
-								StepNumber:   meta.Order,
-								StageReached: meta.Description,
-								Snapshot:     snapshot,
-								IsPost:       true,
-							})
-						}
-					}
-				} else {
-					log.Printf("⚠️ [Worker] No manifest meta for rule '%s'", rkb.RuleName)
-				}
-			} else {
-				log.Printf("⚠️ [Worker] Manifest is nil, skipping post-capture")
-			}
+			// DISABLED: Using explicit captures only (Fix #1 & #4)
+			// if w.manifest != nil {
+			// 	meta := w.manifest.GetRuleMeta(rkb.RuleName)
+			// 	if meta != nil {
+			// 		if meta.Enabled {
+			// 			log.Printf("[Worker] Capturing post-snapshot for '%s' (using dc state, no override)", rkb.RuleName)
+			// 			snapshot, err := audit.ExtractSnapshot(dataContext, packet.IMEI, nil)
+			// 			if err != nil {
+			// 				log.Printf("❌ [Worker] Error capturing post-snapshot for rule '%s': %v", rkb.RuleName, err)
+			// 			} else {
+			// 				log.Printf("📤 [Worker] Sending post-capture for '%s'", rkb.RuleName)
+			// 				audit.Capture(&audit.AuditEntry{
+			// 					IMEI:         packet.IMEI,
+			// 					RuleName:     rkb.RuleName,
+			// 					Description:  meta.Description,
+			// 					Level:        meta.Level,
+			// 					IsAlert:      meta.IsAlert,
+			// 					StepNumber:   meta.Order,
+			// 					StageReached: meta.Description,
+			// 					Snapshot:     snapshot,
+			// 					IsPost:       true,
+			// 				})
+			// 			}
+			// 		}
+			// 	} else {
+			// 		log.Printf("⚠️ [Worker] No manifest meta for rule '%s'", rkb.RuleName)
+			// 	}
+			// } else {
+			// 	log.Printf("⚠️ [Worker] Manifest is nil, skipping post-capture")
+			// }
 		}
 	}
 }

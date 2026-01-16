@@ -4,15 +4,40 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
+## [ ] Track: Fix Double Snapshot Capture & Alert Spam
+*Link: [./conductor/tracks/fix_double_snapshot_capture_20260116/](./conductor/tracks/fix_double_snapshot_capture_20260116/)*
+
+---
+
+## [x] Track: Explicit Per-Rule Post-Execution Snapshot Capture
+*Link: [./conductor/archive/explicit_per_rule_snapshot_20260115/](./conductor/archive/explicit_per_rule_snapshot_20260115/)*
+
+---
+
 ## [x] Track: Universal Alert Deduplication
-*Link: [./conductor/tracks/universal_alert_deduplication_20260109/](./conductor/tracks/universal_alert_deduplication_20260109/)*
+*Link: [./conductor/archive/universal_alert_deduplication_20260109/](./conductor/archive/universal_alert_deduplication_20260109/)*
 
 ---
 
 ## [x] Track: Declarative Audit Magic
-*Link: [./conductor/tracks/declarative_audit_magic_20260106/](./conductor/tracks/declarative_audit_magic_20260106/)*
+*Link: [./conductor/archive/declarative_audit_magic_20260106/](./conductor/archive/declarative_audit_magic_20260106/)*
 
 ---
 
 ## [x] Track: Cleanup Unused Cond5 Flags
-*Link: [./conductor/tracks/cleanup_unused_cond5_20251223/](./conductor/tracks/cleanup_unused_cond5_20251223/)*
+*Link: [./conductor/archive/cleanup_unused_cond5_20251223/](./conductor/archive/cleanup_unused_cond5_20251223/)*
+
+---
+
+## [x] Track: Post-Execution Snapshot Capture via Worker Loop
+*Link: [./conductor/archive/post_snapshot_worker_loop_20260109/](./conductor/archive/post_snapshot_worker_loop_20260109/)*
+
+---
+
+## [x] Track: Fix Post-Execution Snapshot Packet State
+*Link: [./conductor/archive/fix_post_snapshot_packet_state_20260115/](./conductor/archive/fix_post_snapshot_packet_state_20260115/)*
+
+---
+
+## [x] Track: Split GRL Rules for Granular Audit
+*Link: [./conductor/archive/split_grl_rules_for_audit_20260115/](./conductor/archive/split_grl_rules_for_audit_20260115/)*

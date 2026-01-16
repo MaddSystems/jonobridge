@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/hyperjumptech/grule-rule-engine/ast"
+	"github.com/jonobridge/grule-backend/audit"
 	"github.com/jonobridge/grule-backend/capabilities"
 	"github.com/jonobridge/grule-backend/capabilities/alerts"
 	"github.com/jonobridge/grule-backend/capabilities/buffer"
@@ -21,7 +22,7 @@ func NewContextBuilder(registry *capabilities.Registry) *ContextBuilder {
 	return &ContextBuilder{registry: registry}
 }
 
-func (cb *ContextBuilder) Build(packet *IncomingPacket) (ast.IDataContext, error) {
+func (cb *ContextBuilder) Build(packet *IncomingPacket, manifest *audit.AuditManifest) (ast.IDataContext, error) {
 	dc := ast.NewDataContext()
 
 	// 1. Add IncomingPacket
@@ -61,6 +62,8 @@ func (cb *ContextBuilder) Build(packet *IncomingPacket) (ast.IDataContext, error
 	actionsWrapper := &ActionsWrapper{
 		imei:         packet.IMEI,
 		stateWrapper: stateWrapper,
+		dataContext:  dc,
+		manifest:     manifest,
 	}
 	if stateWrapper.Alrt != nil {
 		actionsWrapper.alrt = stateWrapper.Alrt
@@ -129,14 +132,14 @@ func (s *StateWrapper) MarkAlertSentForRule(ruleName string) bool {
 		return false
 	}
 
-	// 1. Mark global (Atomic Check-and-Set)
+	// 1. Mark local FIRST (before global state update)
+	// This ensures the RETE engine sees the updated state when it re-evaluates
+	s.AlertStates[ruleName] = true
+
+	// 2. Mark global (Atomic Check-and-Set)
 	// Returns true if WE won the race and marked it.
 	// Returns false if it was already marked.
 	wonRace := s.Alrt.MarkAlertSent(s.imei, ruleName)
-
-	// 2. Mark local (stop future cycles)
-	// Even if we lost the race (wonRace=false), the alert IS sent, so we must block local cycles.
-	s.AlertStates[ruleName] = true
 
 	if wonRace {
 		log.Printf("✅ [StateWrapper] Alert successfully marked (Winner): IMEI=%s, Rule=%s", s.imei, ruleName)
@@ -196,6 +199,8 @@ type ActionsWrapper struct {
 	imei         string
 	alrt         *alerts.AlertsCapability
 	stateWrapper *StateWrapper
+	dataContext  ast.IDataContext
+	manifest     *audit.AuditManifest
 }
 
 func (a *ActionsWrapper) Log(message string) {
@@ -215,4 +220,36 @@ func (a *ActionsWrapper) CastString(v interface{}) string {
 		return a.alrt.CastString(v)
 	}
 	return ""
+}
+
+// CaptureSnapshot captures an explicit post-execution snapshot.
+// Called manually from GRL rules: actions.CaptureSnapshot("RuleName");
+func (a *ActionsWrapper) CaptureSnapshot(ruleName string) {
+	snapshot, err := audit.ExtractSnapshot(a.dataContext, a.imei, nil)
+	if err != nil {
+		log.Printf("[CaptureSnapshot] Error: %v", err)
+		return
+	}
+
+	entry := &audit.AuditEntry{
+		IMEI:     a.imei,
+		RuleName: ruleName,
+		Snapshot: snapshot,
+		IsPost:   true,
+	}
+
+	// Enrich with manifest if available
+	if a.manifest != nil {
+		meta := a.manifest.GetRuleMeta(ruleName)
+		if meta != nil {
+			entry.Description = meta.Description
+			entry.Level = meta.Level
+			entry.IsAlert = meta.IsAlert
+			entry.StepNumber = meta.Order
+			entry.StageReached = meta.Description
+		}
+	}
+
+	audit.Capture(entry)
+	log.Printf("[CaptureSnapshot] Explicitly captured for %s", ruleName)
 }
