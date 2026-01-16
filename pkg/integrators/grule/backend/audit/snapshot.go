@@ -8,7 +8,6 @@ import (
 
 	"github.com/hyperjumptech/grule-rule-engine/ast"
 	"github.com/jonobridge/grule-backend/capabilities"
-	"github.com/jonobridge/grule-backend/capabilities/buffer"
 )
 
 // unwrapGruleNode extracts the underlying value from a Grule wrapper node if present
@@ -90,11 +89,6 @@ func ExtractSnapshot(dc ast.IDataContext, imei string, packetOverride interface{
 				"MetricsReady":            getFieldBool(v, "MetricsReady"),
 				"MovingWithWeakSignal":    getFieldBool(v, "MovingWithWeakSignal"),
 				"OutsideAllSafeZones":     getFieldBool(v, "OutsideAllSafeZones"),
-			}
-
-			// ADD BUFFER CONTENTS TO PACKET_CURRENT
-			if bufferData := getBufferData(dc, imei); bufferData != nil {
-				extracted["buffer"] = bufferData
 			}
 
 			snapshot["packet_current"] = extracted
@@ -185,50 +179,6 @@ func getFieldMap(v reflect.Value, name string) map[string]interface{} {
 		}
 	}
 	return make(map[string]interface{})
-}
-
-// getBufferData extracts buffer contents from the DataContext
-func getBufferData(dc ast.IDataContext, imei string) interface{} {
-	stateObj := dc.Get("state")
-	if stateObj == nil {
-		log.Printf("[getBufferData] No state object in DataContext")
-		return nil
-	}
-
-	log.Printf("[getBufferData] Found state object: %T", stateObj)
-	realState := unwrapGruleNode(stateObj)
-	log.Printf("[getBufferData] Real state object type: %T", realState)
-
-	// Try to access the Buf field using reflection
-	stateValue := reflect.ValueOf(realState)
-	if stateValue.Kind() == reflect.Ptr {
-		stateValue = stateValue.Elem()
-	}
-
-	if stateValue.IsValid() && stateValue.Kind() == reflect.Struct {
-		bufField := stateValue.FieldByName("Buf")
-		if bufField.IsValid() && !bufField.IsNil() {
-			log.Printf("[getBufferData] Found Buf field: %T", bufField.Interface())
-			if bufCap, ok := bufField.Interface().(*buffer.BufferCapability); ok && bufCap != nil {
-				log.Printf("[getBufferData] Got buffer capability")
-				if data := bufCap.GetSnapshotData(imei); data != nil {
-					log.Printf("[getBufferData] Got buffer data (keys: %v)", reflect.ValueOf(data).MapKeys())
-					if bufferCircular, exists := data["buffer_circular"]; exists {
-						return bufferCircular
-					}
-				} else {
-					log.Printf("[getBufferData] GetSnapshotData returned nil")
-				}
-			} else {
-				log.Printf("[getBufferData] Buf field is not *BufferCapability")
-			}
-		} else {
-			log.Printf("[getBufferData] Buf field not found or is nil")
-		}
-	} else {
-		log.Printf("[getBufferData] State object is not a struct (Kind: %s)", stateValue.Kind())
-	}
-	return nil
 }
 
 // collectSnapshotProviders gathers all capabilities that implement SnapshotProvider

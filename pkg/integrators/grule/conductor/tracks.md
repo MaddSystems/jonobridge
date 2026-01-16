@@ -4,8 +4,13 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [ ] Track: Explain and Enhance Buffer Snapshot Visibility
-*Link: [./conductor/tracks/explain_buffer_snapshot_20260116/](./conductor/tracks/explain_buffer_snapshot_20260116/)*
+## [x] Track: Remove Duplicate Buffer Data from Snapshot
+*Link: [./conductor/archive/remove_duplicate_buffer_injection_20260116/](./conductor/archive/remove_duplicate_buffer_injection_20260116/)*
+
+---
+
+## [x] Track: Explain and Enhance Buffer Snapshot Visibility
+*Link: [./conductor/archive/explain_buffer_snapshot_20260116/](./conductor/archive/explain_buffer_snapshot_20260116/)*
 
 ---
 
