@@ -4,8 +4,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [ ] Track: Fix Double Snapshot Capture & Alert Spam
-*Link: [./conductor/tracks/fix_double_snapshot_capture_20260116/](./conductor/tracks/fix_double_snapshot_capture_20260116/)*
+## [x] Track: Fix Double Snapshot Capture & Alert Spam
+*Link: [./conductor/archive/fix_double_snapshot_capture_20260116/](./conductor/archive/fix_double_snapshot_capture_20260116/)*
 
 ---
 
